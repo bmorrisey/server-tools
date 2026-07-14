@@ -3,6 +3,8 @@
 #   cd deploy
 #   cp .env.example .env && cp config.example.json config.json   (then edit both)
 #   docker compose up -d --build
+name: server-tools
+
 services:
   agent:
     build:
