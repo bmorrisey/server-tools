@@ -13,7 +13,7 @@
  *   raw values.
  */
 import crypto from "node:crypto";
-import { randomId } from "../util.js";
+import { randomId, safeEqual } from "../util.js";
 import { logger } from "../log.js";
 
 const log = logger("auth");
@@ -76,6 +76,7 @@ export function consumeToken({ config, store, token }) {
   const days = config.web.sessionDays ?? 30;
   auth.sessions[hash(sessionId)] = {
     email: entry.email,
+    csrf: randomId(16),
     created: Date.now(),
     expires: Date.now() + days * 86_400_000,
   };
@@ -84,14 +85,26 @@ export function consumeToken({ config, store, token }) {
   return sessionId;
 }
 
-/** Resolve the session cookie to { email } or null. */
+/** Resolve the session cookie to { email, csrf } or null. */
 export function sessionFromCookie({ store, cookieHeader }) {
   const sessionId = parseCookies(cookieHeader)[COOKIE_NAME];
   if (!sessionId) return null;
   const auth = readAuth(store);
-  const entry = auth.sessions[hash(sessionId)];
+  const key = hash(sessionId);
+  const entry = auth.sessions[key];
   if (!entry || entry.expires < Date.now()) return null;
-  return { email: entry.email };
+  // Backfill a CSRF token for sessions created before this field existed.
+  if (!entry.csrf) {
+    entry.csrf = randomId(16);
+    auth.sessions[key] = entry;
+    writeAuth(store, auth);
+  }
+  return { email: entry.email, csrf: entry.csrf };
+}
+
+/** Constant-time check that a submitted CSRF token matches the session. */
+export function csrfValid(session, token) {
+  return Boolean(session?.csrf) && typeof token === "string" && safeEqual(session.csrf, token);
 }
 
 export function destroySession({ store, cookieHeader }) {

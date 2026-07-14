@@ -47,7 +47,8 @@ dashboard; `src/cli.js` runs any operation by hand.
 | `src/backup/` | backup engine, AES-256-GCM streaming crypto, S3 SigV4 client, GFS retention, restore + drill |
 | `src/deploy.js` | git checkout + compose build + health gate + rollback |
 | `src/housekeep.js` | history pruning, temp expiry, configured dir cleanup |
-| `src/web/` | dashboard: http server, magic-link auth, server-rendered UI |
+| `src/remediate.js` | plain-language incident diagnosis + validated one-click actions |
+| `src/web/` | dashboard: http server, magic-link auth, server-rendered UI, action routes |
 | `deploy/` | Dockerfile, docker-compose.yml, config + env examples |
 | `test/` | node:test unit tests, no framework |
 

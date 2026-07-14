@@ -79,6 +79,34 @@ td .detail { color: var(--muted); font-size: 13px; }
 .events li { margin: 0 0 8px; font-size: 14px; }
 .events { list-style: none; padding: 0; margin: 0; }
 .events time { color: var(--muted); font-size: 12.5px; font-variant-numeric: tabular-nums; margin-right: 8px; }
+.banner { margin: 0 0 18px; padding: 11px 16px; border-radius: 10px; font-size: 14px; border: 1px solid var(--border); }
+.banner.ok { background: var(--good-bg); color: var(--good); border-color: transparent; }
+.banner.err { background: var(--crit-bg); color: var(--crit); border-color: transparent; }
+.incident { background: var(--surface); border: 1px solid var(--border); border-left: 3px solid var(--crit);
+  border-radius: 12px; padding: 16px 18px; margin: 0 0 14px; }
+.incident.warn { border-left-color: #fab219; }
+.incident h3 { margin: 0 0 4px; font-size: 16px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.incident .meaning { margin: 6px 0 10px; color: var(--ink); font-size: 14.5px; }
+.incident .why { color: var(--ink-2); font-size: 13.5px; margin: 0 0 6px; font-weight: 600; }
+.incident ul.causes { margin: 0 0 12px; padding-left: 18px; color: var(--ink-2); font-size: 13.5px; }
+.incident ul.causes li { margin: 2px 0; }
+.incident .guidance { font-size: 13.5px; color: var(--ink-2); background: var(--page); border-radius: 8px; padding: 9px 12px; margin: 4px 0 0; }
+.actions-row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-top: 4px; }
+.btn-action { display: inline-flex; align-items: center; gap: 6px; padding: 8px 14px; border-radius: 8px;
+  font-size: 13.5px; font-weight: 600; cursor: pointer; border: 1px solid transparent; background: var(--series); color: #fff; }
+.btn-action.caution { background: var(--surface); color: var(--ink); border-color: var(--input); }
+.btn-action:hover { filter: brightness(1.06); }
+.context { margin-top: 10px; font-size: 13px; color: var(--ink-2); }
+.context .hint { color: var(--good); font-weight: 600; }
+pre.logs { margin: 8px 0 0; padding: 12px 14px; background: var(--page); border: 1px solid var(--border);
+  border-radius: 8px; font: 12px/1.5 ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+  color: var(--ink-2); overflow-x: auto; max-height: 300px; overflow-y: auto; white-space: pre; }
+.top-list { list-style: none; padding: 0; margin: 8px 0 0; font-size: 13px; }
+.top-list li { display: flex; justify-content: space-between; padding: 3px 0; border-top: 1px solid var(--grid); }
+.top-list li:first-child { border-top: 0; }
+.top-list .n { color: var(--ink-2); font-variant-numeric: tabular-nums; }
+details.logs-wrap { margin-top: 10px; }
+details.logs-wrap summary { cursor: pointer; font-size: 13px; color: var(--ink-2); font-weight: 600; }
 .login { max-width: 380px; margin: 12vh auto 0; }
 .login input[type=email] { width: 100%; padding: 10px 12px; border: 1px solid var(--grid);
   border-radius: 8px; background: var(--page); color: var(--ink); font-size: 15px; }
@@ -101,7 +129,65 @@ export function statusPill(status) {
   return `<span class="status ${s}">${STATUS_GLYPH[s]} ${STATUS_TEXT[s]}</span>`;
 }
 
-export function layout({ title, page, session, body }) {
+export function flashBanner(flash) {
+  if (!flash || !flash.message) return "";
+  return `<div class="banner ${flash.ok ? "ok" : "err"}">${flash.ok ? "✓" : "✕"} ${esc(flash.message)}</div>`;
+}
+
+/**
+ * An incident card: plain-language meaning, likely causes, live context
+ * (reclaimable space / busiest containers / recent logs), and action buttons.
+ * `returnPath` is where the action POST returns to.
+ */
+export function incidentCard({ check, incident, context = {}, csrf, returnPath }) {
+  if (!incident) return "";
+  const causes = incident.causes?.length
+    ? `<div class="why">Likely causes</div><ul class="causes">${incident.causes.map((c) => `<li>${esc(c)}</li>`).join("")}</ul>`
+    : "";
+
+  let ctxHtml = "";
+  if (context.reclaimableText) {
+    ctxHtml += `<div class="context"><span class="hint">${esc(context.reclaimableText)}.</span></div>`;
+  }
+  if (context.top?.length) {
+    ctxHtml += `<ul class="top-list">${context.top.map((t) => `<li><span>${esc(t.name)}</span><span class="n">${esc(t.text)}</span></li>`).join("")}</ul>`;
+  }
+  if (context.logs) {
+    ctxHtml += `<details class="logs-wrap"><summary>Recent logs from ${esc(check.container)}</summary><pre class="logs">${esc(context.logs)}</pre></details>`;
+  }
+
+  const actions = (incident.actions ?? [])
+    .map((a) => {
+      const params = a.container ? `<input type="hidden" name="container" value="${esc(a.container)}">` : "";
+      const target = a.target ? `<input type="hidden" name="target" value="${esc(a.target)}">` : "";
+      return `<form method="post" action="/action" onsubmit="return confirm(${jsStr(a.confirm)})" style="margin:0">
+  <input type="hidden" name="csrf" value="${esc(csrf)}">
+  <input type="hidden" name="actionId" value="${esc(a.id)}">
+  <input type="hidden" name="return" value="${esc(returnPath)}">
+  ${params}${target}
+  <button type="submit" class="btn-action ${a.kind === "caution" ? "caution" : ""}">${esc(a.label)}</button>
+</form>`;
+    })
+    .join("");
+
+  const guidance = incident.guidance ? `<div class="guidance">${esc(incident.guidance)}</div>` : "";
+
+  return `<div class="incident ${incident.severity === "warn" ? "warn" : ""}">
+  <h3>${statusPill(incident.severity)} ${esc(incident.title)}</h3>
+  <p class="meaning">${esc(incident.meaning)}</p>
+  ${causes}
+  ${actions ? `<div class="actions-row">${actions}</div>` : ""}
+  ${guidance}
+  ${ctxHtml}
+</div>`;
+}
+
+/** JSON-encode a string for safe inline use in a JS attribute. */
+function jsStr(s) {
+  return esc(JSON.stringify(String(s)));
+}
+
+export function layout({ title, page, session, body, flash }) {
   const nav = [
     ["/", "Overview"],
     ["/checks", "Checks"],
@@ -127,9 +213,10 @@ export function layout({ title, page, session, body }) {
 <header>
   <span class="brand">server-tools</span>
   <nav>${nav}</nav>
-  <form method="post" action="/logout"><button type="submit" title="Signed in as ${esc(session.email)}">Sign out</button></form>
+  <form method="post" action="/logout"><input type="hidden" name="csrf" value="${esc(session.csrf ?? "")}"><button type="submit" title="Signed in as ${esc(session.email)}">Sign out</button></form>
 </header>
 <main>
+${flashBanner(flash)}
 ${body}
 </main>
 <footer>server-tools admin</footer>
@@ -207,7 +294,7 @@ export function statCard({ label, value, detail = "", extra = "" }) {
 </div>`;
 }
 
-export function overviewPage({ session, summary, host, checks, backups, deploys, events, sparks }) {
+export function overviewPage({ session, host, checks, backups, deploys, events, sparks, incidents = [], flash, csrf }) {
   const counts = { ok: 0, warn: 0, fail: 0 };
   for (const c of Object.values(checks)) counts[c.status] = (counts[c.status] ?? 0) + 1;
   const headline =
@@ -276,10 +363,18 @@ export function overviewPage({ session, summary, host, checks, backups, deploys,
     )
     .join("");
 
+  const attention = incidents.length
+    ? `<h2>Attention needed</h2>${incidents
+        .map((it) => incidentCard({ check: it.check, incident: it.incident, context: it.context, csrf, returnPath: "/" }))
+        .join("")}`
+    : "";
+
   const body = `
 <h1>Overview</h1>
 <div class="hero"><span class="headline">${esc(headline)}</span>${heroPill}
   <span class="sub" style="margin:0">${counts.ok} ok - ${counts.warn} warn - ${counts.fail} fail</span></div>
+
+${attention}
 
 <h2>Host</h2>
 <div class="grid">${hostCards}</div>
@@ -294,12 +389,11 @@ export function overviewPage({ session, summary, host, checks, backups, deploys,
 </table>
 
 <h2 style="margin-top:24px">Recent events</h2>
-<ul class="events">${eventItems || '<li class="sub">Nothing yet.</li>'}</ul>
-${deploys ? "" : ""}`;
-  return layout({ title: "Overview", page: "/", session, body });
+<ul class="events">${eventItems || '<li class="sub">Nothing yet.</li>'}</ul>`;
+  return layout({ title: "Overview", page: "/", session, body, flash });
 }
 
-export function checksPage({ session, checks, historyByName }) {
+export function checksPage({ session, checks, historyByName, flash }) {
   const cards = Object.entries(checks)
     .sort(([a], [b]) => a.localeCompare(b))
     .map(([name, c]) => {
@@ -316,10 +410,10 @@ export function checksPage({ session, checks, historyByName }) {
     .join("\n");
   const body = `<h1>Checks</h1><p class="sub">Latest result per check; sparklines show recorded values (latency, %, days) over recent history.</p>
 <div class="grid wide">${cards || '<p class="sub">No checks configured.</p>'}</div>`;
-  return layout({ title: "Checks", page: "/checks", session, body });
+  return layout({ title: "Checks", page: "/checks", session, body, flash });
 }
 
-export function checkDetailPage({ session, name, current, samples }) {
+export function checkDetailPage({ session, name, current, samples, incident, context, csrf, flash, checkConfig }) {
   const values = samples.map((s) => (Number.isFinite(s.value) ? s.value : null));
   const rows = samples
     .slice(-100)
@@ -329,18 +423,22 @@ export function checkDetailPage({ session, name, current, samples }) {
         `<tr><td>${statusPill(s.status)}</td><td class="num">${s.value ?? ""}</td><td><span class="detail">${esc(s.detail ?? "")}</span></td><td class="num"><time>${esc((s.ts ?? "").replace("T", " ").replace("Z", ""))}</time></td></tr>`,
     )
     .join("");
+  const card = incident
+    ? incidentCard({ check: checkConfig ?? { name }, incident, context, csrf, returnPath: `/checks/${encodeURIComponent(name)}` })
+    : "";
   const body = `<h1>${esc(name)}</h1>
 <p class="sub">${current ? `${esc(current.type)} - currently ${current.status}: ${esc(current.detail ?? "")}` : "No current state."}</p>
+${card}
 ${values.filter((v) => v !== null).length > 1 ? sparkline(values, { width: 640, height: 80 }) : ""}
 <h2 style="margin-top:20px">History (${samples.length} samples)</h2>
 <table>
 <thead><tr><th>Status</th><th>Value</th><th>Detail</th><th>At</th></tr></thead>
 <tbody>${rows || '<tr><td colspan="4" class="detail">No samples recorded.</td></tr>'}</tbody>
 </table>`;
-  return layout({ title: name, page: "/checks", session, body });
+  return layout({ title: name, page: "/checks", session, body, flash });
 }
 
-export function backupsPage({ session, backups, targets }) {
+export function backupsPage({ session, backups, targets, flash }) {
   const rows = targets
     .map((t) => {
       const b = backups[t.name] ?? {};
@@ -362,10 +460,10 @@ export function backupsPage({ session, backups, targets }) {
 <thead><tr><th>Status</th><th>Target</th><th>Last success</th><th>Size</th><th>Offsite</th><th>Restore drill</th><th>Detail</th></tr></thead>
 <tbody>${rows || '<tr><td colspan="7" class="detail">No backup targets configured.</td></tr>'}</tbody>
 </table>`;
-  return layout({ title: "Backups", page: "/backups", session, body });
+  return layout({ title: "Backups", page: "/backups", session, body, flash });
 }
 
-export function deploysPage({ session, deploys, targets, events }) {
+export function deploysPage({ session, deploys, targets, events, flash }) {
   const rows = targets
     .map((t) => {
       const d = deploys[t.name];
@@ -395,10 +493,10 @@ export function deploysPage({ session, deploys, targets, events }) {
 </table>
 <h2 style="margin-top:24px">History</h2>
 <ul class="events">${history || '<li class="sub">No deploy events recorded.</li>'}</ul>`;
-  return layout({ title: "Deploys", page: "/deploys", session, body });
+  return layout({ title: "Deploys", page: "/deploys", session, body, flash });
 }
 
-export function eventsPage({ session, events }) {
+export function eventsPage({ session, events, flash }) {
   const rows = events
     .slice(-300)
     .reverse()
@@ -413,5 +511,5 @@ export function eventsPage({ session, events }) {
 <thead><tr><th>At (UTC)</th><th>Kind</th><th>Topic</th><th>Target</th><th>Detail</th></tr></thead>
 <tbody>${rows || '<tr><td colspan="5" class="detail">Nothing recorded yet.</td></tr>'}</tbody>
 </table>`;
-  return layout({ title: "Events", page: "/events", session, body });
+  return layout({ title: "Events", page: "/events", session, body, flash });
 }

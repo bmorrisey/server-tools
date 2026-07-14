@@ -14,7 +14,11 @@ store.ensureDirs();
 
 const config = {
   dataDir: dir,
-  checks: [{ name: "demo-http", type: "http", url: "http://127.0.0.1:1/health" }],
+  checks: [
+    { name: "demo-http", type: "http", url: "http://127.0.0.1:1/health" },
+    { name: "demo-disk", type: "disk", path: "/" },
+    { name: "demo-container", type: "container", container: "demo-app-1" },
+  ],
   backups: [
     { name: "demo-db", type: "postgres", container: "db-1", user: "u", database: "d", passphrase: "x".repeat(16) },
   ],
@@ -24,13 +28,26 @@ const config = {
 };
 
 // Seed some state so pages render real content.
-store.writeState("checks", { "demo-http": { status: "ok", detail: "HTTP 200 in 12ms", type: "http", at: new Date().toISOString(), value: 12 } });
+store.writeState("checks", {
+  "demo-http": { status: "ok", detail: "HTTP 200 in 12ms", type: "http", at: new Date().toISOString(), value: 12 },
+  "demo-disk": { status: "fail", detail: "95% used, 2 GiB free", type: "disk", at: new Date().toISOString(), value: 95 },
+  "demo-container": { status: "fail", detail: "not running", type: "container", at: new Date().toISOString() },
+});
 store.writeState("backups", { "demo-db": { lastResult: "ok", lastSuccess: new Date().toISOString(), lastSizeBytes: 12345, lastDetail: "12 KiB, encrypted", offsite: false } });
 store.append("checks", { name: "demo-http", status: "ok", value: 12, detail: "HTTP 200" });
 store.append("checks", { name: "demo-http", status: "ok", value: 15, detail: "HTTP 200" });
 store.append("events", { topic: "backup", kind: "ok", name: "demo-db", detail: "12 KiB, encrypted" });
 
-const fakeDocker = { ping: async () => false };
+let restarted = null;
+const fakeDocker = {
+  ping: async () => false,
+  restart: async (name) => { restarted = name; },
+  pruneImages: async () => 2_000_000,
+  pruneBuildCache: async () => 1_000_000,
+  logs: async () => "log line one\nlog line two\n",
+  systemDf: async () => ({ Images: [{ Containers: 0, Size: 3_000_000 }], BuildCache: [{ InUse: false, Size: 1_000_000 }] }),
+  listContainers: async () => [],
+};
 const server = await startWebServer({ config, store, docker: fakeDocker, alerter: null });
 const base = `http://127.0.0.1:${server.address().port}`;
 
@@ -109,13 +126,102 @@ test("magic link login flow end to end", async () => {
   assert.equal((await get("/checks/nope", { cookie })).status, 404);
 });
 
-test("logout clears the session", async () => {
+test("failing checks render incident cards with actions; the action route works", async () => {
   const url = createLoginToken({ config, store, email: "op@example.com" });
   const res = await get(`/auth?token=${new URL(url).searchParams.get("token")}`);
   const cookie = res.headers.get("set-cookie").split(";")[0];
 
-  const out = await fetch(`${base}/logout`, { method: "POST", headers: { cookie }, redirect: "manual" });
+  // Overview shows an "Attention needed" section with a plain-language card.
+  const overview = await (await get("/", { cookie })).text();
+  assert.match(overview, /Attention needed/);
+  assert.match(overview, /almost full/); // disk incident meaning
+  assert.match(overview, /Reclaim unused Docker space/); // safe action button
+  assert.match(overview, /is not running normally/); // container incident
+
+  // Extract the CSRF token the page embedded.
+  const csrf = overview.match(/name="csrf" value="([^"]+)"/)[1];
+
+  // Action without a valid CSRF token is refused.
+  const noCsrf = await fetch(`${base}/action`, {
+    method: "POST",
+    headers: { cookie, "content-type": "application/x-www-form-urlencoded" },
+    body: "actionId=reclaim-docker-space&return=/&csrf=wrong",
+    redirect: "manual",
+  });
+  assert.equal(noCsrf.status, 403);
+
+  // Valid reclaim action runs and redirects back with a success flash.
+  const reclaim = await fetch(`${base}/action`, {
+    method: "POST",
+    headers: { cookie, "content-type": "application/x-www-form-urlencoded" },
+    body: `actionId=reclaim-docker-space&return=${encodeURIComponent("/")}&csrf=${encodeURIComponent(csrf)}`,
+    redirect: "manual",
+  });
+  assert.equal(reclaim.status, 303);
+  assert.match(decodeURIComponent(reclaim.headers.get("location")), /ok=1.*Reclaimed/);
+
+  // Restart action validates the container against config, then calls docker.
+  const restart = await fetch(`${base}/action`, {
+    method: "POST",
+    headers: { cookie, "content-type": "application/x-www-form-urlencoded" },
+    body: `actionId=restart-container&container=demo-app-1&return=${encodeURIComponent("/checks/demo-container")}&csrf=${encodeURIComponent(csrf)}`,
+    redirect: "manual",
+  });
+  assert.equal(restart.status, 303);
+  assert.equal(restarted, "demo-app-1");
+
+  // An unmanaged container is rejected (defense in depth, even with valid CSRF).
+  restarted = null;
+  const evil = await fetch(`${base}/action`, {
+    method: "POST",
+    headers: { cookie, "content-type": "application/x-www-form-urlencoded" },
+    body: `actionId=restart-container&container=some-other-container&return=/&csrf=${encodeURIComponent(csrf)}`,
+    redirect: "manual",
+  });
+  assert.equal(evil.status, 303);
+  assert.match(decodeURIComponent(evil.headers.get("location")), /ok=0/);
+  assert.equal(restarted, null);
+
+  // Unauthenticated action POST is refused.
+  const anon = await fetch(`${base}/action`, {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: "actionId=reclaim-docker-space&csrf=x",
+    redirect: "manual",
+  });
+  assert.equal(anon.status, 303);
+  assert.equal(anon.headers.get("location"), "/login");
+
+  // The check detail page shows the incident + a flash banner from a redirect.
+  const detail = await (await get("/checks/demo-container?ok=1&msg=Restarted+demo-app-1", { cookie })).text();
+  assert.match(detail, /is not running normally/);
+  assert.match(detail, /Restarted demo-app-1/); // flash banner
+});
+
+test("logout requires a valid CSRF token", async () => {
+  const url = createLoginToken({ config, store, email: "op@example.com" });
+  const res = await get(`/auth?token=${new URL(url).searchParams.get("token")}`);
+  const cookie = res.headers.get("set-cookie").split(";")[0];
+  // Wrong token: no logout (redirect home, session intact).
+  const bad = await fetch(`${base}/logout`, { method: "POST", headers: { cookie, "content-type": "application/x-www-form-urlencoded" }, body: "csrf=nope", redirect: "manual" });
+  assert.equal(bad.headers.get("location"), "/");
+  assert.equal((await get("/", { cookie })).status, 200); // still logged in
+});
+
+test("logout clears the session", async () => {
+  const url = createLoginToken({ config, store, email: "op@example.com" });
+  const res = await get(`/auth?token=${new URL(url).searchParams.get("token")}`);
+  const cookie = res.headers.get("set-cookie").split(";")[0];
+  const csrf = (await (await get("/", { cookie })).text()).match(/name="csrf" value="([^"]+)"/)[1];
+
+  const out = await fetch(`${base}/logout`, {
+    method: "POST",
+    headers: { cookie, "content-type": "application/x-www-form-urlencoded" },
+    body: `csrf=${encodeURIComponent(csrf)}`,
+    redirect: "manual",
+  });
   assert.equal(out.status, 303);
+  assert.equal(out.headers.get("location"), "/login");
   const after = await get("/", { cookie });
   assert.equal(after.status, 303); // back to login
 });

@@ -80,6 +80,57 @@ export class Docker {
     return this.request("GET", `/containers/${encodeURIComponent(nameOrId)}/stats?stream=false&one-shot=true`);
   }
 
+  /** Restart a container (graceful stop with timeout, then start). */
+  async restart(nameOrId, { timeoutSec = 10 } = {}) {
+    const c = await this.inspect(nameOrId);
+    await this.request("POST", `/containers/${c.Id}/restart?t=${timeoutSec}`);
+  }
+
+  /** Disk usage summary (images, containers, volumes, build cache). */
+  systemDf() {
+    return this.request("GET", "/system/df");
+  }
+
+  /** Remove dangling (untagged, unused) images. Returns bytes reclaimed. */
+  async pruneImages() {
+    const r = await this.request("POST", "/images/prune", undefined);
+    return r?.SpaceReclaimed ?? 0;
+  }
+
+  /** Remove reclaimable build cache. Returns bytes reclaimed. */
+  async pruneBuildCache() {
+    const r = await this.request("POST", "/build/prune", undefined);
+    return r?.SpaceReclaimed ?? 0;
+  }
+
+  /**
+   * Recent log lines from a container, newest last, as text. Handles both the
+   * multiplexed stream format (no TTY) and raw output (TTY containers).
+   */
+  logs(nameOrId, { tail = 25, timeoutMs = 8000 } = {}) {
+    return new Promise((resolve) => {
+      const req = http.request(
+        {
+          socketPath: this.socketPath,
+          method: "GET",
+          path: `/containers/${encodeURIComponent(nameOrId)}/logs?stdout=true&stderr=true&tail=${tail}&timestamps=false`,
+        },
+        (res) => {
+          const chunks = [];
+          res.on("data", (c) => chunks.push(c));
+          res.on("end", () => resolve(demuxLogs(Buffer.concat(chunks))));
+          res.on("error", () => resolve(""));
+        },
+      );
+      req.setTimeout(timeoutMs, () => {
+        req.destroy();
+        resolve("");
+      });
+      req.on("error", () => resolve(""));
+      req.end();
+    });
+  }
+
   /**
    * Find a container by exact name (with or without leading slash) or by
    * compose service label. Returns the inspect document or null.
@@ -139,6 +190,25 @@ export class Docker {
     const info = await this.request("GET", `/exec/${create.Id}/json`);
     return { exitCode: info.ExitCode ?? -1, stdout, stderr };
   }
+}
+
+/**
+ * Decode a container logs response to text. Non-TTY logs are framed with an
+ * 8-byte header per chunk (same as exec); TTY logs are raw. We detect framing
+ * by checking the header shape and fall back to treating the bytes as raw.
+ */
+export function demuxLogs(buf) {
+  const out = [];
+  let i = 0;
+  while (i + 8 <= buf.length) {
+    const type = buf[i];
+    const len = buf.readUInt32BE(i + 4);
+    const framed = (type === 0 || type === 1 || type === 2) && buf[i + 1] === 0 && buf[i + 2] === 0 && buf[i + 3] === 0 && i + 8 + len <= buf.length;
+    if (!framed) return buf.toString("utf8"); // raw / TTY output
+    out.push(buf.subarray(i + 8, i + 8 + len));
+    i += 8 + len;
+  }
+  return out.length ? Buffer.concat(out).toString("utf8") : buf.toString("utf8");
 }
 
 /** Splits Docker's multiplexed attach stream into stdout/stderr. */

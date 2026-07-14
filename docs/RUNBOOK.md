@@ -99,6 +99,31 @@ and after changing anything about backups. The result shows on the dashboard.
    run; tighten `retention` counts in config if they are the problem.
 4. `server-tools housekeep --dry-run` shows what cleanup would remove.
 
+## Understanding and fixing an incident
+
+Every failing check turns into an incident with a plain-language explanation,
+likely causes, and (where one is safe) a one-click fix. Three ways to reach it:
+
+- **Dashboard:** the overview leads with an "Attention needed" section; opening
+  a failing check shows the full card plus recent container logs.
+- **Terminal, read-only:** `server-tools diagnose <check>` prints the same
+  explanation, causes, live context, and the available actions.
+- **Terminal, act:** `server-tools fix <check> [actionId]` runs the top
+  suggested action (or a named one).
+
+The actions are deliberately conservative - none delete application data:
+
+| Action | What it does | When it is offered |
+| --- | --- | --- |
+| `restart-container` | Restarts the named container (brief downtime) | container / postgres / http checks |
+| `reclaim-docker-space` | Removes unused Docker images + build cache | disk checks |
+| `run-backup` | Runs a configured backup target now | backup-freshness checks |
+
+A restart only helps if the container itself is the problem; if the disk is
+also full, clear space first (a restart will not fix a full disk). Certificate
+and load/memory incidents are explained but have no auto-fix, because the real
+remedy needs host access or simply time.
+
 ## App is down (container check red)
 
 1. `docker ps -a` - is the container restarting or exited?
