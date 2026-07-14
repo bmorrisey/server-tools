@@ -1,0 +1,87 @@
+{
+  "dataDir": "/data",
+
+  "docker": { "socketPath": "/var/run/docker.sock" },
+
+  "checkDefaults": { "interval": "60s", "timeout": "10s", "failuresBeforeAlert": 2 },
+
+  "checks": [
+    { "name": "app-http", "type": "http", "url": "https://app.example.com/api/health", "expectJson": { "status": "ok" }, "maxLatency": "2s" },
+    { "name": "app-container", "type": "container", "container": "myapp-app-1" },
+    { "name": "app-db", "type": "postgres", "container": "myapp-db-1", "user": "appuser", "database": "appdb", "interval": "2m" },
+    { "name": "tls-cert", "type": "tls-cert", "host": "app.example.com", "warnDays": 21, "failDays": 7, "interval": "6h" },
+    { "name": "disk-root", "type": "disk", "path": "/host", "warnPct": 80, "failPct": 92, "interval": "5m" },
+    { "name": "memory", "type": "memory", "warnPct": 85, "failPct": 95, "interval": "2m" },
+    { "name": "load", "type": "load", "warnPerCore": 1.5, "failPerCore": 3, "interval": "2m" },
+    { "name": "db-backup-fresh", "type": "backup-freshness", "target": "app-db", "warnAfter": "26h", "failAfter": "50h", "interval": "30m" }
+  ],
+
+  "backups": [
+    {
+      "name": "app-db",
+      "type": "postgres",
+      "container": "myapp-db-1",
+      "user": "appuser",
+      "database": "appdb",
+      "schedule": "03:30",
+      "passphrase": "${BACKUP_PASSPHRASE}",
+      "retention": { "daily": 7, "weekly": 4, "monthly": 6 },
+      "s3": {
+        "bucket": "my-backups",
+        "region": "auto",
+        "endpoint": "https://<accountid>.r2.cloudflarestorage.com",
+        "prefix": "server-tools",
+        "accessKeyId": "${S3_ACCESS_KEY_ID}",
+        "secretAccessKey": "${S3_SECRET_ACCESS_KEY}"
+      }
+    },
+    {
+      "name": "app-media",
+      "type": "files",
+      "path": "/apps/myapp/storage",
+      "schedule": "sun 04:30",
+      "passphrase": "${BACKUP_PASSPHRASE}",
+      "archive": false,
+      "exclude": ["tmp"],
+      "retention": { "daily": 4, "weekly": 4, "monthly": 3 }
+    }
+  ],
+
+  "deploys": [
+    {
+      "name": "myapp",
+      "dir": "/apps/myapp",
+      "healthUrl": "https://app.example.com/api/health",
+      "healthAttempts": 20,
+      "healthDelay": "6s"
+    }
+  ],
+
+  "housekeeping": {
+    "schedule": "04:45",
+    "historyDays": 90,
+    "tmpAge": "2d",
+    "clean": []
+  },
+
+  "alerts": {
+    "webhook": { "url": "https://ntfy.sh/your-private-topic" },
+    "smtp": {
+      "host": "smtp.example.com",
+      "port": 587,
+      "user": "alerts@example.com",
+      "pass": "${SMTP_PASSWORD}",
+      "from": "alerts@example.com",
+      "to": ["you@example.com"]
+    }
+  },
+
+  "web": {
+    "enabled": true,
+    "port": 9090,
+    "bind": "0.0.0.0",
+    "baseUrl": "https://ops.example.com",
+    "allowedEmails": ["you@example.com"],
+    "sessionDays": 30
+  }
+}
