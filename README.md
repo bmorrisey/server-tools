@@ -22,6 +22,23 @@ agent trusts is Node itself.
 | Housekeeping | Prunes its own history, expires temp files, age-based cleanup of directories you configure |
 | Dashboard | Server-rendered admin portal: status tiles, host gauges, check history sparklines, backup/deploy/event views. Magic-link login (email or CLI-generated), long-lived device sessions |
 
+## Screenshots
+
+The overview: status headline, host tiles with sparklines and meters, backup
+state (including the last restore drill), and every check at a glance - in
+your OS's light or dark theme:
+
+![Dashboard overview, light theme](docs/screenshots/overview.png)
+
+![Dashboard overview, dark theme](docs/screenshots/overview-dark.png)
+
+Per-check history with values over time, and the sign-in flow (magic links,
+no passwords):
+
+![Checks page](docs/screenshots/checks.png)
+
+![Login page](docs/screenshots/login.png)
+
 ## Quick start (local)
 
 ```bash
