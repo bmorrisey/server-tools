@@ -18,6 +18,7 @@
  * - Everything is described so the UI and the CLI render the same words.
  */
 import { runBackup, prune as pruneBackups } from "./backup/backup.js";
+import { drill } from "./backup/restore.js";
 import { formatBytes } from "./util.js";
 
 /**
@@ -288,6 +289,14 @@ export async function runAction(actionId, params, { docker, store, config }) {
         return record(true, `Pruned ${plan.drop.length} old artifact(s) for "${target.name}".`);
       }
 
+      case "run-drill": {
+        const target = configuredBackup(config, params.target);
+        if (!target) return record(false, `"${params.target}" is not a configured backup target`);
+        if (target.type !== "postgres") return record(false, `Restore drills apply to database targets; "${target.name}" is a files target`);
+        const result = await drill(target, { docker, store });
+        return record(true, `Restore drill passed for "${target.name}": ${result.lastDrillDetail}`);
+      }
+
       default:
         return record(false, `Unknown action "${actionId}"`);
     }
@@ -309,4 +318,4 @@ function configuredBackup(config, name) {
 }
 
 /** The set of action ids that exist, for validating POSTs. */
-export const ACTION_IDS = new Set(["restart-container", "reclaim-docker-space", "run-backup", "prune-backups"]);
+export const ACTION_IDS = new Set(["restart-container", "reclaim-docker-space", "run-backup", "prune-backups", "run-drill"]);

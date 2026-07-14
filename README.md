@@ -44,6 +44,12 @@ value history, so you can see context without SSHing in:
 
 ![Check detail with recent logs](docs/screenshots/incident-detail.png)
 
+The Backups page turns routine chores into buttons: back up any target now, or
+run a restore drill that proves a database backup actually restores - no
+terminal needed:
+
+![Backups page with one-click actions](docs/screenshots/backups.png)
+
 Per-check history with values over time, and the sign-in flow (magic links,
 no passwords):
 

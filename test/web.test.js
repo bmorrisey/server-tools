@@ -198,6 +198,22 @@ test("failing checks render incident cards with actions; the action route works"
   assert.match(detail, /Restarted demo-app-1/); // flash banner
 });
 
+test("backups page offers Back up now + Test restore buttons", async () => {
+  const url = createLoginToken({ config, store, email: "op@example.com" });
+  const res = await get(`/auth?token=${new URL(url).searchParams.get("token")}`);
+  const cookie = res.headers.get("set-cookie").split(";")[0];
+  const html = await (await get("/backups", { cookie })).text();
+
+  assert.match(html, /Back up now/);
+  assert.match(html, /value="run-backup"/);
+  assert.match(html, /name="target" value="demo-db"/);
+  // demo-db is a postgres target, so a restore-drill button is offered too.
+  assert.match(html, /Test restore/);
+  assert.match(html, /value="run-drill"/);
+  // Every action form carries the session CSRF token.
+  assert.match(html, /name="csrf" value="[A-Za-z0-9_-]+"/);
+});
+
 test("logout requires a valid CSRF token", async () => {
   const url = createLoginToken({ config, store, email: "op@example.com" });
   const res = await get(`/auth?token=${new URL(url).searchParams.get("token")}`);

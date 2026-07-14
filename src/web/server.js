@@ -269,7 +269,7 @@ export function startWebServer({ config, store, docker, alerter }) {
       );
     }
     if (path === "/backups") {
-      return send(res, 200, ui.backupsPage({ session, backups, targets: config.backups, flash }));
+      return send(res, 200, ui.backupsPage({ session, backups, targets: config.backups, flash, csrf: session.csrf }));
     }
     if (path === "/deploys") {
       return send(res, 200, ui.deploysPage({ session, deploys, targets: config.deploys, events, flash }));

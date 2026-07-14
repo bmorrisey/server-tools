@@ -95,7 +95,9 @@ td .detail { color: var(--muted); font-size: 13px; }
 .btn-action { display: inline-flex; align-items: center; gap: 6px; padding: 8px 14px; border-radius: 8px;
   font-size: 13.5px; font-weight: 600; cursor: pointer; border: 1px solid transparent; background: var(--series); color: #fff; }
 .btn-action.caution { background: var(--surface); color: var(--ink); border-color: var(--input); }
+.btn-action.sm { padding: 5px 11px; font-size: 12.5px; }
 .btn-action:hover { filter: brightness(1.06); }
+.btn-row { display: flex; gap: 6px; flex-wrap: wrap; }
 .context { margin-top: 10px; font-size: 13px; color: var(--ink-2); }
 .context .hint { color: var(--good); font-weight: 600; }
 pre.logs { margin: 8px 0 0; padding: 12px 14px; background: var(--page); border: 1px solid var(--border);
@@ -157,17 +159,17 @@ export function incidentCard({ check, incident, context = {}, csrf, returnPath }
   }
 
   const actions = (incident.actions ?? [])
-    .map((a) => {
-      const params = a.container ? `<input type="hidden" name="container" value="${esc(a.container)}">` : "";
-      const target = a.target ? `<input type="hidden" name="target" value="${esc(a.target)}">` : "";
-      return `<form method="post" action="/action" onsubmit="return confirm(${jsStr(a.confirm)})" style="margin:0">
-  <input type="hidden" name="csrf" value="${esc(csrf)}">
-  <input type="hidden" name="actionId" value="${esc(a.id)}">
-  <input type="hidden" name="return" value="${esc(returnPath)}">
-  ${params}${target}
-  <button type="submit" class="btn-action ${a.kind === "caution" ? "caution" : ""}">${esc(a.label)}</button>
-</form>`;
-    })
+    .map((a) =>
+      actionForm({
+        id: a.id,
+        label: a.label,
+        kind: a.kind,
+        confirm: a.confirm,
+        params: { container: a.container, target: a.target },
+        csrf,
+        returnPath,
+      }),
+    )
     .join("");
 
   const guidance = incident.guidance ? `<div class="guidance">${esc(incident.guidance)}</div>` : "";
@@ -185,6 +187,24 @@ export function incidentCard({ check, incident, context = {}, csrf, returnPath }
 /** JSON-encode a string for safe inline use in a JS attribute. */
 function jsStr(s) {
   return esc(JSON.stringify(String(s)));
+}
+
+/**
+ * A single action button as a self-contained POST form (CSRF token, action id,
+ * params, and a confirm dialog). Used by incident cards and the backups page.
+ */
+export function actionForm({ id, label, kind = "safe", confirm, params = {}, csrf, returnPath, small = false }) {
+  const hidden = Object.entries(params)
+    .filter(([, v]) => v != null)
+    .map(([k, v]) => `<input type="hidden" name="${esc(k)}" value="${esc(v)}">`)
+    .join("");
+  return `<form method="post" action="/action" onsubmit="return confirm(${jsStr(confirm)})" style="margin:0">
+  <input type="hidden" name="csrf" value="${esc(csrf)}">
+  <input type="hidden" name="actionId" value="${esc(id)}">
+  <input type="hidden" name="return" value="${esc(returnPath)}">
+  ${hidden}
+  <button type="submit" class="btn-action ${kind === "caution" ? "caution" : ""} ${small ? "sm" : ""}">${esc(label)}</button>
+</form>`;
 }
 
 export function layout({ title, page, session, body, flash }) {
@@ -438,11 +458,17 @@ ${values.filter((v) => v !== null).length > 1 ? sparkline(values, { width: 640, 
   return layout({ title: name, page: "/checks", session, body, flash });
 }
 
-export function backupsPage({ session, backups, targets, flash }) {
+export function backupsPage({ session, backups, targets, flash, csrf }) {
   const rows = targets
     .map((t) => {
       const b = backups[t.name] ?? {};
       const ok = b.lastResult === "ok";
+      const buttons = [
+        actionForm({ id: "run-backup", label: "Back up now", kind: "safe", confirm: `Run the "${t.name}" backup now?`, params: { target: t.name }, csrf, returnPath: "/backups", small: true }),
+        t.type === "postgres"
+          ? actionForm({ id: "run-drill", label: "Test restore", kind: "caution", confirm: `Run a restore drill for "${t.name}"? It restores the latest backup into a temporary database to prove it works, then removes it. This can take a moment.`, params: { target: t.name }, csrf, returnPath: "/backups", small: true })
+          : "",
+      ].join("");
       return `<tr>
 <td>${b.lastResult ? statusPill(ok ? "ok" : "fail") : '<span class="detail">never run</span>'}</td>
 <td>${esc(t.name)}<br><span class="detail">${esc(t.type)}${t.schedule ? ` - ${esc(t.schedule)}` : " - manual"}</span></td>
@@ -450,14 +476,14 @@ export function backupsPage({ session, backups, targets, flash }) {
 <td class="num">${b.lastSizeBytes ? formatBytes(b.lastSizeBytes) : "-"}</td>
 <td>${b.offsite ? "yes" : "-"}</td>
 <td>${b.lastDrill ? `${statusPill(b.lastDrillResult === "ok" ? "ok" : "fail")} <span class="detail">${esc(formatDuration(Date.now() - Date.parse(b.lastDrill)))} ago</span>` : '<span class="detail">never</span>'}</td>
-<td><span class="detail">${esc((b.lastDetail ?? "").slice(0, 120))}</span></td>
+<td><div class="btn-row">${buttons}</div></td>
 </tr>`;
     })
     .join("");
   const body = `<h1>Backups</h1>
-<p class="sub">Run one now: <code>server-tools backup &lt;target&gt;</code> - prove restores work: <code>server-tools drill &lt;target&gt;</code> (see RUNBOOK.md).</p>
+<p class="sub">Back up any target now, or run a restore drill to prove a database backup actually restores - no terminal needed. Encrypted artifacts are kept locally and, when configured, uploaded offsite.</p>
 <table>
-<thead><tr><th>Status</th><th>Target</th><th>Last success</th><th>Size</th><th>Offsite</th><th>Restore drill</th><th>Detail</th></tr></thead>
+<thead><tr><th>Status</th><th>Target</th><th>Last success</th><th>Size</th><th>Offsite</th><th>Restore drill</th><th>Actions</th></tr></thead>
 <tbody>${rows || '<tr><td colspan="7" class="detail">No backup targets configured.</td></tr>'}</tbody>
 </table>`;
   return layout({ title: "Backups", page: "/backups", session, body, flash });

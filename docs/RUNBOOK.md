@@ -113,11 +113,16 @@ likely causes, and (where one is safe) a one-click fix. Three ways to reach it:
 
 The actions are deliberately conservative - none delete application data:
 
-| Action | What it does | When it is offered |
+| Action | What it does | Where it is offered |
 | --- | --- | --- |
-| `restart-container` | Restarts the named container (brief downtime) | container / postgres / http checks |
-| `reclaim-docker-space` | Removes unused Docker images + build cache | disk checks |
-| `run-backup` | Runs a configured backup target now | backup-freshness checks |
+| `restart-container` | Restarts the named container (brief downtime) | container / postgres / http incidents |
+| `reclaim-docker-space` | Removes unused Docker images + build cache | disk incidents |
+| `run-backup` | Runs a configured backup target now | backup-freshness incidents, and the Backups page |
+| `run-drill` | Restores the latest backup into a temporary database to prove it works, then removes it | the Backups page (database targets) |
+
+The **Backups page** also carries "Back up now" and "Test restore" buttons for
+every target, so a routine backup or a restore drill is one click instead of a
+terminal command.
 
 A restart only helps if the container itself is the problem; if the disk is
 also full, clear space first (a restart will not fix a full disk). Certificate

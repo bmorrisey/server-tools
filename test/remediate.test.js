@@ -95,6 +95,16 @@ test("runAction validates targets against config", async () => {
     assert.equal(r.ok, true);
     assert.match(r.message, /Reclaimed/);
 
+    // run-drill validates target existence and type before touching docker.
+    r = await runAction("run-drill", { target: "nope" }, { docker: null, store, config });
+    assert.equal(r.ok, false);
+    assert.match(r.message, /not a configured backup target/);
+
+    const filesConfig = { checks: [], backups: [{ name: "media", type: "files", path: "/x" }] };
+    r = await runAction("run-drill", { target: "media" }, { docker: null, store, config: filesConfig });
+    assert.equal(r.ok, false);
+    assert.match(r.message, /apply to database targets/);
+
     // Unknown action id.
     r = await runAction("format-c-drive", {}, { docker: null, store, config });
     assert.equal(r.ok, false);
