@@ -1,0 +1,144 @@
+import { test, after } from "node:test";
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { Store } from "../src/store.js";
+import { startWebServer } from "../src/web/server.js";
+import { createLoginToken } from "../src/web/auth.js";
+import { sparkline, meter, statusPill } from "../src/web/ui.js";
+
+const dir = fs.mkdtempSync(path.join(os.tmpdir(), "st-web-"));
+const store = new Store(dir);
+store.ensureDirs();
+
+const config = {
+  dataDir: dir,
+  checks: [{ name: "demo-http", type: "http", url: "http://127.0.0.1:1/health" }],
+  backups: [
+    { name: "demo-db", type: "postgres", container: "db-1", user: "u", database: "d", passphrase: "x".repeat(16) },
+  ],
+  deploys: [{ name: "demo-app", dir: "/apps/demo", healthUrl: "http://127.0.0.1:1/health" }],
+  alerts: {},
+  web: { enabled: true, port: 0, bind: "127.0.0.1", baseUrl: "http://127.0.0.1", allowedEmails: ["op@example.com"], sessionDays: 1 },
+};
+
+// Seed some state so pages render real content.
+store.writeState("checks", { "demo-http": { status: "ok", detail: "HTTP 200 in 12ms", type: "http", at: new Date().toISOString(), value: 12 } });
+store.writeState("backups", { "demo-db": { lastResult: "ok", lastSuccess: new Date().toISOString(), lastSizeBytes: 12345, lastDetail: "12 KiB, encrypted", offsite: false } });
+store.append("checks", { name: "demo-http", status: "ok", value: 12, detail: "HTTP 200" });
+store.append("checks", { name: "demo-http", status: "ok", value: 15, detail: "HTTP 200" });
+store.append("events", { topic: "backup", kind: "ok", name: "demo-db", detail: "12 KiB, encrypted" });
+
+const fakeDocker = { ping: async () => false };
+const server = await startWebServer({ config, store, docker: fakeDocker, alerter: null });
+const base = `http://127.0.0.1:${server.address().port}`;
+
+after(() => {
+  server.close();
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+async function get(pathname, { cookie = "", redirect = "manual" } = {}) {
+  return fetch(`${base}${pathname}`, { headers: cookie ? { cookie } : {}, redirect });
+}
+
+test("healthz is public", async () => {
+  const res = await get("/healthz");
+  assert.equal(res.status, 200);
+  assert.equal((await res.json()).status, "ok");
+});
+
+test("pages and API require a session", async () => {
+  for (const p of ["/", "/checks", "/backups", "/deploys", "/events"]) {
+    const res = await get(p);
+    assert.equal(res.status, 303, p);
+    assert.equal(res.headers.get("location"), "/login");
+  }
+  const api = await get("/api/status");
+  assert.equal(api.status, 401);
+});
+
+test("login page renders and sets security headers", async () => {
+  const res = await get("/login");
+  assert.equal(res.status, 200);
+  assert.match(res.headers.get("content-security-policy"), /default-src 'none'/);
+  assert.equal(res.headers.get("x-frame-options"), "DENY");
+  const html = await res.text();
+  assert.match(html, /sign-in link/i);
+});
+
+test("magic link login flow end to end", async () => {
+  const url = createLoginToken({ config, store, email: "op@example.com" });
+  const token = new URL(url).searchParams.get("token");
+
+  const res = await get(`/auth?token=${token}`);
+  assert.equal(res.status, 303);
+  assert.equal(res.headers.get("location"), "/");
+  const setCookie = res.headers.get("set-cookie");
+  assert.match(setCookie, /st_session=/);
+  const cookie = setCookie.split(";")[0];
+
+  // Token is burned.
+  const again = await get(`/auth?token=${token}`);
+  assert.equal(again.status, 400);
+
+  // Authenticated pages render.
+  for (const [p, marker] of [
+    ["/", "Overview"],
+    ["/checks", "demo-http"],
+    ["/backups", "demo-db"],
+    ["/deploys", "demo-app"],
+    ["/events", "backup"],
+    ["/checks/demo-http", "History"],
+  ]) {
+    const page = await get(p, { cookie });
+    assert.equal(page.status, 200, p);
+    assert.match(await page.text(), new RegExp(marker), p);
+  }
+
+  // JSON status.
+  const api = await get("/api/status", { cookie });
+  assert.equal(api.status, 200);
+  const body = await api.json();
+  assert.equal(body.checks["demo-http"].status, "ok");
+  assert.equal(body.dockerReachable, false);
+  assert.ok(body.host.memUsedPct > 0);
+
+  // Unknown check 404s; login POST rate limit eventually kicks in.
+  assert.equal((await get("/checks/nope", { cookie })).status, 404);
+});
+
+test("logout clears the session", async () => {
+  const url = createLoginToken({ config, store, email: "op@example.com" });
+  const res = await get(`/auth?token=${new URL(url).searchParams.get("token")}`);
+  const cookie = res.headers.get("set-cookie").split(";")[0];
+
+  const out = await fetch(`${base}/logout`, { method: "POST", headers: { cookie }, redirect: "manual" });
+  assert.equal(out.status, 303);
+  const after = await get("/", { cookie });
+  assert.equal(after.status, 303); // back to login
+});
+
+test("login POST is uniform for allowed and unknown emails", async () => {
+  for (const email of ["op@example.com", "stranger@example.com"]) {
+    const res = await fetch(`${base}/login`, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: `email=${encodeURIComponent(email)}`,
+    });
+    assert.equal(res.status, 200);
+    assert.match(await res.text(), /on its way/);
+  }
+});
+
+test("ui fragments render sanely", () => {
+  assert.match(statusPill("ok"), /✓ ok/);
+  assert.match(statusPill("fail"), /✕ fail/);
+  assert.equal(sparkline([1]), ""); // too few points
+  assert.match(sparkline([1, 5, 3, 8]), /<svg/);
+  assert.match(sparkline([1, 5, 3, 8]), /<title>latest 8/);
+  assert.match(meter(50), /width:50%/);
+  assert.match(meter(96), /fail/);
+  assert.match(meter(120), /width:100%/); // clamped
+});

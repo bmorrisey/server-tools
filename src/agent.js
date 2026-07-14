@@ -100,6 +100,22 @@ export async function startAgent({ configPath, withWeb = true } = {}) {
   // Housekeeping.
   schedule(config.housekeeping.schedule ?? "04:30", "housekeep", () => housekeep(config, store));
 
+  // Host metrics sample every minute (feeds the dashboard sparklines).
+  const metrics = await import("./metrics.js");
+  metrics.cpu(); // prime the delta
+  setInterval(() => {
+    try {
+      const mem = metrics.memory();
+      store.append("host", {
+        cpuPct: metrics.cpu().pct,
+        memPct: mem.usedPct,
+        load1: metrics.load().m1,
+      });
+    } catch (e) {
+      log.warn(`host metrics sample failed: ${e.message}`);
+    }
+  }, 60_000).unref();
+
   // Dashboard.
   let web = null;
   if (withWeb && config.web.enabled !== false) {
