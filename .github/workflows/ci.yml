@@ -21,7 +21,7 @@ jobs:
           set -e
           for f in $(find src -name '*.js'); do node --check "$f"; done
       - name: Unit tests
-        run: node --test test/
+        run: node --test
       - name: Validate example config
         run: |
           cp deploy/config.example.json config.json

@@ -13,7 +13,7 @@
   "scripts": {
     "agent": "node src/agent.js",
     "cli": "node src/cli.js",
-    "test": "node --test test/"
+    "test": "node --test"
   },
   "dependencies": {},
   "devDependencies": {}

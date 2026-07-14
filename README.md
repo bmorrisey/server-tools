@@ -87,7 +87,7 @@ statuses - never application content.
 ## Development
 
 ```bash
-node --test test/        # unit tests
+node --test              # unit tests
 node src/cli.js validate # config sanity
 ```
 
