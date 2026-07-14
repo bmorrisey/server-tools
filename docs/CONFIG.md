@@ -59,6 +59,11 @@ Common fields: `name` (unique), `type`, `interval`, `timeout`,
 Without `expectStatus`, any 2xx/3xx passes. `expectJson` asserts dotted paths
 in a JSON response body. `maxLatency` turns slow-but-up into a warn.
 
+Add an optional `"container": "<name>"` to an `http` check to name the
+container that serves it. It is not used for the check itself, but it lets the
+incident view offer a one-click "restart that container" fix and show its
+recent logs when the endpoint is unhealthy.
+
 ### `tcp`
 
 ```json

@@ -20,6 +20,7 @@ agent trusts is Node itself.
 | Restore | One-command restore, plus a `drill` command that restores the latest artifact into a scratch database and validates it, so you find out your backups work before you need them |
 | Deploys | `server-tools deploy <app> <tag>`: fetch, checkout, rebuild, health-verify, and roll back automatically if the new version does not come up healthy |
 | Housekeeping | Prunes its own history, expires temp files, age-based cleanup of directories you configure |
+| Incident cards | Every failing check becomes a plain-language card: what it means, the likely causes (with live detail like reclaimable disk space and recent container logs), and safe one-click fixes - restart a container, reclaim unused Docker space, run a backup now. No SSH, no jargon |
 | Dashboard | Server-rendered admin portal: status tiles, host gauges, check history sparklines, backup/deploy/event views. Magic-link login (email or CLI-generated), long-lived device sessions |
 
 ## Screenshots
@@ -31,6 +32,23 @@ your OS's light or dark theme:
 ![Dashboard overview, light theme](docs/screenshots/overview.png)
 
 ![Dashboard overview, dark theme](docs/screenshots/overview-dark.png)
+
+When something is wrong, the dashboard leads with an "Attention needed"
+section: each failing check is explained in plain words, with likely causes
+and safe one-click fixes - not just a red light:
+
+![Incident cards with one-click fixes](docs/screenshots/incidents.png)
+
+Opening a failing check shows the same card plus recent container logs and the
+value history, so you can see context without SSHing in:
+
+![Check detail with recent logs](docs/screenshots/incident-detail.png)
+
+The Backups page turns routine chores into buttons: back up any target now, or
+run a restore drill that proves a database backup actually restores - no
+terminal needed:
+
+![Backups page with one-click actions](docs/screenshots/backups.png)
 
 Per-check history with values over time, and the sign-in flow (magic links,
 no passwords):
@@ -70,7 +88,8 @@ src/
                   restore, drill
   deploy.js       tag checkout + compose build + health gate + auto-rollback
   housekeep.js    history/temp/directory cleanup
-  web/            dashboard (added in the dashboard PR)
+  remediate.js    plain-language incident diagnosis + one-click safe actions
+  web/            dashboard: http server, magic-link auth, UI, action routes
 ```
 
 ## What the toolkit assumes about your applications

@@ -11,6 +11,7 @@ import {
   destroySession,
   sessionCookie,
   emailAllowed,
+  csrfValid,
   RateLimiter,
 } from "../src/web/auth.js";
 
@@ -91,6 +92,41 @@ test("sessions expire", () => {
     for (const k of Object.keys(auth.sessions)) auth.sessions[k].expires = Date.now() - 1;
     store.writeState("auth", auth);
     assert.equal(sessionFromCookie({ store, cookieHeader: `st_session=${sessionId}` }), null);
+  } finally {
+    cleanup();
+  }
+});
+
+test("sessions carry a CSRF token and csrfValid checks it", () => {
+  const { store, config, cleanup } = ctx();
+  try {
+    const url = createLoginToken({ config, store, email: "op@example.com" });
+    const sessionId = consumeToken({ config, store, token: new URL(url).searchParams.get("token") });
+    const session = sessionFromCookie({ store, cookieHeader: `st_session=${sessionId}` });
+    assert.ok(session.csrf && session.csrf.length >= 16);
+    assert.ok(csrfValid(session, session.csrf));
+    assert.ok(!csrfValid(session, "wrong-token"));
+    assert.ok(!csrfValid(session, ""));
+    assert.ok(!csrfValid({ email: "x" }, "anything")); // no csrf on session
+  } finally {
+    cleanup();
+  }
+});
+
+test("sessions created before CSRF existed get one backfilled on read", () => {
+  const { store, config, cleanup } = ctx();
+  try {
+    const url = createLoginToken({ config, store, email: "op@example.com" });
+    const sessionId = consumeToken({ config, store, token: new URL(url).searchParams.get("token") });
+    // Simulate a legacy session with no csrf field.
+    const auth = store.readState("auth");
+    for (const k of Object.keys(auth.sessions)) delete auth.sessions[k].csrf;
+    store.writeState("auth", auth);
+    const session = sessionFromCookie({ store, cookieHeader: `st_session=${sessionId}` });
+    assert.ok(session.csrf);
+    // And it persisted.
+    const again = sessionFromCookie({ store, cookieHeader: `st_session=${sessionId}` });
+    assert.equal(session.csrf, again.csrf);
   } finally {
     cleanup();
   }

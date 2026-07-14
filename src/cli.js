@@ -12,6 +12,8 @@
  *   server-tools deploy <target> <ref> [--dry-run]
  *   server-tools housekeep [--dry-run]
  *   server-tools status                  print latest check/backup state
+ *   server-tools diagnose <check>        explain a failing check in plain words
+ *   server-tools fix <check> [actionId]  run a suggested one-click remediation
  *   server-tools login-link <email>      print a one-time dashboard login URL
  *   server-tools validate                validate the config file and exit
  */
@@ -174,6 +176,50 @@ async function main() {
           `  ${s.lastResult === "ok" ? "OK  " : "FAIL"} ${name.padEnd(26)} last ${s.lastSuccess ?? "never"}  ${s.lastDetail ?? ""}\n`,
         );
       }
+      break;
+    }
+
+    case "diagnose": {
+      const name = positional[0] ?? fail("usage: diagnose <check>");
+      const check = findTarget({ checks: config.checks }, "checks", name);
+      const state = store.readState("checks", {})[name];
+      if (!state) fail(`check "${name}" has not run yet (run: server-tools check ${name})`);
+      const { diagnose, gatherContext } = await import("./remediate.js");
+      const incident = diagnose(check, state);
+      if (!incident) {
+        process.stdout.write(`${name} is healthy: ${state.detail ?? "ok"}\n`);
+        break;
+      }
+      const ctx = await gatherContext(check, { docker });
+      process.stdout.write(`${incident.severity.toUpperCase()}: ${incident.title}\n\n${incident.meaning}\n`);
+      if (incident.causes?.length) {
+        process.stdout.write(`\nLikely causes:\n${incident.causes.map((c) => `  - ${c}`).join("\n")}\n`);
+      }
+      if (ctx.reclaimableText) process.stdout.write(`\n${ctx.reclaimableText}\n`);
+      if (ctx.top?.length) process.stdout.write(`\nBusiest containers:\n${ctx.top.map((t) => `  ${t.name.padEnd(28)} ${t.text}`).join("\n")}\n`);
+      if (incident.actions?.length) {
+        process.stdout.write(`\nSuggested actions (run: server-tools fix ${name} <id>):\n`);
+        for (const a of incident.actions) process.stdout.write(`  ${a.id.padEnd(22)} ${a.label} [${a.kind}]\n`);
+      }
+      if (incident.guidance) process.stdout.write(`\nNote: ${incident.guidance}\n`);
+      if (ctx.logs) process.stdout.write(`\nRecent logs (${check.container}):\n${ctx.logs.split("\n").map((l) => `  ${l}`).join("\n")}\n`);
+      break;
+    }
+
+    case "fix": {
+      const name = positional[0] ?? fail("usage: fix <check> [actionId]");
+      const check = findTarget({ checks: config.checks }, "checks", name);
+      const state = store.readState("checks", {})[name];
+      if (!state) fail(`check "${name}" has not run yet`);
+      const { diagnose, runAction } = await import("./remediate.js");
+      const incident = diagnose(check, state);
+      const actions = incident?.actions ?? [];
+      if (!actions.length) fail(`no one-click action available for "${name}"; run: server-tools diagnose ${name}`);
+      const chosen = positional[1] ? actions.find((a) => a.id === positional[1]) : actions[0];
+      if (!chosen) fail(`no action "${positional[1]}" for "${name}"; options: ${actions.map((a) => a.id).join(", ")}`);
+      const result = await runAction(chosen.id, { container: chosen.container, target: chosen.target }, { docker, store, config });
+      process.stdout.write(`${result.ok ? "OK" : "FAILED"}: ${result.message}\n`);
+      process.exit(result.ok ? 0 : 1);
       break;
     }
 

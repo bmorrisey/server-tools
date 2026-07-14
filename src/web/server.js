@@ -22,6 +22,7 @@ import * as ui from "./ui.js";
 import * as auth from "./auth.js";
 import * as metrics from "../metrics.js";
 import { sendMail } from "../smtp.js";
+import { diagnose, gatherContext, runAction, ACTION_IDS } from "../remediate.js";
 import { logger } from "../log.js";
 
 const log = logger("web");
@@ -102,6 +103,45 @@ function hostSparks(store) {
   };
 }
 
+/**
+ * Build incident cards for checks that are not passing. On the overview we
+ * include every failing check plus warnings that have a concrete action (so a
+ * "disk getting full" warn shows its reclaim button, but a bare warn does not
+ * clutter the page). Context (logs/df/stats) is gathered per incident.
+ */
+async function computeIncidents(config, checks, docker, { overviewOnly = false } = {}) {
+  const out = [];
+  for (const check of config.checks ?? []) {
+    const state = checks[check.name];
+    if (!state || state.status === "ok") continue;
+    const incident = diagnose(check, state);
+    if (!incident) continue;
+    if (overviewOnly && state.status === "warn" && !(incident.actions?.length)) continue;
+    const context = await gatherContext(check, { docker });
+    out.push({ check, state, incident, context });
+    if (out.length >= 8) break;
+  }
+  // Failures first, then warnings.
+  return out.sort((a, b) => (a.state.status === "fail" ? 0 : 1) - (b.state.status === "fail" ? 0 : 1));
+}
+
+function parseFlash(url) {
+  const message = url.searchParams.get("msg");
+  if (!message) return null;
+  return { ok: url.searchParams.get("ok") === "1", message: message.slice(0, 300) };
+}
+
+function flashUrl(path, ok, message) {
+  const q = new URLSearchParams({ ok: ok ? "1" : "0", msg: String(message).slice(0, 300) });
+  return `${path}?${q.toString()}`;
+}
+
+/** Only allow returning to an internal dashboard path (no open redirects). */
+function safeReturn(path) {
+  if (typeof path !== "string" || !path.startsWith("/") || path.startsWith("//")) return "/";
+  return path.split("?")[0];
+}
+
 function checkHistory(store, name = null) {
   const samples = store.recent("checks", { limit: 4000, maxDays: 3 });
   const byName = {};
@@ -174,39 +214,68 @@ export function startWebServer({ config, store, docker, alerter }) {
     }
 
     if (req.method === "POST" && path === "/logout") {
+      const body = new URLSearchParams(await readBody(req));
+      if (!auth.csrfValid(session, body.get("csrf"))) return redirect(res, "/");
       auth.destroySession({ store, cookieHeader: req.headers.cookie });
       return redirect(res, "/login", { "set-cookie": auth.clearCookie() });
     }
 
+    // One-click remediation. State-changing, so CSRF-protected and validated.
+    if (req.method === "POST" && path === "/action") {
+      const body = new URLSearchParams(await readBody(req));
+      if (!auth.csrfValid(session, body.get("csrf"))) return send(res, 403, "<h1>Invalid request token</h1>");
+      const actionId = body.get("actionId") ?? "";
+      const returnPath = safeReturn(body.get("return"));
+      if (!ACTION_IDS.has(actionId)) {
+        return redirect(res, flashUrl(returnPath, false, `Unknown action "${actionId}"`));
+      }
+      log.info(`action requested: ${actionId} by ${session.email}`);
+      const result = await runAction(actionId, { container: body.get("container"), target: body.get("target") }, { docker, store, config });
+      return redirect(res, flashUrl(returnPath, result.ok, result.message));
+    }
+
     if (req.method !== "GET") return send(res, 405, "<h1>Method not allowed</h1>");
 
+    const flash = parseFlash(url);
     const checks = store.readState("checks", {});
     const backups = store.readState("backups", {});
     const deploys = store.readState("deploys", {});
     const events = store.recent("events", { limit: 400, maxDays: 7 });
 
     if (path === "/") {
-      const [host, sparks] = [await collectHost(config), hostSparks(store)];
-      return send(res, 200, ui.overviewPage({ session, host, checks, backups, deploys, events, sparks }));
+      const [host, sparks, incidents] = [await collectHost(config), hostSparks(store), await computeIncidents(config, checks, docker, { overviewOnly: true })];
+      return send(res, 200, ui.overviewPage({ session, host, checks, backups, deploys, events, sparks, incidents, flash, csrf: session.csrf }));
     }
     if (path === "/checks") {
-      return send(res, 200, ui.checksPage({ session, checks, historyByName: checkHistory(store) }));
+      return send(res, 200, ui.checksPage({ session, checks, historyByName: checkHistory(store), flash }));
     }
     if (path.startsWith("/checks/")) {
       const name = decodeURIComponent(path.slice("/checks/".length));
-      if (!config.checks.some((c) => c.name === name) && !checks[name]) {
+      const checkConfig = config.checks.find((c) => c.name === name);
+      if (!checkConfig && !checks[name]) {
         return send(res, 404, "<h1>No such check</h1>");
       }
-      return send(res, 200, ui.checkDetailPage({ session, name, current: checks[name], samples: checkHistory(store, name) }));
+      const current = checks[name];
+      let incident = null;
+      let context = {};
+      if (checkConfig && current && current.status !== "ok") {
+        incident = diagnose(checkConfig, current);
+        if (incident) context = await gatherContext(checkConfig, { docker });
+      }
+      return send(
+        res,
+        200,
+        ui.checkDetailPage({ session, name, current, samples: checkHistory(store, name), incident, context, checkConfig, csrf: session.csrf, flash }),
+      );
     }
     if (path === "/backups") {
-      return send(res, 200, ui.backupsPage({ session, backups, targets: config.backups }));
+      return send(res, 200, ui.backupsPage({ session, backups, targets: config.backups, flash, csrf: session.csrf }));
     }
     if (path === "/deploys") {
-      return send(res, 200, ui.deploysPage({ session, deploys, targets: config.deploys, events }));
+      return send(res, 200, ui.deploysPage({ session, deploys, targets: config.deploys, events, flash }));
     }
     if (path === "/events") {
-      return send(res, 200, ui.eventsPage({ session, events }));
+      return send(res, 200, ui.eventsPage({ session, events, flash }));
     }
     if (path === "/api/status") {
       const host = await collectHost(config);
