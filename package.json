@@ -1,0 +1,20 @@
+{
+  "name": "server-tools",
+  "version": "0.1.0",
+  "description": "Self-contained ops toolkit for a single-box Docker VPS: health checks, alerts, encrypted offsite backups, safe deploys, housekeeping, and an admin dashboard.",
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=20.10"
+  },
+  "bin": {
+    "server-tools": "src/cli.js"
+  },
+  "scripts": {
+    "agent": "node src/agent.js",
+    "cli": "node src/cli.js",
+    "test": "node --test"
+  },
+  "dependencies": {},
+  "devDependencies": {}
+}
