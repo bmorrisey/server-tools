@@ -83,6 +83,10 @@ the deploy helper should manage, keeping container path = config path:
 Media directories for `files` backup targets need to be visible too (a
 read-only mount is enough for manifest/verify: add `:ro`).
 
+The `/:/host:ro` mount also lets the Storage page report container log file
+sizes. Without it the page still works; it just cannot show how big the log
+files have grown.
+
 ## 5. Start the agent
 
 ```bash

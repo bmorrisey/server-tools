@@ -11,9 +11,31 @@ root-equivalent on the host. Treat the agent's config and environment with
 the same care as root credentials, and treat dashboard access as operator
 access.
 
-What it does with that power is intentionally narrow and reviewable: the
-Docker client implements only list/inspect/stats/exec, and exec is used for
-`pg_dump`, `psql`, and the in-container commands you configure yourself.
+What it does with that power is intentionally narrow and reviewable. The
+Docker client implements only list, inspect, stats, exec, restart, disk usage,
+prune, and remove. Exec is used for `pg_dump`, `psql`, and the in-container
+commands you configure yourself.
+
+Destructive calls are bounded by design, because this runs alongside live
+production:
+
+- **Volumes are never deleted.** There is no code path, action id, or API
+  method in the toolkit that removes a volume. Unreferenced volumes are
+  reported so a human can decide.
+- **Running containers are never removed or stopped**, only restarted, and
+  only when the container is named by your own config.
+- **Container removal** is limited to containers that already exited, are not
+  set to restart, and have been stopped longer than
+  `housekeeping.staleContainerAge`. The volume flag is never sent.
+- **Image removal** goes through the Engine, which refuses to remove anything
+  a container references, and skips any tag matched by
+  `housekeeping.keepImages`. Nothing is ever forced.
+- **Backup pruning** removes only artifacts the configured retention policy
+  had already marked for deletion.
+
+Every candidate list is computed by a pure function (`src/storage.js`), shown
+in full before the operator confirms, and acted on verbatim. Every action is
+recorded in the event history with what it removed.
 
 ## Dashboard authentication
 
@@ -67,6 +89,19 @@ The dashboard renders operational metadata only: check statuses, latencies,
 sizes, counts, timestamps, container states, and event descriptions composed
 by this toolkit. It has no code path that reads application database rows or
 media files.
+
+Pages are served under a strict Content-Security-Policy: `default-src 'none'`,
+no external origins, and a `script-src` that permits exactly one script by its
+SHA-256 hash (the confirmation and progress handler). `'unsafe-inline'` is not
+allowed for scripts, so an injected script cannot execute even if markup
+escaping were bypassed. Editing that script changes its hash, and the header is
+derived from the same source, so the two cannot drift apart.
+
+Because that policy blocks inline event handlers, any confirmation or client
+behaviour must live in that one hashed script. An `onclick=` or `onsubmit=`
+attribute will be silently ignored by the browser, which for a confirmation
+dialog means the action fires with no prompt at all. A test asserts that no
+inline handlers are rendered.
 
 ## Hardening checklist
 

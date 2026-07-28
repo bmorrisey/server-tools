@@ -90,14 +90,40 @@ and after changing anything about backups. The result shows on the dashboard.
 
 ## Disk is filling up
 
-1. `server-tools check` - the disk check shows current usage.
-2. Biggest usual suspects, in order: docker build cache and old images
-   (`docker system df`, then `docker image prune -a` and
-   `docker builder prune`), application media growth, local backup
-   artifacts.
-3. Local backup artifacts are pruned by retention after every successful
-   run; tighten `retention` counts in config if they are the problem.
-4. `server-tools housekeep --dry-run` shows what cleanup would remove.
+Open **Storage** in the dashboard (or run `server-tools storage`). It answers
+the three questions in order: where the space went, which compose project is
+holding it, and what can be removed right now.
+
+1. **Read the breakdown.** Images, container writable layers, volumes, build
+   cache, backups, and everything else, as sizes and as a share of the disk.
+   On a box that builds its own images, old images and build cache are very
+   often most of the surprise.
+2. **Check the per-project table.** It shows images, volumes, and writable
+   layers per compose project, so a single noisy project is obvious.
+3. **Pick a cleanup.** Each option states exactly what it removes and what it
+   costs before you confirm:
+
+   | Action | Frees | What it costs you |
+   | --- | --- | --- |
+   | `reclaim-build-cache` | Unused build layers | Nothing. The next image build starts cold. |
+   | `reclaim-dangling-images` | Untagged leftover images | Nothing. |
+   | `remove-unused-images` | Every image no container uses | Rolling back to one of those versions means rebuilding or pulling it again. |
+   | `remove-stopped-containers` | Old one-off containers | Their logs go with them. |
+   | `prune-backups` | Backup artifacts already past retention | Nothing the schedule was not going to delete anyway. |
+   | `trim-history` | The toolkit's own old history and temp files | Nothing. |
+
+   From a terminal: `server-tools reclaim <action> [target]`.
+4. **Volumes are never removed for you.** The page lists them, flags the ones
+   nothing references, and stops there. An unreferenced volume is very often
+   the database of a project that is simply down right now. Confirm what it
+   belongs to, then remove it yourself: `docker volume rm <name>`.
+5. **If backups are the problem**, tighten `retention` counts in config; the
+   prune runs after every successful backup.
+6. `server-tools housekeep --dry-run` shows what the scheduled cleanup would
+   remove.
+
+Nothing on the Storage page stops a running container, removes a container
+that is meant to be running, or touches application data.
 
 ## Understanding and fixing an incident
 
@@ -117,6 +143,7 @@ The actions are deliberately conservative - none delete application data:
 | --- | --- | --- |
 | `restart-container` | Restarts the named container (brief downtime) | container / postgres / http incidents |
 | `reclaim-docker-space` | Removes unused Docker images + build cache | disk incidents |
+| `reclaim-build-cache`, `reclaim-dangling-images`, `remove-unused-images`, `remove-stopped-containers`, `trim-history` | Targeted disk reclamation, each previewed before it runs | the Storage page (see "Disk is filling up") |
 | `run-backup` | Runs a configured backup target now | backup-freshness incidents, and the Backups page |
 | `run-drill` | Restores the latest backup into a temporary database to prove it works, then removes it | the Backups page (database targets) |
 

@@ -25,6 +25,11 @@ dashboard; `src/cli.js` runs any operation by hand.
   history, error messages, or URLs.
 - **Backups copy bytes as they are.** No decryption, transformation, or
   inspection of application data anywhere in the backup path.
+- **Destructive actions stay conservative.** This runs against live
+  production. Never delete a volume, never touch a running container, and
+  never remove anything the operator was not shown first. Any new cleanup
+  must compute its candidate list as a pure, tested function and act on
+  exactly that list. See the safety model at the top of `src/storage.js`.
 - No em-dashes in code, comments, docs, or commit messages; use plain
   hyphens.
 - Commits: imperative subject line, body explains why; no AI attribution
@@ -47,6 +52,7 @@ dashboard; `src/cli.js` runs any operation by hand.
 | `src/backup/` | backup engine, AES-256-GCM streaming crypto, S3 SigV4 client, GFS retention, restore + drill |
 | `src/deploy.js` | git checkout + compose build + health gate + rollback |
 | `src/housekeep.js` | history pruning, temp expiry, configured dir cleanup |
+| `src/storage.js` | disk usage analysis + conservative, previewed reclamation |
 | `src/remediate.js` | plain-language incident diagnosis + validated one-click actions |
 | `src/web/` | dashboard: http server, magic-link auth, server-rendered UI, action routes |
 | `deploy/` | Dockerfile, docker-compose.yml, config + env examples |
@@ -55,7 +61,7 @@ dashboard; `src/cli.js` runs any operation by hand.
 ## Working here
 
 ```bash
-node --test test/                 # run the suite; keep it green
+node --test                      # run the suite; keep it green
 node src/cli.js validate          # after any config-schema change
 node --check src/<file>.js        # syntax check a module
 ```
@@ -67,7 +73,10 @@ node --check src/<file>.js        # syntax check a module
   `cat` and `jq` must be able to debug an incident. Do not switch the store
   to a binary format.
 - The dashboard is server-rendered HTML with inline CSS/JS and no external
-  assets (works with a strict CSP and no CDN). Keep it that way.
+  assets (works with a strict CSP and no CDN). Keep it that way. Client
+  behaviour goes in the single hashed `SCRIPT` block in `src/web/ui.js`;
+  inline `on*=` attributes are blocked by the CSP and fail silently, so a
+  confirmation written that way never prompts at all.
 - Config changes need: validation in `src/config.js`, documentation in
   `docs/CONFIG.md`, and the example in `deploy/config.example.json` updated
   together.

@@ -10,17 +10,21 @@
  *   GET  /auth?token=...   consume a link -> session cookie
  *   POST /logout
  *   GET  /                 overview          } session required
+ *   GET  /storage          disk breakdown + safe cleanup options }
  *   GET  /checks[/name]    checks + history  }
  *   GET  /backups          backup targets    }
  *   GET  /deploys          deploy history    }
  *   GET  /events           event log         }
+ *   POST /action           run one validated remediation (CSRF protected)
  *   GET  /api/status       machine-readable snapshot (session required)
+ *   GET  /api/storage      machine-readable storage report (session required)
  */
 import http from "node:http";
 import { URL } from "node:url";
 import * as ui from "./ui.js";
 import * as auth from "./auth.js";
 import * as metrics from "../metrics.js";
+import * as storage from "../storage.js";
 import { sendMail } from "../smtp.js";
 import { diagnose, gatherContext, runAction, ACTION_IDS } from "../remediate.js";
 import { logger } from "../log.js";
@@ -28,8 +32,12 @@ import { logger } from "../log.js";
 const log = logger("web");
 
 const SECURITY_HEADERS = {
+  // script-src allows exactly one script, by hash: the confirmation and
+  // progress handler in ui.js. No 'unsafe-inline', so an injected script
+  // still cannot run. Note that without a script-src, inline handlers are
+  // blocked outright, which is why confirmations must live in that block.
   "content-security-policy":
-    "default-src 'none'; style-src 'unsafe-inline'; img-src 'self' data:; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+    `default-src 'none'; script-src ${ui.SCRIPT_HASH}; style-src 'unsafe-inline'; img-src 'self' data:; form-action 'self'; base-uri 'none'; frame-ancestors 'none'`,
   "x-content-type-options": "nosniff",
   "x-frame-options": "DENY",
   "referrer-policy": "no-referrer",
@@ -268,6 +276,10 @@ export function startWebServer({ config, store, docker, alerter }) {
         ui.checkDetailPage({ session, name, current, samples: checkHistory(store, name), incident, context, checkConfig, csrf: session.csrf, flash }),
       );
     }
+    if (path === "/storage") {
+      const report = await storage.report({ docker, store, config });
+      return send(res, 200, ui.storagePage({ session, report, flash, csrf: session.csrf }));
+    }
     if (path === "/backups") {
       return send(res, 200, ui.backupsPage({ session, backups, targets: config.backups, flash, csrf: session.csrf }));
     }
@@ -294,6 +306,9 @@ export function startWebServer({ config, store, docker, alerter }) {
         deploys,
         dockerReachable: await docker.ping(),
       });
+    }
+    if (path === "/api/storage") {
+      return send(res, 200, await storage.report({ docker, store, config }));
     }
 
     return send(res, 404, "<h1>Not found</h1>");

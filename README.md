@@ -20,6 +20,7 @@ agent trusts is Node itself.
 | Restore | One-command restore, plus a `drill` command that restores the latest artifact into a scratch database and validates it, so you find out your backups work before you need them |
 | Deploys | `server-tools deploy <app> <tag>`: fetch, checkout, rebuild, health-verify, and roll back automatically if the new version does not come up healthy |
 | Housekeeping | Prunes its own history, expires temp files, age-based cleanup of directories you configure |
+| Storage | A page that answers "what is eating my disk": images, container layers, volumes, build cache, and backups broken down by size and by Docker Compose project, plus previewed one-click cleanups. Volumes are reported but never deleted for you |
 | Incident cards | Every failing check becomes a plain-language card: what it means, the likely causes (with live detail like reclaimable disk space and recent container logs), and safe one-click fixes - restart a container, reclaim unused Docker space, run a backup now. No SSH, no jargon |
 | Dashboard | Server-rendered admin portal: status tiles, host gauges, check history sparklines, backup/deploy/event views. Magic-link login (email or CLI-generated), long-lived device sessions |
 
@@ -49,6 +50,13 @@ run a restore drill that proves a database backup actually restores - no
 terminal needed:
 
 ![Backups page with one-click actions](docs/screenshots/backups.png)
+
+The Storage page answers "why is this box full?" without a shell: usage broken
+down by category and by Docker Compose project, then a short list of cleanups
+that each state exactly what they remove and what it costs before you confirm.
+Volumes are listed and sized, but never deleted for you:
+
+![Storage page with usage breakdown and safe cleanup options](docs/screenshots/storage.png)
 
 Per-check history with values over time, and the sign-in flow (magic links,
 no passwords):
@@ -88,6 +96,7 @@ src/
                   restore, drill
   deploy.js       tag checkout + compose build + health gate + auto-rollback
   housekeep.js    history/temp/directory cleanup
+  storage.js      disk usage analysis + previewed, conservative reclamation
   remediate.js    plain-language incident diagnosis + one-click safe actions
   web/            dashboard: http server, magic-link auth, UI, action routes
 ```
