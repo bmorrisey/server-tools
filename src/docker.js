@@ -5,6 +5,7 @@
  * Only the handful of endpoints the toolkit uses are implemented:
  *   - listContainers / inspect / stats  (health + resource checks)
  *   - exec                              (pg_dump, psql, in-container commands)
+ *   - systemDf / prune / remove         (disk usage reporting and reclamation)
  *
  * Exec output uses Docker's multiplexed stream framing (8-byte header per
  * frame: [type, 0, 0, 0, len_be32]); demux() splits stdout/stderr.
@@ -13,6 +14,19 @@ import http from "node:http";
 import { logger } from "./log.js";
 
 const log = logger("docker");
+
+/**
+ * Image references and container ids go into the request path verbatim (the
+ * engine expects unescaped slashes in "registry/name:tag"), so anything that
+ * could change the meaning of the URL is rejected outright.
+ */
+export function safeRef(ref) {
+  const s = String(ref ?? "");
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:@/-]*$/.test(s)) {
+    throw new Error(`unsafe docker reference: ${JSON.stringify(s).slice(0, 80)}`);
+  }
+  return s;
+}
 
 export class Docker {
   constructor({ socketPath = "/var/run/docker.sock" } = {}) {
@@ -95,6 +109,22 @@ export class Docker {
   async pruneImages() {
     const r = await this.request("POST", "/images/prune", undefined);
     return r?.SpaceReclaimed ?? 0;
+  }
+
+  /**
+   * Remove one image by tag or id. The engine refuses (409) when a container
+   * still references it, which is the safety net we rely on; we never force.
+   */
+  removeImage(ref) {
+    return this.request("DELETE", `/images/${safeRef(ref)}`);
+  }
+
+  /**
+   * Remove a stopped container. The volume flag is deliberately absent: this
+   * toolkit never deletes a volume, and the engine defaults it to false.
+   */
+  removeContainer(id) {
+    return this.request("DELETE", `/containers/${safeRef(id)}`);
   }
 
   /** Remove reclaimable build cache. Returns bytes reclaimed. */

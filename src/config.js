@@ -101,6 +101,28 @@ export function validateConfig(cfg) {
     need(typeof d.healthUrl === "string" && d.healthUrl.startsWith("http"), `${where}.healthUrl must be an http(s) URL`);
   }
 
+  const hk = cfg.housekeeping ?? {};
+  if (hk.schedule !== undefined)
+    need(parseSchedule(hk.schedule) !== null, `housekeeping.schedule "${hk.schedule}" is not a valid schedule`);
+  if (hk.historyDays !== undefined)
+    need(Number.isInteger(hk.historyDays) && hk.historyDays >= 0, "housekeeping.historyDays must be a non-negative integer");
+  if (hk.tmpAge !== undefined) need(parseDuration(hk.tmpAge) !== null, `housekeeping.tmpAge "${hk.tmpAge}" is not a duration`);
+  if (hk.staleContainerAge !== undefined)
+    need(
+      parseDuration(hk.staleContainerAge) !== null,
+      `housekeeping.staleContainerAge "${hk.staleContainerAge}" is not a duration`,
+    );
+  if (hk.keepImages !== undefined)
+    need(
+      Array.isArray(hk.keepImages) && hk.keepImages.every((p) => typeof p === "string" && p),
+      "housekeeping.keepImages must be an array of image tag patterns",
+    );
+  for (const [i, rule] of (hk.clean ?? []).entries()) {
+    need(typeof rule.path === "string" && rule.path, `housekeeping.clean[${i}].path is required`);
+    if (rule.maxAge !== undefined)
+      need(parseDuration(rule.maxAge) !== null, `housekeeping.clean[${i}].maxAge "${rule.maxAge}" is not a duration`);
+  }
+
   const alerts = cfg.alerts ?? {};
   if (alerts.smtp) {
     for (const k of ["host", "from", "to"]) {

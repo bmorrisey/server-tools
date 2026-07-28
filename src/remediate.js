@@ -12,14 +12,17 @@
  * Design rules:
  * - Actions are conservative. Nothing here deletes application data. The most
  *   forceful thing is restarting a container or removing *unused* Docker images
- *   and build cache.
+ *   and build cache. Volumes are never removed (see src/storage.js for the
+ *   full reclamation safety model).
  * - Each action declares a `kind`: "safe" (do it without a second thought) or
  *   "caution" (reversible but worth a confirm, e.g. restarting a database).
  * - Everything is described so the UI and the CLI render the same words.
  */
 import { runBackup, prune as pruneBackups } from "./backup/backup.js";
 import { drill } from "./backup/restore.js";
-import { formatBytes } from "./util.js";
+import { housekeep } from "./housekeep.js";
+import * as storage from "./storage.js";
+import { formatBytes, parseDuration } from "./util.js";
 
 /**
  * Build the incident for a check + its latest state. Pure function (no I/O) so
@@ -94,6 +97,7 @@ export function diagnose(check, state) {
         actions: [
           { id: "reclaim-docker-space", label: "Reclaim unused Docker space", kind: "safe", confirm: "Remove unused Docker images and build cache? This never touches running containers or their data." },
         ],
+        link: { href: "/storage", label: "See what is using the disk" },
       };
 
     case "memory":
@@ -272,7 +276,37 @@ export async function runAction(actionId, params, { docker, store, config }) {
         const images = await docker.pruneImages();
         const cache = await docker.pruneBuildCache();
         const total = (images ?? 0) + (cache ?? 0);
+        storage.invalidate();
         return record(true, `Reclaimed ${formatBytes(total)} of disk (unused images + build cache).`);
+      }
+
+      case "reclaim-build-cache": {
+        const { bytes } = await storage.reclaimBuildCache(docker);
+        return record(true, `Cleared ${formatBytes(bytes)} of unused build cache.`);
+      }
+
+      case "reclaim-dangling-images": {
+        const { bytes } = await storage.reclaimDanglingImages(docker);
+        return record(true, `Removed untagged leftover images, freeing ${formatBytes(bytes)}.`);
+      }
+
+      case "remove-unused-images": {
+        const result = await storage.removeUnusedImages(docker, { keep: config.housekeeping?.keepImages ?? [] });
+        const note = result.skipped.length ? ` ${result.skipped.length} turned out to be in use and were left alone.` : "";
+        return record(true, `Removed ${result.removed} image${result.removed === 1 ? "" : "s"} with no container, freeing ${formatBytes(result.bytes)}.${note}`);
+      }
+
+      case "remove-stopped-containers": {
+        const olderThanMs = parseDuration(config.housekeeping?.staleContainerAge ?? storage.DEFAULT_STALE_CONTAINER_AGE) ?? 86_400_000;
+        const result = await storage.removeStaleContainers(docker, { olderThanMs });
+        const note = result.skipped.length ? ` ${result.skipped.length} could not be removed and were left alone.` : "";
+        return record(true, `Removed ${result.removed} stopped container${result.removed === 1 ? "" : "s"}, freeing ${formatBytes(result.bytes)}. No volume was touched.${note}`);
+      }
+
+      case "trim-history": {
+        const result = await housekeep(config, store, {});
+        storage.invalidate();
+        return record(true, `Housekeeping done: ${result.summary.join("; ") || "nothing needed removing"}.`);
       }
 
       case "run-backup": {
@@ -286,6 +320,7 @@ export async function runAction(actionId, params, { docker, store, config }) {
         const target = configuredBackup(config, params.target);
         if (!target) return record(false, `"${params.target}" is not a configured backup target`);
         const plan = await pruneBackups(target, { store });
+        storage.invalidate();
         return record(true, `Pruned ${plan.drop.length} old artifact(s) for "${target.name}".`);
       }
 
@@ -317,5 +352,23 @@ function configuredBackup(config, name) {
   return (config.backups ?? []).find((b) => b.name === name) ?? null;
 }
 
-/** The set of action ids that exist, for validating POSTs. */
-export const ACTION_IDS = new Set(["restart-container", "reclaim-docker-space", "run-backup", "prune-backups", "run-drill"]);
+/**
+ * The set of action ids that exist, for validating POSTs.
+ *
+ * Note what is not here and never should be: nothing removes a volume, and
+ * nothing removes a running container. Reclaiming space is always limited to
+ * images, build cache, containers that already exited, and backup artifacts
+ * the retention policy had already marked for deletion.
+ */
+export const ACTION_IDS = new Set([
+  "restart-container",
+  "reclaim-docker-space",
+  "reclaim-build-cache",
+  "reclaim-dangling-images",
+  "remove-unused-images",
+  "remove-stopped-containers",
+  "trim-history",
+  "run-backup",
+  "prune-backups",
+  "run-drill",
+]);

@@ -11,6 +11,8 @@
  *   server-tools artifacts <target>      list local + offsite artifacts
  *   server-tools deploy <target> <ref> [--dry-run]
  *   server-tools housekeep [--dry-run]
+ *   server-tools storage [--json]        what is using the disk, and what is reclaimable
+ *   server-tools reclaim <action>        run one storage cleanup (see storage output)
  *   server-tools status                  print latest check/backup state
  *   server-tools diagnose <check>        explain a failing check in plain words
  *   server-tools fix <check> [actionId]  run a suggested one-click remediation
@@ -54,8 +56,8 @@ async function main() {
     const usage = header
       .split("*/")[0]
       .split("\n")
-      .filter((l) => /^ \* {2}server-tools /.test(l))
-      .map((l) => l.replace(/^ \* {2}/, "  "))
+      .filter((l) => /^ \* {3}server-tools /.test(l))
+      .map((l) => l.replace(/^ \* {3}/, "  "))
       .join("\n");
     process.stdout.write(`usage:\n${usage}\n`);
     return;
@@ -160,6 +162,76 @@ async function main() {
     case "housekeep": {
       const result = await housekeep(config, store, { dryRun: flags.has("--dry-run") });
       process.stdout.write(`${result.dryRun ? "(dry run) " : ""}${result.summary.join("\n") || "nothing to remove"}\n`);
+      break;
+    }
+
+    case "storage": {
+      const storage = await import("./storage.js");
+      const report = await storage.report({ docker, store, config });
+      if (flags.has("--json")) {
+        process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
+        break;
+      }
+      if (report.disk) {
+        process.stdout.write(
+          `disk ${report.diskPath}: ${report.disk.usedPct}% used, ${formatBytes(report.disk.freeBytes)} free of ${formatBytes(report.disk.totalBytes)}\n\n`,
+        );
+      }
+      process.stdout.write("where the space is going:\n");
+      for (const b of report.breakdown) {
+        process.stdout.write(`  ${b.label.padEnd(30)} ${formatBytes(b.bytes).padStart(10)}\n`);
+      }
+      if (report.projects.length) {
+        process.stdout.write("\nby compose project (images / volumes / writable):\n");
+        for (const p of report.projects) {
+          process.stdout.write(
+            `  ${p.name.padEnd(30)} ${String(`${p.running}/${p.containers}`).padStart(6)}  ` +
+              `${formatBytes(p.imageBytes).padStart(10)} ${formatBytes(p.volumeBytes).padStart(10)} ${formatBytes(p.writableBytes).padStart(10)}\n`,
+          );
+        }
+      }
+      if (report.plan.length) {
+        process.stdout.write(`\nreclaimable (${formatBytes(report.reclaimableBytes)} total), run: server-tools reclaim <action>\n`);
+        for (const a of report.plan) {
+          const id = a.target ? `${a.id} ${a.target}` : a.id;
+          process.stdout.write(`  ${id.padEnd(34)} ${formatBytes(a.bytes).padStart(10)}  [${a.kind}] ${a.label}\n`);
+        }
+      } else {
+        process.stdout.write("\nnothing to reclaim\n");
+      }
+      const loose = report.volumes.filter((v) => !v.inUse);
+      if (loose.length) {
+        const shown = loose.slice(0, 10);
+        process.stdout.write(
+          `\n${loose.length} volume(s) with nothing referencing them, ${formatBytes(loose.reduce((s, v) => s + v.sizeBytes, 0))} total.\n` +
+            "these are your data and are never removed automatically; confirm before acting:\n",
+        );
+        for (const v of shown) {
+          process.stdout.write(`  ${v.name.padEnd(44)} ${formatBytes(v.sizeBytes).padStart(10)}\n`);
+        }
+        if (loose.length > shown.length) process.stdout.write(`  ... and ${loose.length - shown.length} more (see --json)\n`);
+      }
+      for (const f of report.findings) {
+        process.stdout.write(`\nheads up: ${f.title}\n  ${f.detail}\n`);
+      }
+      break;
+    }
+
+    case "reclaim": {
+      const storage = await import("./storage.js");
+      const { runAction } = await import("./remediate.js");
+      const report = await storage.report({ docker, store, config });
+      const wanted = positional[0] ?? fail("usage: reclaim <action> [target]");
+      const chosen = report.plan.find((a) => a.id === wanted && (!a.target || a.target === positional[1]));
+      if (!chosen) {
+        fail(
+          `no reclaim action "${wanted}"${positional[1] ? ` for "${positional[1]}"` : ""} available right now; run: server-tools storage`,
+        );
+      }
+      process.stdout.write(`${chosen.label}: ${chosen.what}\n${chosen.risk}\n\n`);
+      const result = await runAction(chosen.id, { target: chosen.target }, { docker, store, config });
+      process.stdout.write(`${result.ok ? "OK" : "FAILED"}: ${result.message}\n`);
+      process.exit(result.ok ? 0 : 1);
       break;
     }
 

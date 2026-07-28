@@ -39,14 +39,43 @@ store.append("checks", { name: "demo-http", status: "ok", value: 15, detail: "HT
 store.append("events", { topic: "backup", kind: "ok", name: "demo-db", detail: "12 KiB, encrypted" });
 
 let restarted = null;
+const removedContainers = [];
+const diskUsage = {
+  LayersSize: 3_000_000,
+  BuilderSize: 1_000_000,
+  Images: [{ Id: "sha256:old", RepoTags: ["demo/app:v1"], Size: 3_000_000, Containers: 0, Created: 1_700_000_000 }],
+  Containers: [
+    {
+      Id: "leftover",
+      Names: ["/demo-migrate-run-1"],
+      Image: "demo/app:v1",
+      ImageID: "sha256:old",
+      State: "exited",
+      Status: "Exited (0) 6 days ago",
+      SizeRw: 40_000,
+      Created: 1_700_000_000,
+      Labels: { "com.docker.compose.project": "demo", "com.docker.compose.service": "migrate" },
+    },
+  ],
+  Volumes: [{ Name: "demo_db_data", UsageData: { Size: 9_000_000, RefCount: 1 }, Labels: { "com.docker.compose.project": "demo" } }],
+  BuildCache: [{ ID: "bc", InUse: false, Shared: false, Size: 1_000_000 }],
+};
 const fakeDocker = {
   ping: async () => false,
   restart: async (name) => { restarted = name; },
   pruneImages: async () => 2_000_000,
   pruneBuildCache: async () => 1_000_000,
   logs: async () => "log line one\nlog line two\n",
-  systemDf: async () => ({ Images: [{ Containers: 0, Size: 3_000_000 }], BuildCache: [{ InUse: false, Size: 1_000_000 }] }),
+  systemDf: async () => diskUsage,
   listContainers: async () => [],
+  inspect: async (id) => ({
+    Id: id,
+    State: { FinishedAt: new Date(Date.now() - 6 * 86_400_000).toISOString() },
+    HostConfig: { RestartPolicy: { Name: "no" }, LogConfig: { Type: "json-file", Config: {} } },
+    LogPath: null,
+  }),
+  removeImage: async () => {},
+  removeContainer: async (id) => { removedContainers.push(id); },
 };
 const server = await startWebServer({ config, store, docker: fakeDocker, alerter: null });
 const base = `http://127.0.0.1:${server.address().port}`;
@@ -67,7 +96,7 @@ test("healthz is public", async () => {
 });
 
 test("pages and API require a session", async () => {
-  for (const p of ["/", "/checks", "/backups", "/deploys", "/events"]) {
+  for (const p of ["/", "/storage", "/checks", "/backups", "/deploys", "/events"]) {
     const res = await get(p);
     assert.equal(res.status, 303, p);
     assert.equal(res.headers.get("location"), "/login");
@@ -212,6 +241,46 @@ test("backups page offers Back up now + Test restore buttons", async () => {
   assert.match(html, /value="run-drill"/);
   // Every action form carries the session CSRF token.
   assert.match(html, /name="csrf" value="[A-Za-z0-9_-]+"/);
+});
+
+test("storage page explains usage, offers cleanups, and refuses to delete volumes", async () => {
+  const url = createLoginToken({ config, store, email: "op@example.com" });
+  const res = await get(`/auth?token=${new URL(url).searchParams.get("token")}`);
+  const cookie = res.headers.get("set-cookie").split(";")[0];
+
+  const html = await (await get("/storage", { cookie })).text();
+  assert.match(html, /Where the space is going/);
+  assert.match(html, /Container images/);
+  assert.match(html, /Volumes \(your data\)/);
+  assert.match(html, /demo_db_data/); // volumes are listed
+  assert.match(html, /docker volume rm/); // ... but only as a manual instruction
+  assert.match(html, /no volume is ever deleted/i);
+  assert.match(html, /demo-migrate-run-1/); // the stale container is previewed
+  assert.match(html, /demo\/app:v1/); // the unused image is previewed
+  assert.match(html, /Clear unused build cache/);
+  assert.ok(!/actionId="[^"]*volume/i.test(html), "no volume action is ever offered");
+
+  // The disk tile on the overview links here.
+  assert.match(await (await get("/", { cookie })).text(), /href="\/storage"/);
+
+  // The machine-readable form carries the same numbers.
+  const api = await (await get("/api/storage", { cookie })).json();
+  assert.equal(api.dockerAvailable, true);
+  assert.equal(api.summary.volumes.totalBytes, 9_000_000);
+  assert.equal(api.staleContainers.length, 1);
+  assert.ok(api.plan.every((a) => !/volume/i.test(a.id)));
+
+  // Running a cleanup from the page removes exactly the previewed container.
+  const csrf = html.match(/name="csrf" value="([^"]+)"/)[1];
+  const run = await fetch(`${base}/action`, {
+    method: "POST",
+    headers: { cookie, "content-type": "application/x-www-form-urlencoded" },
+    body: `actionId=remove-stopped-containers&return=${encodeURIComponent("/storage")}&csrf=${encodeURIComponent(csrf)}`,
+    redirect: "manual",
+  });
+  assert.equal(run.status, 303);
+  assert.match(decodeURIComponent(run.headers.get("location")).replace(/\+/g, " "), /ok=1.*Removed 1 stopped container.*No volume was touched/);
+  assert.deepEqual(removedContainers, ["leftover"]);
 });
 
 test("logout requires a valid CSRF token", async () => {

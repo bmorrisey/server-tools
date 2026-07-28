@@ -10,17 +10,21 @@
  *   GET  /auth?token=...   consume a link -> session cookie
  *   POST /logout
  *   GET  /                 overview          } session required
+ *   GET  /storage          disk breakdown + safe cleanup options }
  *   GET  /checks[/name]    checks + history  }
  *   GET  /backups          backup targets    }
  *   GET  /deploys          deploy history    }
  *   GET  /events           event log         }
+ *   POST /action           run one validated remediation (CSRF protected)
  *   GET  /api/status       machine-readable snapshot (session required)
+ *   GET  /api/storage      machine-readable storage report (session required)
  */
 import http from "node:http";
 import { URL } from "node:url";
 import * as ui from "./ui.js";
 import * as auth from "./auth.js";
 import * as metrics from "../metrics.js";
+import * as storage from "../storage.js";
 import { sendMail } from "../smtp.js";
 import { diagnose, gatherContext, runAction, ACTION_IDS } from "../remediate.js";
 import { logger } from "../log.js";
@@ -268,6 +272,10 @@ export function startWebServer({ config, store, docker, alerter }) {
         ui.checkDetailPage({ session, name, current, samples: checkHistory(store, name), incident, context, checkConfig, csrf: session.csrf, flash }),
       );
     }
+    if (path === "/storage") {
+      const report = await storage.report({ docker, store, config });
+      return send(res, 200, ui.storagePage({ session, report, flash, csrf: session.csrf }));
+    }
     if (path === "/backups") {
       return send(res, 200, ui.backupsPage({ session, backups, targets: config.backups, flash, csrf: session.csrf }));
     }
@@ -294,6 +302,9 @@ export function startWebServer({ config, store, docker, alerter }) {
         deploys,
         dockerReachable: await docker.ping(),
       });
+    }
+    if (path === "/api/storage") {
+      return send(res, 200, await storage.report({ docker, store, config }));
     }
 
     return send(res, 404, "<h1>Not found</h1>");
