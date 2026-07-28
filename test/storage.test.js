@@ -69,8 +69,9 @@ function df() {
       { Name: "orphan_data", UsageData: { Size: 2000, RefCount: 0 }, Labels: {} },
     ],
     BuildCache: [
-      { ID: "bc1", Size: 800, InUse: false, Shared: false },
+      { ID: "bc1", Size: 700, InUse: false, Shared: false },
       { ID: "bc2", Size: 200, InUse: true, Shared: false },
+      { ID: "bc3", Size: 100, InUse: false, Shared: true },
     ],
   };
 }
@@ -93,8 +94,11 @@ test("summarizeDf follows Docker's accounting and never counts volumes as reclai
   assert.equal(s.volumes.unusedCount, 1);
   assert.equal(s.volumes.unusedBytes, 2000);
 
+  // Shared cache is still bytes on disk and is still reclaimable when idle;
+  // only records the builder is actively using are held back.
   assert.equal(s.buildCache.totalBytes, 1000);
   assert.equal(s.buildCache.reclaimableBytes, 800);
+  assert.equal(summarizeDf({ BuildCache: [{ Size: 500, InUse: false, Shared: true }] }).buildCache.reclaimableBytes, 500);
 
   // Images + stopped writable layers + build cache. Volume bytes excluded.
   assert.equal(s.reclaimableBytes, 8050);

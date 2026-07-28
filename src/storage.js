@@ -101,11 +101,12 @@ export function summarizeDf(df = {}) {
   const unusedVolumes = volumes.filter((v) => (v.UsageData?.RefCount ?? 0) === 0);
   const unusedVolumeBytes = unusedVolumes.reduce((sum, v) => sum + Math.max(Number(v.UsageData?.Size) || 0, 0), 0);
 
-  const cacheOwn = cache.filter((c) => !c.Shared);
-  const cacheBytes = Number.isFinite(df.BuilderSize)
-    ? df.BuilderSize
-    : cacheOwn.reduce((sum, c) => sum + (Number(c.Size) || 0), 0);
-  const cacheInUse = cacheOwn.filter((c) => c.InUse).reduce((sum, c) => sum + (Number(c.Size) || 0), 0);
+  // Each cache record is distinct on disk, shared or not, so the total is a
+  // plain sum and everything not in use can go. Deriving this from the records
+  // rather than the engine's BuilderSize field matches `docker buildx du` on
+  // every engine version (older ones omit the field entirely).
+  const cacheBytes = cache.reduce((sum, c) => sum + (Number(c.Size) || 0), 0);
+  const cacheInUse = cache.filter((c) => c.InUse).reduce((sum, c) => sum + (Number(c.Size) || 0), 0);
 
   const summary = {
     images: {
