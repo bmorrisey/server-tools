@@ -73,7 +73,10 @@ node --check src/<file>.js        # syntax check a module
   `cat` and `jq` must be able to debug an incident. Do not switch the store
   to a binary format.
 - The dashboard is server-rendered HTML with inline CSS/JS and no external
-  assets (works with a strict CSP and no CDN). Keep it that way.
+  assets (works with a strict CSP and no CDN). Keep it that way. Client
+  behaviour goes in the single hashed `SCRIPT` block in `src/web/ui.js`;
+  inline `on*=` attributes are blocked by the CSP and fail silently, so a
+  confirmation written that way never prompts at all.
 - Config changes need: validation in `src/config.js`, documentation in
   `docs/CONFIG.md`, and the example in `deploy/config.example.json` updated
   together.

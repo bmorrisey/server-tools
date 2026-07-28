@@ -90,6 +90,19 @@ sizes, counts, timestamps, container states, and event descriptions composed
 by this toolkit. It has no code path that reads application database rows or
 media files.
 
+Pages are served under a strict Content-Security-Policy: `default-src 'none'`,
+no external origins, and a `script-src` that permits exactly one script by its
+SHA-256 hash (the confirmation and progress handler). `'unsafe-inline'` is not
+allowed for scripts, so an injected script cannot execute even if markup
+escaping were bypassed. Editing that script changes its hash, and the header is
+derived from the same source, so the two cannot drift apart.
+
+Because that policy blocks inline event handlers, any confirmation or client
+behaviour must live in that one hashed script. An `onclick=` or `onsubmit=`
+attribute will be silently ignored by the browser, which for a confirmation
+dialog means the action fires with no prompt at all. A test asserts that no
+inline handlers are rendered.
+
 ## Hardening checklist
 
 - [ ] Dashboard published only through the reverse proxy over HTTPS

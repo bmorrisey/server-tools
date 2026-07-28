@@ -5,7 +5,41 @@
  * ~10% area washes, hairline grid, status always icon + label (never color
  * alone).
  */
+import crypto from "node:crypto";
 import { escapeHtml as esc, formatBytes, formatDuration } from "../util.js";
+
+/**
+ * The only script the dashboard ships. It confirms destructive actions and,
+ * once one is running, says so: several cleanups take minutes, and a form POST
+ * gives no feedback of its own.
+ *
+ * It lives in one static block on purpose. Inline event handlers (onsubmit=...)
+ * are blocked by our CSP, and rather than weaken the policy to 'unsafe-inline'
+ * we allow exactly this text by hash. Change the text and the hash changes with
+ * it, so a tampered or injected script still cannot run.
+ */
+const SCRIPT = `
+document.addEventListener("submit", function (e) {
+  var form = e.target;
+  var message = form.getAttribute("data-confirm");
+  if (!message) return;
+  if (form.getAttribute("data-busy") === "1") { e.preventDefault(); return; }
+  if (!window.confirm(message)) { e.preventDefault(); return; }
+  form.setAttribute("data-busy", "1");
+  var status = document.getElementById("working");
+  if (status) {
+    status.textContent = form.getAttribute("data-working") || "Working on it...";
+    status.hidden = false;
+  }
+  setTimeout(function () {
+    var buttons = document.querySelectorAll("button[type=submit]");
+    for (var i = 0; i < buttons.length; i++) buttons[i].disabled = true;
+  }, 0);
+});
+`;
+
+/** CSP source expression that allows exactly the script above. */
+export const SCRIPT_HASH = `'sha256-${crypto.createHash("sha256").update(SCRIPT).digest("base64")}'`;
 
 const CSS = `
 :root {
@@ -88,6 +122,10 @@ td .detail { color: var(--muted); font-size: 13px; }
 .events li { margin: 0 0 8px; font-size: 14px; }
 .events { list-style: none; padding: 0; margin: 0; }
 .events time { color: var(--muted); font-size: 12.5px; font-variant-numeric: tabular-nums; margin-right: 8px; }
+.working { margin: 0; padding: 12px 24px; font-size: 14px; font-weight: 600;
+  background: var(--warn-bg); color: var(--warn); border-bottom: 1px solid var(--border); }
+.working[hidden] { display: none; }
+button[disabled] { opacity: 0.55; cursor: progress; }
 .banner { margin: 0 0 18px; padding: 11px 16px; border-radius: 10px; font-size: 14px; border: 1px solid var(--border); }
 .banner.ok { background: var(--good-bg); color: var(--good); border-color: transparent; }
 .banner.err { background: var(--crit-bg); color: var(--crit); border-color: transparent; }
@@ -227,21 +265,23 @@ export function incidentCard({ check, incident, context = {}, csrf, returnPath }
 </div>`;
 }
 
-/** JSON-encode a string for safe inline use in a JS attribute. */
-function jsStr(s) {
-  return esc(JSON.stringify(String(s)));
-}
-
 /**
  * A single action button as a self-contained POST form (CSRF token, action id,
- * params, and a confirm dialog). Used by incident cards and the backups page.
+ * params, and a confirmation). Used by incident cards, the backups page, and
+ * the storage page.
+ *
+ * The confirmation text and the "now running" message ride on data attributes
+ * rather than inline handlers, so the one hashed script above can pick them up
+ * under a strict CSP. `working` should say something true about duration:
+ * clearing a large build cache or running a backup takes minutes.
  */
-export function actionForm({ id, label, kind = "safe", confirm, params = {}, csrf, returnPath, small = false }) {
+export function actionForm({ id, label, kind = "safe", confirm, params = {}, csrf, returnPath, small = false, working }) {
   const hidden = Object.entries(params)
     .filter(([, v]) => v != null)
     .map(([k, v]) => `<input type="hidden" name="${esc(k)}" value="${esc(v)}">`)
     .join("");
-  return `<form method="post" action="/action" onsubmit="return confirm(${jsStr(confirm)})" style="margin:0">
+  const busy = working ?? `Running: ${label}. You can leave this page; the result is recorded under Events.`;
+  return `<form method="post" action="/action" data-confirm="${esc(confirm)}" data-working="${esc(busy)}" style="margin:0">
   <input type="hidden" name="csrf" value="${esc(csrf)}">
   <input type="hidden" name="actionId" value="${esc(id)}">
   <input type="hidden" name="return" value="${esc(returnPath)}">
@@ -279,11 +319,13 @@ export function layout({ title, page, session, body, flash }) {
   <nav>${nav}</nav>
   <form method="post" action="/logout"><input type="hidden" name="csrf" value="${esc(session.csrf ?? "")}"><button type="submit" title="Signed in as ${esc(session.email)}">Sign out</button></form>
 </header>
+<p class="working" id="working" hidden></p>
 <main>
 ${flashBanner(flash)}
 ${body}
 </main>
 <footer>server-tools admin</footer>
+<script>${SCRIPT}</script>
 </body>
 </html>`;
 }
@@ -512,9 +554,29 @@ export function backupsPage({ session, backups, targets, flash, csrf }) {
       const b = backups[t.name] ?? {};
       const ok = b.lastResult === "ok";
       const buttons = [
-        actionForm({ id: "run-backup", label: "Back up now", kind: "safe", confirm: `Run the "${t.name}" backup now?`, params: { target: t.name }, csrf, returnPath: "/backups", small: true }),
+        actionForm({
+          id: "run-backup",
+          label: "Back up now",
+          kind: "safe",
+          confirm: `Run the "${t.name}" backup now?`,
+          params: { target: t.name },
+          csrf,
+          returnPath: "/backups",
+          small: true,
+          working: `Backing up "${t.name}". A large database can take several minutes. You can leave this page; the result is recorded under Events.`,
+        }),
         t.type === "postgres"
-          ? actionForm({ id: "run-drill", label: "Test restore", kind: "caution", confirm: `Run a restore drill for "${t.name}"? It restores the latest backup into a temporary database to prove it works, then removes it. This can take a moment.`, params: { target: t.name }, csrf, returnPath: "/backups", small: true })
+          ? actionForm({
+              id: "run-drill",
+              label: "Test restore",
+              kind: "caution",
+              confirm: `Run a restore drill for "${t.name}"? It restores the latest backup into a temporary database to prove it works, then removes it. This can take a moment.`,
+              params: { target: t.name },
+              csrf,
+              returnPath: "/backups",
+              small: true,
+              working: `Running a restore drill for "${t.name}". This restores a full copy, so it can take several minutes. You can leave this page; the result is recorded under Events.`,
+            })
           : "",
       ].join("");
       return `<tr>
@@ -599,6 +661,7 @@ export function storagePage({ session, report, flash, csrf }) {
         params: { target: a.target },
         csrf,
         returnPath: "/storage",
+        working: `Running: ${a.label}. Clearing this much can take several minutes. You can leave this page; the result is recorded under Events.`,
       });
       return `<div class="card">
   <div class="label">${esc(a.label)} ${a.kind === "caution" ? '<span class="status warn">&#9888; review first</span>' : '<span class="status ok">&#10003; safe</span>'}</div>
@@ -732,7 +795,7 @@ ${diskLine}
 <thead><tr><th>Category</th><th>Size</th><th>Share of disk</th><th>What it is</th></tr></thead>
 <tbody>${breakdownRows}</tbody>
 </table>
-<p class="sub" style="margin-top:8px">Shares assume Docker keeps its data on ${esc(r.diskPath)}, which is the default. Image sizes count shared layers once.</p>
+<p class="sub" style="margin-top:8px">Shares are of the filesystem at ${esc(r.diskPath)}, and assume Docker stores its data there, which is the default. Image sizes count shared layers once.</p>
 
 <h2 style="margin-top:24px">Ways to reclaim space</h2>
 <div class="safe-note"><strong>What will never happen here:</strong> no volume is ever deleted, no running container is stopped or removed, and no application data is touched. Every option below lists exactly what it removes before you click.</div>

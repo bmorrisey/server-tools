@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { createHash } from "node:crypto";
 import { Store } from "../src/store.js";
 import { startWebServer } from "../src/web/server.js";
 import { createLoginToken } from "../src/web/auth.js";
@@ -281,6 +282,33 @@ test("storage page explains usage, offers cleanups, and refuses to delete volume
   assert.equal(run.status, 303);
   assert.match(decodeURIComponent(run.headers.get("location")).replace(/\+/g, " "), /ok=1.*Removed 1 stopped container.*No volume was touched/);
   assert.deepEqual(removedContainers, ["leftover"]);
+});
+
+test("confirmations survive the CSP: hashed script, no inline handlers", async () => {
+  const url = createLoginToken({ config, store, email: "op@example.com" });
+  const res = await get(`/auth?token=${new URL(url).searchParams.get("token")}`);
+  const cookie = res.headers.get("set-cookie").split(";")[0];
+
+  const page = await get("/storage", { cookie });
+  const csp = page.headers.get("content-security-policy");
+  const html = await page.text();
+
+  // Inline event handlers are blocked by this policy, so none may be emitted:
+  // a confirmation written as onsubmit= would silently never fire.
+  assert.ok(!/\son[a-z]+\s*=/i.test(html), "no inline event handlers may be rendered");
+  assert.ok(!/'unsafe-inline'[^;]*;?\s*(?=.*script-src)/.test(csp.split("script-src")[1] ?? ""), "script-src must not allow unsafe-inline");
+
+  // The one script we do ship is allowed by its own hash, and that hash must
+  // actually match the bytes in the page.
+  assert.match(csp, /script-src 'sha256-[A-Za-z0-9+/=]+'/);
+  const inline = html.match(/<script>([\s\S]*?)<\/script>/);
+  assert.ok(inline, "the confirmation script is present");
+  const digest = `'sha256-${createHash("sha256").update(inline[1]).digest("base64")}'`;
+  assert.ok(csp.includes(digest), "the CSP hash must match the script actually served");
+
+  // Destructive buttons carry their confirmation and a progress message.
+  assert.match(html, /data-confirm="[^"]*Clear unused build cache/);
+  assert.match(html, /data-working="[^"]*can take several minutes[^"]*recorded under Events/);
 });
 
 test("logout requires a valid CSRF token", async () => {

@@ -32,8 +32,12 @@ import { logger } from "../log.js";
 const log = logger("web");
 
 const SECURITY_HEADERS = {
+  // script-src allows exactly one script, by hash: the confirmation and
+  // progress handler in ui.js. No 'unsafe-inline', so an injected script
+  // still cannot run. Note that without a script-src, inline handlers are
+  // blocked outright, which is why confirmations must live in that block.
   "content-security-policy":
-    "default-src 'none'; style-src 'unsafe-inline'; img-src 'self' data:; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+    `default-src 'none'; script-src ${ui.SCRIPT_HASH}; style-src 'unsafe-inline'; img-src 'self' data:; form-action 'self'; base-uri 'none'; frame-ancestors 'none'`,
   "x-content-type-options": "nosniff",
   "x-frame-options": "DENY",
   "referrer-policy": "no-referrer",
