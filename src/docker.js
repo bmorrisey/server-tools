@@ -177,12 +177,21 @@ export class Docker {
 
   /**
    * Run a command inside a container. Returns { exitCode, stdout, stderr }.
-   * When `stdoutStream` is provided, stdout bytes are written to it instead of
-   * being buffered (used to stream large database dumps straight to disk).
+   *
+   * `stdoutStream` writes stdout bytes straight out instead of buffering them
+   * (used to stream large database dumps to disk).
+   *
+   * `stdin` (Buffer or Readable) feeds the command's standard input. This is
+   * the only sane way to hand a large payload to a process in a container:
+   * command arguments are capped at 128 KB each by the kernel, so anything
+   * bigger has to arrive as a stream. Supplying it switches the start request
+   * to a hijacked connection, which is how the Engine does bidirectional
+   * exec I/O.
    */
-  async exec(nameOrId, cmd, { env = [], user = "", stdoutStream = null, timeoutMs = 15 * 60_000 } = {}) {
+  async exec(nameOrId, cmd, { env = [], user = "", stdoutStream = null, stdin = null, timeoutMs = 15 * 60_000 } = {}) {
     const container = await this.inspect(nameOrId);
     const create = await this.request("POST", `/containers/${container.Id}/exec`, {
+      AttachStdin: Boolean(stdin),
       AttachStdout: true,
       AttachStderr: true,
       Env: env,
@@ -191,14 +200,22 @@ export class Docker {
     });
 
     const { stdout, stderr } = await new Promise((resolve, reject) => {
+      const headers = { "Content-Type": "application/json" };
+      // Ask the Engine to upgrade the connection so we get a raw duplex socket
+      // to write stdin on; without stdin the plain response stream is enough.
+      if (stdin) {
+        headers.Connection = "Upgrade";
+        headers.Upgrade = "tcp";
+      }
       const req = http.request(
         {
           socketPath: this.socketPath,
           method: "POST",
           path: `/exec/${create.Id}/start`,
-          headers: { "Content-Type": "application/json" },
+          headers,
         },
         (res) => {
+          if (stdin) return; // the upgrade handler owns this exchange
           if (res.statusCode >= 400) {
             reject(new Error(`docker exec start -> ${res.statusCode}`));
             return;
@@ -209,6 +226,20 @@ export class Docker {
           res.on("error", reject);
         },
       );
+      if (stdin) {
+        req.on("upgrade", (res, socket, head) => {
+          const demux = new Demuxer(stdoutStream);
+          if (head?.length) demux.push(head);
+          socket.on("data", (chunk) => demux.push(chunk));
+          // Ending our side of the socket is what signals EOF on stdin; the
+          // Engine keeps sending output until the command exits.
+          socket.on("end", () => resolve(demux.finish()));
+          socket.on("error", reject);
+          socket.setTimeout(timeoutMs, () => socket.destroy(new Error("docker exec timed out")));
+          if (typeof stdin.pipe === "function") stdin.pipe(socket);
+          else socket.end(Buffer.isBuffer(stdin) ? stdin : Buffer.from(stdin));
+        });
+      }
       req.setTimeout(timeoutMs, () => req.destroy(new Error("docker exec timed out")));
       req.on("error", reject);
       req.end(JSON.stringify({ Detach: false, Tty: false }));

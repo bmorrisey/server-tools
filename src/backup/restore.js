@@ -57,24 +57,21 @@ export async function latestArtifact(target, { store }) {
   throw new Error(`no artifacts found for target "${target.name}"`);
 }
 
+/**
+ * Feed SQL to psql inside the database container.
+ *
+ * The payload goes in over stdin. It must not go anywhere near a command
+ * argument: the kernel caps a single argument at 128 KB (MAX_ARG_STRLEN), so
+ * an argument-based restore works on a toy database and fails on a real one,
+ * which is the worst possible time to find out. Nothing is written to disk in
+ * the container either, so a dump of user data never lands on a filesystem it
+ * did not already live on.
+ */
 async function psqlInput(docker, target, database, sql, extraArgs = []) {
-  // Write SQL into the container via a temp file to avoid arg-length limits.
-  const tmp = `/tmp/server-tools-restore-${Date.now()}.sql`;
-  const b64 = Buffer.from(sql).toString("base64");
-  // Chunk the base64 to stay under exec arg limits.
-  const chunkSize = 512 * 1024;
-  for (let i = 0; i < b64.length; i += chunkSize) {
-    const chunk = b64.slice(i, i + chunkSize);
-    const op = i === 0 ? ">" : ">>";
-    const r = await docker.exec(target.container, ["sh", "-c", `printf %s "${chunk}" ${op} ${tmp}.b64`]);
-    if (r.exitCode !== 0) throw new Error(`writing restore payload failed: ${r.stderr}`);
-  }
-  const decode = await docker.exec(target.container, ["sh", "-c", `base64 -d ${tmp}.b64 > ${tmp} && rm ${tmp}.b64`]);
-  if (decode.exitCode !== 0) throw new Error(`decoding restore payload failed: ${decode.stderr}`);
   const run = await docker.exec(
     target.container,
-    ["sh", "-c", `psql -U ${target.user} -d ${database} -v ON_ERROR_STOP=1 ${extraArgs.join(" ")} -f ${tmp}; ec=$?; rm -f ${tmp}; exit $ec`],
-    { timeoutMs: 60 * 60_000 },
+    ["psql", "-U", target.user, "-d", database, "-v", "ON_ERROR_STOP=1", ...extraArgs, "-f", "-"],
+    { stdin: Buffer.from(sql), timeoutMs: 60 * 60_000 },
   );
   if (run.exitCode !== 0) throw new Error(`psql exit ${run.exitCode}: ${run.stderr.trim().slice(0, 500)}`);
   return run;
