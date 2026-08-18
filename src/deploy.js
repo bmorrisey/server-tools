@@ -127,12 +127,24 @@ const COMPOSE_PASSTHROUGH = [
   "DOCKER_CERT_PATH",
   "DOCKER_TLS_VERIFY",
   "DOCKER_CONTEXT",
+  "DOCKER_API_VERSION",
   "SSH_AUTH_SOCK",
+  "XDG_RUNTIME_DIR",
+  // A build on a box behind an egress proxy needs these, and BuildKit passes
+  // them into the build itself; dropping them breaks package installs.
+  "HTTP_PROXY",
+  "HTTPS_PROXY",
+  "NO_PROXY",
+  "http_proxy",
+  "https_proxy",
+  "no_proxy",
+  "DOCKER_BUILDKIT",
+  "BUILDKIT_PROGRESS",
 ];
 
-function composeEnv() {
+function composeEnv(target) {
   const env = {};
-  for (const key of COMPOSE_PASSTHROUGH) {
+  for (const key of [...COMPOSE_PASSTHROUGH, ...(target?.composeEnv ?? [])]) {
     if (process.env[key] !== undefined) env[key] = process.env[key];
   }
   return env;
@@ -141,7 +153,7 @@ function composeEnv() {
 async function compose(exec, target, subcommand, { timeoutMs = 30 * 60_000 } = {}) {
   const r = await exec("docker", composeArgs(target, subcommand), {
     cwd: target.dir,
-    env: composeEnv(),
+    env: composeEnv(target),
     timeoutMs,
   });
   if (r.code !== 0) {
@@ -257,19 +269,28 @@ async function readEnvFile(envPath) {
  * application's secrets becomes world-readable.
  */
 async function writeEnvFile(envPath, text) {
-  const st = await fsp.stat(envPath).catch(() => null);
+  // A .env that is a symlink to a shared secrets file is a real arrangement.
+  // Renaming over the link would replace it with a regular file and leave the
+  // canonical copy silently diverged, so the target is what gets rewritten.
+  const target = await fsp.realpath(envPath).catch(() => envPath);
+  const st = await fsp.stat(target).catch(() => null);
   const mode = st ? st.mode & 0o777 : 0o600;
-  const tmp = `${envPath}.server-tools.tmp`;
+  const tmp = `${target}.server-tools.${process.pid}.tmp`;
   try {
     await fsp.writeFile(tmp, text, { mode });
     // writeFile only applies mode when it creates the file; a leftover temp
     // from an earlier crash would otherwise keep its old permissions.
     await fsp.chmod(tmp, mode);
-    if (st) await fsp.chown(tmp, st.uid, st.gid).catch(() => {});
-    await fsp.rename(tmp, envPath);
+    if (st) {
+      await fsp
+        .chown(tmp, st.uid, st.gid)
+        .catch((e) => log.warn(`could not preserve ownership of ${target}: ${e.message}`));
+    }
+    await fsp.rename(tmp, target);
   } catch (e) {
-    await fsp.rm(tmp, { force: true });
-    throw new Error(`cannot write ${envPath}: ${e.message}`);
+    // Cleanup must not become the reported reason.
+    await fsp.rm(tmp, { force: true }).catch(() => {});
+    throw new Error(`cannot write ${target}: ${e.message}`);
   }
 }
 
@@ -349,10 +370,16 @@ async function inspectServices(exec, target, services) {
   for (const service of services) {
     const ps = await exec("docker", composeArgs(target, ["ps", "-a", "-q", service]), {
       cwd: target.dir,
-      env: composeEnv(),
+      env: composeEnv(target),
       timeoutMs: 60_000,
     });
-    if (ps.code !== 0) throw unverifiable(`docker compose ps failed: ${(ps.stderr || ps.stdout).slice(-300)}`);
+    if (ps.code !== 0) {
+      const reason = (ps.stderr || ps.stdout).slice(-300);
+      // "no such service" is a config error: leniency there would leave the
+      // whole verification guarantee switched off for every deploy.
+      if (/no such service/i.test(reason)) throw new Error(`service "${service}" is not in the compose file`);
+      throw unverifiable(`docker compose ps failed: ${reason}`);
+    }
     const ids = ps.stdout.split("\n").map((l) => l.trim()).filter(Boolean);
     if (!ids.length) {
       entries.push({ service, containers: [] });
@@ -460,9 +487,20 @@ async function deployRegistry(target, tag, { store, dryRun, exec, health }) {
   const rollback = (reason, what) =>
     rollbackRegistry(exec, target, { record, envPath, envVar, envText, previous, from, to, reason, what, health });
 
-  let unproven = null;
+  // Writing .env is the first thing that changes the box, so its own failure
+  // belongs with the pull: nothing has happened yet, and recreating a healthy
+  // stack to "roll back" from it would be the only damage done.
   try {
     await writeEnvFile(envPath, upsertEnvVar(envText, envVar, to));
+  } catch (e) {
+    const detail = `${e.message.slice(0, 300)}; nothing on this box was changed`;
+    log.error(`deploy ${target.name} could not write ${envPath}: ${e.message}`);
+    record("fail", detail);
+    return { ok: false, from, to, rolledBack: false, detail };
+  }
+
+  let unproven = null;
+  try {
     await bringUp(exec, target, to, imageId);
   } catch (e) {
     if (!e.unverifiable) return rollback(e.message, "rollout");
@@ -510,14 +548,20 @@ async function deployRegistry(target, tag, { store, dryRun, exec, health }) {
  */
 async function rollbackRegistry(exec, target, { record, envPath, envVar, envText, previous, from, to, reason, what, health }) {
   const why = `${what} failed on ${to} (${String(reason).slice(0, 200)})`;
-  const restore = await writeEnvFile(envPath, envText).then(
+  const restoreError = await writeEnvFile(envPath, envText).then(
     () => null,
     (e) => e.message,
   );
-  if (restore) log.error(`could not restore ${envPath}: ${restore}`);
+  // If the file could not be put back it still names the failed image, so the
+  // next routine "compose up -d" redeploys it. That has to reach the operator,
+  // not just the log.
+  const stillBroken = restoreError
+    ? ` ${envVar} in ${envPath} could NOT be restored (${restoreError.slice(0, 150)}) and still names ${to} - fix it before any later compose up, or it redeploys - intervene.`
+    : "";
+  if (restoreError) log.error(`could not restore ${envPath}: ${restoreError}`);
 
   if (!previous) {
-    const detail = `${why}; ${envVar} named no image before this deploy, so there is nothing to roll back to - intervene`;
+    const detail = `${why}; ${envVar} named no image before this deploy, so there is nothing to roll back to - intervene.${stillBroken}`;
     log.error(`${what} failed for ${target.name} and no previous image is recorded; intervene`);
     record("fail", detail);
     return { ok: false, from, to, rolledBack: false, detail };
@@ -530,13 +574,13 @@ async function rollbackRegistry(exec, target, { record, envPath, envVar, envText
     const imageId = await pullImage(exec, previous, { allowLocal: true });
     await bringUp(exec, target, previous, imageId);
   } catch (e) {
-    const detail = `${why}; rollback to ${previous} ALSO FAILED (${e.message.slice(0, 200)}) - intervene`;
+    const detail = `${why}; rollback to ${previous} ALSO FAILED (${e.message.slice(0, 200)}) - intervene.${stillBroken}`;
     record("rollback", detail);
     return { ok: false, from, to, rolledBack: true, detail };
   }
   const healthResult = await health(target.healthUrl, healthWaitFor(target));
-  const detail = `${why}; rolled back to ${previous}, now ${healthResult.healthy ? "healthy" : "STILL UNHEALTHY - intervene"}`;
-  record("rollback", detail);
+  const detail = `${why}; rolled back to ${previous}, now ${healthResult.healthy ? "healthy" : "STILL UNHEALTHY - intervene"}.${stillBroken}`;
+  record(restoreError ? "fail" : "rollback", detail);
   return { ok: false, from, to, rolledBack: true, detail };
 }
 

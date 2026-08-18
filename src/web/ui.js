@@ -900,6 +900,16 @@ ${logsPanel}`;
   return layout({ title: "Storage", page: "/storage", session, body, flash });
 }
 
+/**
+ * A deploy can also land as "succeeded, but something could not be proven".
+ * Rendering that as a red failure contradicts the CLI (which exits 0) and the
+ * events feed beside it, so the pill has to carry the same three states the
+ * recorder writes.
+ */
+function deployPill(kind) {
+  return statusPill(kind === "ok" ? "ok" : kind === "warn" ? "warn" : "fail");
+}
+
 export function deploysPage({ session, deploys, targets, events, flash }) {
   const rows = targets
     .map((t) => {
@@ -907,7 +917,7 @@ export function deploysPage({ session, deploys, targets, events, flash }) {
       const registry = t.source === "registry";
       const source = registry ? `registry - ${esc(t.image)}` : "git - builds on this box";
       return `<tr>
-<td>${d ? statusPill(d.kind === "ok" ? "ok" : "fail") : '<span class="detail">no deploys recorded</span>'}</td>
+<td>${d ? deployPill(d.kind) : '<span class="detail">no deploys recorded</span>'}</td>
 <td>${esc(t.name)}<br><span class="detail">${esc(t.dir)}${t.project ? ` - project ${esc(t.project)}` : ""}</span></td>
 <td><span class="detail">${source}</span></td>
 <td class="num">${d ? esc((d.at ?? "").replace("T", " ").replace("Z", "")) : "-"}</td>
@@ -922,7 +932,7 @@ export function deploysPage({ session, deploys, targets, events, flash }) {
     .reverse()
     .map(
       (e) =>
-        `<li><time>${esc((e.ts ?? "").replace("T", " ").replace("Z", ""))}</time>${statusPill(e.kind === "ok" ? "ok" : "fail")} ${esc(e.name ?? "")}: ${esc((e.detail ?? "").slice(0, 160))}</li>`,
+        `<li><time>${esc((e.ts ?? "").replace("T", " ").replace("Z", ""))}</time>${deployPill(e.kind)} ${esc(e.name ?? "")}: ${esc((e.detail ?? "").slice(0, 160))}</li>`,
     )
     .join("");
   const body = `<h1>Deploys</h1>

@@ -177,6 +177,11 @@ export function validateConfig(cfg) {
           d.services.every((s) => typeof s === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(s)),
         `${where}.services must be a non-empty array of compose service names (a name starting with "-" would be read as a flag)`,
       );
+    if (d.composeEnv !== undefined)
+      need(
+        Array.isArray(d.composeEnv) && d.composeEnv.every((v) => typeof v === "string" && /^[A-Za-z_][A-Za-z0-9_]*$/.test(v)),
+        `${where}.composeEnv must be an array of environment variable names`,
+      );
     if (d.healthAttempts !== undefined)
       need(Number.isInteger(d.healthAttempts) && d.healthAttempts > 0, `${where}.healthAttempts must be a positive integer`);
     if (d.healthDelay !== undefined)
@@ -187,8 +192,10 @@ export function validateConfig(cfg) {
       need(typeof d.project === "string" && d.project, `${where}.project is required for registry deploys (the "docker compose -p" name)`);
       need(typeof d.image === "string" && d.image, `${where}.image is required for registry deploys (repository without a tag)`);
       if (typeof d.image === "string" && d.image)
+        // A private registry carries a port ("registry.example.com:5000/o/app"),
+        // so a colon is legal here; the tag check below is what rejects one.
         need(
-          /^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(d.image),
+          /^[A-Za-z0-9][A-Za-z0-9._:/-]*$/.test(d.image),
           `${where}.image is not a valid image repository name`,
         );
       if (typeof d.image === "string" && d.image)

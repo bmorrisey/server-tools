@@ -277,6 +277,18 @@ Common fields: `name`, `dir` (the compose project directory), `healthUrl`,
 | `imageEnvVar` | `"APP_IMAGE"` | The variable written into the target's `.env` and referenced from the compose file. |
 | `healthAttempts` | `20` | How many times to poll `healthUrl`. |
 | `healthDelay` | `"6s"` | Wait between polls. |
+| `composeEnv` | `[]` | Extra environment variable names to pass through to `docker compose` (see below). |
+
+**Compose runs with a deliberately minimal environment** in both modes: enough
+to reach Docker (`PATH`, `HOME`, `DOCKER_*`, `SSH_AUTH_SOCK`,
+`XDG_RUNTIME_DIR`) plus the proxy and BuildKit settings a build needs
+(`HTTP(S)_PROXY`, `NO_PROXY`, `DOCKER_BUILDKIT`, `BUILDKIT_PROGRESS`). It does
+not inherit the agent's whole environment, because that is where the
+toolkit's own secrets live and compose prefers the process environment over
+`.env` - a name collision would hand one of them to your containers, and in
+registry mode it would outrank the image reference just written. Anything
+else a build genuinely needs from the agent's environment goes in
+`composeEnv`; anything the application needs belongs in its own `.env`.
 
 On a box that runs a single stack, `docker compose` in the project directory
 resolves to the project you meant. On a box with several, the project name is
@@ -309,7 +321,8 @@ Nothing compiles on the host, so a release cannot starve the other stacks
 sharing the box, and a rollback costs a pull rather than a second build. Two
 consequences worth knowing:
 
-- `image` must not carry a tag or digest; the tag is the deploy argument.
+- `image` must not carry a tag or digest; the tag is the deploy argument. A
+private registry with a port (`registry.example.com:5000/owner/app`) is fine.
 - The reference is **written to `.env`** rather than exported for one
   command. Compose stores no such state, so a later plain
   `docker compose up -d` would otherwise re-resolve `${APP_IMAGE:-...}` and
@@ -318,10 +331,8 @@ consequences worth knowing:
   not want deployed.
 - Rollback needs a previous value in `.env`. On the very first registry
   deploy there is none, and the toolkit says so rather than guessing a tag.
-- Compose is run with a deliberately minimal environment (enough to reach
-  Docker, nothing more). Everything the application needs must come from its
-  own `.env`; the agent's environment holds the toolkit's own secrets, and a
-  name collision there would otherwise be handed to your containers.
+- Compose runs with the minimal environment described above, so the image
+  reference in `.env` is the only thing that decides which image is used.
 
 The app's compose file, `.env`, and directory must be visible to the agent
 (bind-mount it into the container at the same path you configure).
