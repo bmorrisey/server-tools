@@ -44,6 +44,8 @@
       "source": { "volume": "myapp_media" },
       "schedule": "05:30",
       "passphrase": "${BACKUP_PASSPHRASE}",
+      "archive": true,
+      "allowEmpty": false,
       "retention": { "daily": 7, "weekly": 4, "monthly": 6 }
     },
     {
@@ -73,6 +75,7 @@
       "project": "marketing",
       "source": "git",
       "services": ["web"],
+      "composeEnv": [],
       "healthUrl": "https://www.example.com/",
       "healthAttempts": 20,
       "healthDelay": "6s"

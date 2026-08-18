@@ -138,6 +138,15 @@ export function validateConfig(cfg) {
       }
       if (b.allowEmpty !== undefined)
         need(typeof b.allowEmpty === "boolean", `${where}.allowEmpty must be true or false`);
+      if (b.archive !== undefined) {
+        need(typeof b.archive === "boolean", `${where}.archive must be true or false`);
+        // A manifest taken through the Docker socket describes no tree this
+        // box can re-read, so without an archive nothing could ever verify it.
+        need(
+          !(b.archive === false && b.source && (b.source.volume || b.source.container)),
+          `${where}.archive cannot be false for a volume or container source; there would be no tree left to verify the manifest against`,
+        );
+      }
     }
     if (b.type === "external") {
       // An external target exists to be honest about what is not covered, so

@@ -610,8 +610,15 @@ async function deployGit(target, ref, { store, dryRun, exec, health }) {
     // health polling alone cannot tell a rollout from a no-op. When the target
     // names its services, require them to be running before believing it.
     if (target.services?.length) {
-      const verify = verifyContainers(await inspectServices(exec, target, target.services));
-      if (!verify.ok) throw new Error(`services did not come up: ${verify.problems.join("; ")}`);
+      try {
+        const verify = verifyContainers(await inspectServices(exec, target, target.services));
+        if (!verify.ok) throw new Error(`services did not come up: ${verify.problems.join("; ")}`);
+      } catch (e) {
+        // Same rule as registry mode: a read-only check that could not be
+        // performed must not cause a write. Let the health gate decide.
+        if (!e.unverifiable) throw e;
+        log.warn(`deploy ${target.name}: ${e.message}; falling back to the health check`);
+      }
     }
   } catch (e) {
     log.error(`build/up failed for ${target.name}; rolling back to ${from}`);

@@ -190,6 +190,7 @@ async function main() {
 
     case "artifacts": {
       const target = findTarget(config, "backups", positional[0] ?? fail("usage: artifacts <target>"));
+      if (target.type === "external") fail(`"${target.name}" is external (${target.note}); nothing is stored here`);
       const dir = store.backupDir(target.name);
       const local = await fsp.readdir(dir).catch(() => []);
       process.stdout.write("local:\n");

@@ -537,3 +537,33 @@ test("a build keeps the proxy and buildkit settings it needs", async () => {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("a .env that cannot be put back is reported, not just logged", async () => {
+  const dir = scratch();
+  try {
+    // The restore is what stops a rolled-back release from redeploying itself
+    // on the next routine "compose up -d", so its failure has to reach the
+    // operator rather than only the log.
+    const docker = fakeDocker();
+    let sabotaged = false;
+    const guarded = async (cmd, args, opts) => {
+      const result = await docker.exec(cmd, args, opts);
+      // Once the rollout is under way, put something in .env's place that
+      // cannot be written over, so the rollback's restore fails.
+      if (args.includes("up") && !sabotaged) {
+        sabotaged = true;
+        fs.rmSync(path.join(dir, ".env"));
+        fs.mkdirSync(path.join(dir, ".env"));
+      }
+      return result;
+    };
+    const store = fakeStore();
+    const result = await deploy(registryTarget(dir), "v2", { store, exec: guarded, health: unhealthy });
+    assert.equal(result.ok, false);
+    assert.match(result.detail, /could NOT be restored/);
+    assert.match(result.detail, /intervene/);
+    assert.equal(store.deploys.app.kind, "fail", "an unrestored .env is not a clean rollback");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

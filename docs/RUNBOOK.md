@@ -96,7 +96,11 @@ server-tools export app-media <artifact> --to /tmp/media.tar.gz
 ```
 
 `export` writes a decrypted `.tar.gz`, prints the path, refuses to overwrite
-an existing file, and prints the exact `tar` flags for that archive. Use them:
+an existing file, and prints the exact `tar` flags for that archive. It
+streams, so artifact size is not a limit - unless the artifact exists only
+offsite (a rebuilt box), where it is fetched whole into memory first; on a
+very large media archive, pull it from the bucket with your provider's own
+tool instead. Use them:
 an archive read out of a volume or container is rooted at the name of the
 directory that was copied, so unpacking it without `--strip-components=1`
 puts every file one level too deep. That looks like it worked and 404s every

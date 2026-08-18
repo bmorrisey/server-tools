@@ -270,7 +270,13 @@ export async function verifyArchive(target, { store, artifact = null }) {
   // the basename of the copied path and drops that component.
   const strip = manifest.root ? 0 : 1;
   const source = await artifactStream(target, name, { store });
-  const scan = await scanTarStream(source.pipe(zlib.createGunzip()), { strip });
+  const gunzip = zlib.createGunzip();
+  // pipe() does not forward a source error to its destination, and the source
+  // here is the decrypting stream: a bad tag or a truncated artifact would
+  // otherwise leave the scan waiting for an "end" that never comes. A drill
+  // that hangs is worse than one that fails, because failing is the point.
+  source.on("error", (e) => gunzip.destroy(e));
+  const scan = await scanTarStream(source.pipe(gunzip), { strip });
   return { artifact: name, ...compareToManifest(scan, manifest) };
 }
 
@@ -284,8 +290,14 @@ export async function exportArtifact(target, artifactName, dest, { store }) {
     count.on("data", (c) => (bytes += c.length));
     await pipelineAsync(source, count, handle.createWriteStream());
     return bytes;
+  } catch (e) {
+    // Leaving half a decrypted artifact behind is worse than leaving none:
+    // the exclusive create then refuses the operator's natural retry.
+    await handle.close().catch(() => {});
+    await fsp.rm(dest, { force: true }).catch(() => {});
+    throw e;
   } finally {
-    await handle.close();
+    await handle.close().catch(() => {});
   }
 }
 
@@ -316,6 +328,11 @@ export async function drillFiles(target, { store, artifact = null }) {
       detail = `${v.artifact}: ${v.checked} files, ${formatBytes(v.bytes)} read back and matched`;
     } else {
       const manifest = await loadLatestManifest(target, { store });
+      if (!manifest.root) {
+        throw new Error(
+          `"${target.name}" keeps a manifest and no archive, and its source is read through Docker, so there is no tree here to check it against; set "archive": true to make it provable`,
+        );
+      }
       const v = await verifyManifest(manifest);
       if (!v.ok) throw new Error(v.problems.slice(0, 5).join("; "));
       detail = `manifest only: ${v.checked} files present, ${v.hashed} re-hashed and matched`;

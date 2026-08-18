@@ -263,3 +263,38 @@ test("coverage is judged per application when targets name one", () => {
   assert.equal(notes.length, 1);
   assert.equal(notes[0].app, "beta");
 });
+
+test("a retention policy that keeps nothing is refused", () => {
+  // The Storage page offers pruning as a safe action on the promise that
+  // recent backups survive it; all-zero would delete the newest artifact.
+  const problems = validateConfig(
+    withDefaults({
+      ...minimal,
+      backups: [
+        { name: "db", type: "postgres", container: "c", database: "d", user: "u", encrypt: false, retention: { daily: 0, weekly: 0, monthly: 0 } },
+      ],
+    }),
+  );
+  assert.ok(problems.some((p) => p.includes("must keep at least one backup")));
+  assert.deepEqual(
+    validateConfig(
+      withDefaults({
+        ...minimal,
+        backups: [
+          { name: "db", type: "postgres", container: "c", database: "d", user: "u", encrypt: false, retention: { daily: 0, weekly: 0, monthly: 1 } },
+        ],
+      }),
+    ),
+    [],
+  );
+});
+
+test("a docker-sourced target cannot be manifest-only, because nothing could verify it", () => {
+  const problems = validateConfig(
+    withDefaults({
+      ...minimal,
+      backups: [{ name: "media", type: "files", encrypt: false, source: { volume: "v" }, archive: false }],
+    }),
+  );
+  assert.ok(problems.some((p) => p.includes("archive")));
+});

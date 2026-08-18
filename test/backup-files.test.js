@@ -339,3 +339,77 @@ test("a large encrypted archive is drilled without being held in memory", async 
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("hardlinked media does not break the drill", async () => {
+  // A directory walk sees both names as ordinary files; tar writes the second
+  // as a link with no body. Ignoring the link would leave the manifest
+  // listing a file the archive appears not to contain, and the drill failing
+  // forever on a backup that is perfectly good.
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "st-link-"));
+  try {
+    const media = path.join(root, "media");
+    fs.mkdirSync(media, { recursive: true });
+    fs.writeFileSync(path.join(media, "a.jpg"), "the same bytes");
+    fs.linkSync(path.join(media, "a.jpg"), path.join(media, "b.jpg"));
+    const store = new Store(path.join(root, "data"));
+    store.ensureDirs();
+
+    const t = { name: "media", type: "files", path: media, archive: true, encrypt: false };
+    const patch = await runBackup(t, { docker: null, store });
+    assert.match(patch.lastDetail, /^2 files/);
+
+    const verified = await verifyArchive(t, { store });
+    assert.equal(verified.ok, true, JSON.stringify(verified.problems));
+    assert.equal((await drillFiles(t, { store })).lastDrillResult, "ok");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a drill on a corrupt encrypted archive fails instead of hanging", async () => {
+  const { root, tarPath, store } = fixture();
+  try {
+    const t = target({ encrypt: true, passphrase: "a passphrase long enough" });
+    await runBackup(t, { docker: stubDocker(tarPath), store });
+    const dir = store.backupDir("media");
+    const name = fs.readdirSync(dir).find((f) => f.endsWith(".tar.gz.enc"));
+    const bytes = fs.readFileSync(path.join(dir, name));
+    bytes[bytes.length - 1] ^= 0xff; // flip a bit in the authentication tag
+    fs.writeFileSync(path.join(dir, name), bytes);
+
+    // The failure has to arrive as a rejection: a drill that never returns
+    // records nothing, alerts nobody, and hangs the dashboard request that
+    // started it. Bit rot is exactly what this is for.
+    await assert.rejects(
+      () => Promise.race([
+        drillFiles(t, { store }),
+        new Promise((_, reject) => setTimeout(() => reject(new Error("drill hung")), 5000)),
+      ]),
+      (e) => !/drill hung/.test(e.message),
+    );
+    assert.equal(store.readState("backups", {}).media.lastDrillResult, "fail");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a truncated encrypted archive fails the drill too", async () => {
+  const { root, tarPath, store } = fixture();
+  try {
+    const t = target({ encrypt: true, passphrase: "a passphrase long enough" });
+    await runBackup(t, { docker: stubDocker(tarPath), store });
+    const dir = store.backupDir("media");
+    const name = fs.readdirSync(dir).find((f) => f.endsWith(".tar.gz.enc"));
+    const bytes = fs.readFileSync(path.join(dir, name));
+    fs.writeFileSync(path.join(dir, name), bytes.subarray(0, bytes.length - 8));
+    await assert.rejects(
+      () => Promise.race([
+        drillFiles(t, { store }),
+        new Promise((_, reject) => setTimeout(() => reject(new Error("drill hung")), 5000)),
+      ]),
+      (e) => !/drill hung/.test(e.message),
+    );
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});

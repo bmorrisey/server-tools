@@ -199,6 +199,20 @@ export class TarScanner {
       if (path) this.entry = { path, size, hash: crypto.createHash("sha256") };
       else this.dropped++;
       this.override = {};
+    } else if (typeflag === "1") {
+      // A hardlink: tar writes the second and later names as a link with no
+      // body. A directory walk sees them as ordinary files, so ignoring them
+      // here would leave the manifest listing a file the archive appears not
+      // to contain, and every restore drill failing on a backup that is fine.
+      // The bytes are the target's, so the entry is too.
+      const path = normalizeEntryPath(name, this.strip);
+      const linkTo = normalizeEntryPath(readString(header.subarray(157, 257)), this.strip);
+      const target = this.files.find((f) => f.path === linkTo);
+      if (path && target) {
+        this.files.push({ path, size: target.size, sha256: target.sha256 });
+        this.totalBytes += target.size;
+      }
+      this.override = {};
     } else {
       // Directories, links, devices: recorded by tar, nothing to hash.
       this.override = {};

@@ -231,4 +231,5 @@ State lives in the `server-tools-data` volume and survives rebuilds.
 | Deploy says "working tree has local changes" | The app checkout is dirty; commit/stash on the box or clean it, then retry |
 | Registry deploy says "no previous image recorded" | `.env` had no value for the image variable, so there is nothing to roll back to; set it to the running tag and redeploy |
 | Registry deploy says "services are not running <ref>" | The new image started and died, or a service was left on the old image; `docker compose -p <project> logs <service>` shows why. The stack has already been rolled back |
-| `files` backup says "cannot determine where <name> lives" | The volume or container named in `source` is not on this box, or nothing mounts that volume; fix the name rather than letting the target fall back to a partial backup |
+| `files` backup says `no volume named "x" on this box`, `volume "x" exists but no container mounts it`, or `container "x" not found on this box` | The source cannot be resolved, so the run fails rather than backing up whatever else it can find. Fix the name; do not work around it |
+| `files` backup says "holds no files" | The source resolved but is empty, which an unmounted bind mount looks exactly like. Check the mount before setting `allowEmpty` |
