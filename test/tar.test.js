@@ -243,3 +243,15 @@ test("a single stray zero block does not end the archive early", async () => {
   const result = await scanTarStream(Readable.from([archive]), { strip: 1 });
   assert.deepEqual(result.files.map((f) => f.path).sort(), ["a.txt", "b.txt"]);
 });
+
+test("a corrupt size field is refused rather than trusted", () => {
+  // A negative size would flow into the manifest and make totalBytes lie.
+  const header = tarHeader({ name: "a.txt", size: 0 });
+  header.write("-000000001\0 ", 124, 12, "latin1");
+  let sum = 0;
+  header.write("        ", 148, 8, "latin1");
+  for (let i = 0; i < 512; i++) sum += header[i];
+  header.write(`${sum.toString(8).padStart(6, "0")}\0 `, 148, 8, "latin1");
+  const scanner = new TarScanner();
+  assert.throws(() => scanner.update(header), /invalid size/);
+});

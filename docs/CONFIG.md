@@ -150,7 +150,11 @@ Common fields: `name`, `type` (`postgres` | `files` | `external`), `schedule`,
 - `retention`: `{ "daily": 7, "weekly": 4, "monthly": 6 }` grandfather-
   father-son counts. A backup taken on Sunday fills a weekly slot; one taken
   on the 1st fills a monthly slot. Applied locally and offsite after every
-  successful run.
+  successful run, per run rather than per file, so an archive and its
+  manifest are always kept or dropped together. At least one of the three
+  must be non-zero: all zeroes would delete the backup that had just been
+  taken, and the dashboard offers pruning as a safe action on the promise
+  that it never does that.
 - `s3`: offsite upload. `{ bucket, region, accessKeyId, secretAccessKey,
   endpoint?, prefix? }`. Set `endpoint` for S3-compatible providers
   (path-style addressing is used automatically); leave it unset for AWS.
@@ -220,6 +224,11 @@ that still exists and restores nothing. Targets using the older top-level
 `path` keep the manifest-only default so existing configs do not suddenly
 start writing tarballs; set `"archive": true` on those when you want a real
 copy.
+
+`"archive": false` is refused for a volume or container source. A manifest
+taken through the Docker socket describes no tree this box can re-read, so
+without an archive there would be nothing to verify it against and the
+restore drill could never pass.
 
 `server-tools drill app-media` proves the artifact: it reads the archive back
 byte for byte and checks every file against the manifest that run wrote. For

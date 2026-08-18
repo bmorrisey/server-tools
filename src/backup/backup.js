@@ -389,6 +389,15 @@ async function readThroughDocker(target, src, { docker, outPath, passphrase }) {
   if (!result.complete) {
     throw new Error(`archive stream from ${describeSource(src)} ended mid-entry; refusing to record a partial backup`);
   }
+  if (result.unresolvedLinks > 0) {
+    // The manifest here IS the scan, so a link we could not resolve would go
+    // missing from the inventory with the archive and the manifest agreeing
+    // about it. Silent under-reporting is the failure this whole target type
+    // exists to prevent.
+    throw new Error(
+      `${result.unresolvedLinks} hardlink(s) in ${describeSource(src)} could not be resolved to their contents; refusing to record an incomplete inventory`,
+    );
+  }
   const manifest = {
     root: null,
     source: { ...src, container: containerName, containerPath },

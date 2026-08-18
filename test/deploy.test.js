@@ -567,3 +567,97 @@ test("a .env that cannot be put back is reported, not just logged", async () => 
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("a git deploy that could not be verified is recorded as such, not as clean", async () => {
+  const dir = scratch();
+  try {
+    // The services check exists in git mode for one reason: the old
+    // containers stay up and healthy through the build, so health alone can
+    // pass against the previous release. Falling back to health and recording
+    // "ok" would put that failure mode straight back, invisibly.
+    const exec = async (cmd, args) => {
+      if (cmd === "git" && args.includes("rev-parse")) return { code: 0, stdout: "abc1234", stderr: "" };
+      if (cmd === "git" && args.includes("describe")) return { code: 0, stdout: "v1.0.0", stderr: "" };
+      if (args.includes("ps")) return { code: 1, stdout: "", stderr: "Cannot connect to the Docker daemon" };
+      return { code: 0, stdout: "", stderr: "" };
+    };
+    const store = fakeStore();
+    const target = { name: "legacy", dir, services: ["web"], healthUrl: "http://127.0.0.1:1/health" };
+    const result = await deploy(target, "v2.0.0", { store, exec, health: healthy });
+    assert.equal(result.ok, true, "a daemon hiccup must not roll a healthy stack back");
+    assert.equal(result.rolledBack, false);
+    assert.match(result.detail, /could not verify services/);
+    assert.equal(store.deploys.legacy.kind, "warn");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a git deploy whose services really did not come up is rolled back and named honestly", async () => {
+  const dir = scratch();
+  try {
+    const calls = [];
+    const exec = async (cmd, args) => {
+      calls.push([cmd, ...args].join(" "));
+      if (cmd === "git" && args.includes("rev-parse")) return { code: 0, stdout: "abc1234", stderr: "" };
+      if (cmd === "git" && args.includes("describe")) return { code: 0, stdout: "v1.0.0", stderr: "" };
+      if (args.includes("ps")) return { code: 0, stdout: "cid1", stderr: "" };
+      if (args[0] === "inspect") return { code: 0, stdout: "cid1\tsha256:i\texited\t/legacy-web-1", stderr: "" };
+      return { code: 0, stdout: "", stderr: "" };
+    };
+    const store = fakeStore();
+    const target = { name: "legacy", dir, services: ["web"], healthUrl: "http://127.0.0.1:1/health" };
+    const result = await deploy(target, "v2.0.0", { store, exec, health: healthy });
+    assert.equal(result.ok, false);
+    assert.equal(result.rolledBack, true);
+    // The build succeeded; calling this "build failed" sends the operator to
+    // the wrong logs.
+    assert.match(result.detail, /^rollout failed/);
+    assert.ok(calls.some((c) => c.includes("checkout abc1234")));
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a short docker inspect is not read as a healthy service", async () => {
+  const dir = scratch();
+  try {
+    // compose listed two containers, inspect returned one. Believing the
+    // shorter answer would report a half-deployed service as fine.
+    const docker = fakeDocker();
+    const exec = async (cmd, args, opts) => {
+      if (args.includes("ps")) return { code: 0, stdout: "cid1\ncid2", stderr: "" };
+      return docker.exec(cmd, args, opts);
+    };
+    const result = await deploy(registryTarget(dir), "v2", { store: null, exec, health: healthy });
+    // A container reaped between the two calls is a transient, so this is
+    // "could not verify" rather than "broken" - but it must be said, not
+    // quietly counted as a fully verified rollout.
+    assert.match(result.detail, /inspected 1 of 2 containers/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a rollback uses a locally present image when the registry is unreachable", async () => {
+  const dir = scratch();
+  try {
+    // The previous image may have been pruned from the registry, or the
+    // registry may be the reason the deploy failed. A local copy is enough.
+    const calls = [];
+    const exec = async (cmd, args) => {
+      calls.push([cmd, ...args].join(" "));
+      if (args[0] === "pull" && args[1].endsWith(":v1")) return { code: 1, stdout: "", stderr: "registry unreachable" };
+      if (args[0] === "image" && args[1] === "inspect") return { code: 0, stdout: "sha256:img", stderr: "" };
+      if (args.includes("ps")) return { code: 0, stdout: "cid1", stderr: "" };
+      if (args[0] === "inspect") return { code: 0, stdout: "cid1\tsha256:img\trunning\t/app-web-1", stderr: "" };
+      return { code: 0, stdout: "", stderr: "" };
+    };
+    const result = await deploy(registryTarget(dir), "v2", { store: null, exec, health: unhealthy });
+    assert.equal(result.rolledBack, true);
+    assert.doesNotMatch(result.detail, /ALSO FAILED/);
+    assert.equal(readEnvVar(fs.readFileSync(path.join(dir, ".env"), "utf8"), "APP_IMAGE"), "ghcr.io/o/app:v1");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

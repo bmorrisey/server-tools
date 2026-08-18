@@ -110,6 +110,8 @@ export class TarScanner {
     this.buf = Buffer.alloc(0);
     this.files = [];
     this.totalBytes = 0;
+    this.byPath = new Map(); // path -> entry, for resolving hardlinks
+    this.unresolvedLinks = 0; // links whose target never appeared
     this.dropped = 0; // entries removed by `strip`, tracked so an archive
     this.zeroBlocks = 0; // that yields nothing can be told from an empty one
     this.sawEnd = false;
@@ -205,12 +207,18 @@ export class TarScanner {
       // here would leave the manifest listing a file the archive appears not
       // to contain, and every restore drill failing on a backup that is fine.
       // The bytes are the target's, so the entry is too.
+      //
+      // The link target can outgrow the 100-byte header field just as a name
+      // can, and then it arrives the same two ways: a GNU 'K' record, or a
+      // PAX "linkpath". Reading only the header field would truncate it, miss
+      // the lookup, and drop the entry - the same bug one route over.
       const path = normalizeEntryPath(name, this.strip);
-      const linkTo = normalizeEntryPath(readString(header.subarray(157, 257)), this.strip);
-      const target = this.files.find((f) => f.path === linkTo);
+      const rawLink = this.override.linkpath ?? readString(header.subarray(157, 257));
+      const target = this.byPath.get(normalizeEntryPath(rawLink, this.strip));
       if (path && target) {
-        this.files.push({ path, size: target.size, sha256: target.sha256 });
-        this.totalBytes += target.size;
+        this.#record({ path, size: target.size, sha256: target.sha256 });
+      } else if (path) {
+        this.unresolvedLinks++;
       }
       this.override = {};
     } else {
@@ -223,21 +231,31 @@ export class TarScanner {
     else this.#endEntry();
   }
 
+  #record(entry) {
+    this.files.push(entry);
+    this.byPath.set(entry.path, entry);
+    this.totalBytes += entry.size;
+  }
+
   #endEntry() {
     if (this.entry) {
-      this.files.push({ path: this.entry.path, size: this.entry.size, sha256: this.entry.hash.digest("hex") });
-      this.totalBytes += this.entry.size;
+      this.#record({ path: this.entry.path, size: this.entry.size, sha256: this.entry.hash.digest("hex") });
       this.entry = null;
     } else if (this.collect) {
       const raw = Buffer.concat(this.collect);
       if (this.collectKind === "L") {
         const text = raw.toString("utf8").replace(/\0.*$/s, "");
         this.override = { ...this.override, path: normalizeEntryPath(text, 0) };
+      } else if (this.collectKind === "K") {
+        // GNU's long-link record: the target of the hardlink that follows.
+        const text = raw.toString("utf8").replace(/\0.*$/s, "");
+        this.override = { ...this.override, linkpath: text };
       } else if (this.collectKind === "x") {
         // Byte offsets, so the payload stays a Buffer all the way in.
         const pax = parsePax(raw);
         const next = { ...this.override };
         if (pax.path) next.path = pax.path;
+        if (pax.linkpath) next.linkpath = pax.linkpath;
         if (pax.size !== undefined && Number.isFinite(Number(pax.size))) next.size = Number(pax.size);
         this.override = next;
       }
@@ -255,7 +273,13 @@ export class TarScanner {
     this.finished = true;
     const clean = this.phase === "header" && !this.entry;
     const files = [...this.files].sort((a, b) => a.path.localeCompare(b.path));
-    return { files, totalBytes: this.totalBytes, dropped: this.dropped, complete: this.sawEnd && clean };
+    return {
+      files,
+      totalBytes: this.totalBytes,
+      dropped: this.dropped,
+      unresolvedLinks: this.unresolvedLinks,
+      complete: this.sawEnd && clean,
+    };
   }
 }
 

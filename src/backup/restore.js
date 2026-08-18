@@ -17,7 +17,7 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
 import zlib from "node:zlib";
-import { PassThrough, Readable } from "node:stream";
+import { PassThrough, Readable, pipeline } from "node:stream";
 import { decryptBuffer, decryptStream, isEncryptedArtifact } from "./crypto.js";
 import { shouldArchive, verifyManifest } from "./backup.js";
 import { scanTarStream } from "./tar.js";
@@ -271,12 +271,13 @@ export async function verifyArchive(target, { store, artifact = null }) {
   const strip = manifest.root ? 0 : 1;
   const source = await artifactStream(target, name, { store });
   const gunzip = zlib.createGunzip();
-  // pipe() does not forward a source error to its destination, and the source
-  // here is the decrypting stream: a bad tag or a truncated artifact would
-  // otherwise leave the scan waiting for an "end" that never comes. A drill
-  // that hangs is worse than one that fails, because failing is the point.
-  source.on("error", (e) => gunzip.destroy(e));
-  const scan = await scanTarStream(source.pipe(gunzip), { strip });
+  // pipeline, not pipe: errors have to travel in both directions here. A bad
+  // tag or a truncated artifact must reach the scanner (or the drill hangs
+  // waiting for an "end" that never comes), and a gunzip failure must tear
+  // the decrypting source down (or its file descriptor is held for the life
+  // of the agent, on exactly the corrupt archive someone will retry).
+  pipeline(source, gunzip, () => {});
+  const scan = await scanTarStream(gunzip, { strip });
   return { artifact: name, ...compareToManifest(scan, manifest) };
 }
 

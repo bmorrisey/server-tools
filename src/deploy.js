@@ -604,6 +604,7 @@ async function deployGit(target, ref, { store, dryRun, exec, health }) {
   const record = recorder(store, target, fromRef, ref, "git");
   const build = () => compose(exec, target, ["up", "-d", "--build"]);
 
+  let unproven = null;
   try {
     await build();
     // A build leaves the previous containers up and healthy the whole time, so
@@ -615,17 +616,21 @@ async function deployGit(target, ref, { store, dryRun, exec, health }) {
         if (!verify.ok) throw new Error(`services did not come up: ${verify.problems.join("; ")}`);
       } catch (e) {
         // Same rule as registry mode: a read-only check that could not be
-        // performed must not cause a write. Let the health gate decide.
+        // performed must not cause a write. Let the health gate decide - but
+        // say so, because health alone passing against the previous release
+        // is the exact thing this check was added to catch.
         if (!e.unverifiable) throw e;
+        unproven = e.message;
         log.warn(`deploy ${target.name}: ${e.message}; falling back to the health check`);
       }
     }
   } catch (e) {
-    log.error(`build/up failed for ${target.name}; rolling back to ${from}`);
+    const what = e.message.startsWith("services did not come up") ? "rollout" : "build";
+    log.error(`${what} failed for ${target.name}; rolling back to ${from}`);
     await git(exec, dir, "checkout", from);
     await build().catch((e2) => log.error(`rollback build also failed: ${e2.message}`));
-    record("rollback", `build failed (${e.message.slice(0, 200)}); rolled back to ${fromRef}`);
-    return { ok: false, from: fromRef, to: ref, rolledBack: true, detail: `build failed: ${e.message.slice(0, 300)}` };
+    record("rollback", `${what} failed (${e.message.slice(0, 200)}); rolled back to ${fromRef}`);
+    return { ok: false, from: fromRef, to: ref, rolledBack: true, detail: `${what} failed: ${e.message.slice(0, 300)}` };
   }
 
   const healthResult = await health(target.healthUrl, healthWaitFor(target));
@@ -647,9 +652,16 @@ async function deployGit(target, ref, { store, dryRun, exec, health }) {
     };
   }
 
-  record("ok", `${fromRef} -> ${ref}, healthy after ${healthResult.tries} checks`);
-  log.info(`deploy ${target.name} ok: ${ref} healthy`);
-  return { ok: true, from: fromRef, to: ref, rolledBack: false, detail: `healthy after ${healthResult.tries} checks` };
+  const caveat = unproven ? `, but ${unproven}` : "";
+  record(unproven ? "warn" : "ok", `${fromRef} -> ${ref}, healthy after ${healthResult.tries} checks${caveat}`);
+  log.info(`deploy ${target.name} ok: ${ref} healthy${caveat}`);
+  return {
+    ok: true,
+    from: fromRef,
+    to: ref,
+    rolledBack: false,
+    detail: `healthy after ${healthResult.tries} checks${caveat}`,
+  };
 }
 
 /* ---------------------------------------------------------------------- */

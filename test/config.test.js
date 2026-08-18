@@ -298,3 +298,33 @@ test("a docker-sourced target cannot be manifest-only, because nothing could ver
   );
   assert.ok(problems.some((p) => p.includes("archive")));
 });
+
+test("the shipped example config validates", () => {
+  // It is the starting point every deployment copies, and AGENTS.md requires
+  // it to move in lockstep with validation; nothing else here checks that.
+  const raw = fs.readFileSync(new URL("../deploy/config.example.json", import.meta.url), "utf8");
+  const withSecrets = raw.replaceAll(/"\$\{[A-Z0-9_]+\}"/g, '"a placeholder long enough"');
+  assert.deepEqual(validateConfig(withDefaults(JSON.parse(withSecrets))), []);
+});
+
+test("exclude is refused on a source read through docker", () => {
+  // The Engine hands back the subtree as one stream, so the exclusion could
+  // only reach the manifest, and every drill would fail from then on.
+  const problems = validateConfig(
+    withDefaults({
+      ...minimal,
+      backups: [{ name: "m", type: "files", encrypt: false, source: { volume: "v" }, exclude: ["tmp"] }],
+    }),
+  );
+  assert.ok(problems.some((p) => p.includes("cannot be applied to a volume or container source")));
+  // And a path source still accepts them, as literal paths only.
+  assert.deepEqual(
+    validateConfig(withDefaults({ ...minimal, backups: [{ name: "m", type: "files", encrypt: false, path: "/m", exclude: ["tmp"] }] })),
+    [],
+  );
+  assert.ok(
+    validateConfig(
+      withDefaults({ ...minimal, backups: [{ name: "m", type: "files", encrypt: false, path: "/m", exclude: ["*.tmp"] }] }),
+    ).some((p) => p.includes("literal paths")),
+  );
+});

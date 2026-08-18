@@ -213,9 +213,12 @@ async function main() {
       // the live data - where media belongs is the operator's call, not ours.
       const target = findTarget(config, "backups", positional[0] ?? fail("usage: export <target> [artifact] [--to <file>]"));
       if (target.type === "external") fail(`"${target.name}" is external (${target.note}); nothing is stored here to export`);
+      // Check the invocation before doing any work: telling someone their
+      // artifact is missing when what they actually mistyped is a flag sends
+      // them looking in the wrong place.
+      const to = optionValue("--to");
       const name = positional[1] ?? (await latestArtifact(target, { store }));
       const extractHint = await extractionHint(target, name, store);
-      const to = optionValue("--to");
       const dest = to ? path.resolve(to) : path.join(store.tmpDir(), name.replace(/\.enc$/, ""));
       // Exclusive create: this writes plaintext application data, so it must
       // never land on top of a file the operator was not shown, and never

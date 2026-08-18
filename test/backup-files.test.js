@@ -13,7 +13,8 @@ import crypto from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { Store } from "../src/store.js";
 import { runBackup } from "../src/backup/backup.js";
-import { drillFiles, verifyArchive } from "../src/backup/restore.js";
+import { drillFiles, exportArtifact, verifyArchive } from "../src/backup/restore.js";
+import { scanTarStream } from "../src/backup/tar.js";
 
 function fixture() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "st-media-"));
@@ -409,6 +410,106 @@ test("a truncated encrypted archive fails the drill too", async () => {
       ]),
       (e) => !/drill hung/.test(e.message),
     );
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a hardlink whose target has a long path is still resolved", async () => {
+  // Over 100 bytes the target does not fit the ustar header field, so it
+  // arrives as a GNU 'K' record or a PAX linkpath. Reading only the header
+  // would truncate it, miss the lookup, and drop the entry - the same
+  // manifest-versus-archive disagreement one route over. Which of the two
+  // names tar archives first is readdir order, so this is intermittent per
+  // directory and permanent once it happens.
+  for (const format of ["gnu", "pax"]) {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "st-link2-"));
+    try {
+      const media = path.join(root, "media");
+      const deep = path.join(media, "a".repeat(60), "b".repeat(60));
+      fs.mkdirSync(deep, { recursive: true });
+      const original = path.join(deep, "photo-original.jpg");
+      fs.writeFileSync(original, "the same bytes");
+      fs.linkSync(original, path.join(media, "thumb.jpg"));
+      const store = new Store(path.join(root, "data"));
+      store.ensureDirs();
+
+      const tarPath = path.join(root, "media.tar");
+      assert.equal(spawnSync("tar", [`--format=${format}`, "-cf", tarPath, "-C", root, "media"]).status, 0);
+      const scan = await scanTarStream(fs.createReadStream(tarPath), { strip: 1 });
+      assert.equal(scan.unresolvedLinks, 0, `${format}: link target not resolved`);
+      assert.equal(scan.files.length, 2, format);
+      const [one, two] = scan.files;
+      assert.equal(one.sha256, two.sha256, `${format}: a link must carry the target's bytes`);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  }
+});
+
+test("a link the scanner cannot resolve fails the run rather than under-reporting", async () => {
+  const { root, store } = fixture();
+  try {
+    // A link entry whose target never appears in the stream. On a docker
+    // source the manifest IS the scan, so dropping it would leave archive and
+    // manifest agreeing that the file was never there.
+    const orphan = path.join(root, "orphan.tar");
+    const header = Buffer.alloc(512);
+    header.write("storage/thumb.jpg", 0, 100, "utf8");
+    header.write("0000644\0", 100, 8, "latin1");
+    header.write("0000000\0", 108, 8, "latin1");
+    header.write("0000000\0", 116, 8, "latin1");
+    header.write(`${(0).toString(8).padStart(11, "0")}\0`, 124, 12, "latin1");
+    header.write("00000000000\0", 136, 12, "latin1");
+    header.write("        ", 148, 8, "latin1");
+    header.write("1", 156, 1, "latin1");
+    header.write("storage/gone.jpg", 157, 100, "utf8");
+    header.write("ustar\0", 257, 6, "latin1");
+    header.write("00", 263, 2, "latin1");
+    let sum = 0;
+    for (let i = 0; i < 512; i++) sum += header[i];
+    header.write(`${sum.toString(8).padStart(6, "0")}\0 `, 148, 8, "latin1");
+    fs.writeFileSync(orphan, Buffer.concat([header, Buffer.alloc(1024)]));
+
+    await assert.rejects(
+      () => runBackup(target(), { docker: stubDocker(orphan), store }),
+      /could not be resolved/,
+    );
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a failed export leaves nothing behind, so the retry is not blocked", async () => {
+  const { root, tarPath, store } = fixture();
+  try {
+    const t = target({ encrypt: true, passphrase: "a passphrase long enough" });
+    await runBackup(t, { docker: stubDocker(tarPath), store });
+    const dir = store.backupDir("media");
+    const name = fs.readdirSync(dir).find((f) => f.endsWith(".tar.gz.enc"));
+    const bytes = fs.readFileSync(path.join(dir, name));
+    bytes[bytes.length - 1] ^= 0xff;
+    fs.writeFileSync(path.join(dir, name), bytes);
+
+    const dest = path.join(root, "out.tar.gz");
+    await assert.rejects(() => exportArtifact(t, name, dest, { store }));
+    // Half a decrypted artifact left at dest would then trip the exclusive
+    // create and tell the operator to pick a different path.
+    assert.equal(fs.existsSync(dest), false);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a manifest-only docker-sourced target says why it cannot be drilled", async () => {
+  const { root, tarPath, store } = fixture();
+  try {
+    // Config validation refuses this combination, but a target that predates
+    // the rule, or one hand-edited, must still get a sentence it can act on
+    // rather than an internal message about filesystem roots.
+    const t = target({ archive: false });
+    await runBackup(t, { docker: stubDocker(tarPath), store });
+    await assert.rejects(() => drillFiles(t, { store }), /set "archive": true to make it provable/);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
