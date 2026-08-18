@@ -5,8 +5,18 @@
  * non-AWS providers; path-style addressing is used when an endpoint is set).
  */
 import crypto from "node:crypto";
+import fs from "node:fs";
+import fsp from "node:fs/promises";
+import { Readable } from "node:stream";
 
 const sha256 = (data) => crypto.createHash("sha256").update(data).digest("hex");
+
+/** sha256 of a file, computed without holding the file in memory. */
+async function sha256File(filePath) {
+  const hash = crypto.createHash("sha256");
+  for await (const chunk of fs.createReadStream(filePath)) hash.update(chunk);
+  return hash.digest("hex");
+}
 const hmac = (key, data) => crypto.createHmac("sha256", key).update(data).digest();
 
 /**
@@ -95,6 +105,34 @@ export class S3 {
   async put(key, buf) {
     const res = await this.request("PUT", key, { body: buf });
     if (!res.ok) throw new Error(`S3 PUT ${key} -> ${res.status}`);
+  }
+
+  /**
+   * Upload a file without reading it into memory.
+   *
+   * Media archives are large by nature, and a multi-gigabyte readFile inside
+   * a long-running agent on a single-box VPS does not fail softly - it gets
+   * the process OOM-killed, which takes every scheduled check with it. SigV4
+   * needs the payload digest before the first byte is sent, so the file is
+   * hashed in one streaming pass and sent in a second: one extra read, and a
+   * flat memory profile whatever the size.
+   */
+  async putFile(key, filePath, { timeoutMs = 60 * 60_000 } = {}) {
+    const { size } = await fsp.stat(filePath);
+    const payloadHash = await sha256File(filePath);
+    const path = this.objectPath(key);
+    const headers = this.sign({ method: "PUT", path, payloadHash });
+    const res = await fetch(`${this.base}${path}`, {
+      method: "PUT",
+      headers: { ...headers, "content-length": String(size) },
+      body: Readable.toWeb(fs.createReadStream(filePath)),
+      duplex: "half",
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      throw new Error(`S3 PUT ${key} -> ${res.status}: ${text.slice(0, 300)}`);
+    }
   }
 
   /** Returns a Buffer, or null when the object does not exist. */

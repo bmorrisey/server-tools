@@ -4,7 +4,7 @@
  *
  *   node src/agent.js            (config from ./config.json or SERVER_TOOLS_CONFIG)
  */
-import { loadConfig } from "./config.js";
+import { coverageNotes, loadConfig } from "./config.js";
 import { Store } from "./store.js";
 import { Docker } from "./docker.js";
 import { CheckEngine } from "./checks.js";
@@ -78,6 +78,10 @@ export async function startAgent({ configPath, withWeb = true } = {}) {
 
   // Backups.
   for (const target of config.backups) {
+    if (target.type === "external") {
+      log.info(`backup ${target.name}: external (${target.note}), nothing to copy`);
+      continue;
+    }
     if (!target.schedule) {
       log.info(`backup ${target.name}: no schedule, manual only`);
       continue;
@@ -95,7 +99,8 @@ export async function startAgent({ configPath, withWeb = true } = {}) {
       }
     });
   }
-  log.info(`scheduled ${config.backups.filter((b) => b.schedule).length} backup targets`);
+  log.info(`scheduled ${config.backups.filter((b) => b.schedule && b.type !== "external").length} backup targets`);
+  for (const note of coverageNotes(config)) log.warn(`${note.title}: ${note.detail}`);
 
   // Housekeeping.
   schedule(config.housekeeping.schedule ?? "04:30", "housekeep", () => housekeep(config, store));

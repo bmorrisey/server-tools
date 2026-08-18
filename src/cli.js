@@ -7,8 +7,9 @@
  *   server-tools backup <target>         run one backup target now
  *   server-tools backup-all              run every configured backup target
  *   server-tools restore <target> [artifact] [--force]
- *   server-tools drill <target> [artifact]
+ *   server-tools drill <target> [artifact]  prove a backup restores (db) or matches its manifest (files)
  *   server-tools artifacts <target>      list local + offsite artifacts
+ *   server-tools export <target> [artifact] [--to <file>]   write a decrypted copy of an artifact
  *   server-tools deploy <target> <ref> [--dry-run]
  *   server-tools housekeep [--dry-run]
  *   server-tools storage [--json]        what is using the disk, and what is reclaimable
@@ -21,12 +22,12 @@
  */
 import fsp from "node:fs/promises";
 import path from "node:path";
-import { loadConfig, DEFAULT_CONFIG_PATH } from "./config.js";
+import { coverageNotes, loadConfig, DEFAULT_CONFIG_PATH } from "./config.js";
 import { Store } from "./store.js";
 import { Docker } from "./docker.js";
 import { runCheck } from "./checks.js";
 import { runBackup } from "./backup/backup.js";
-import { restore, drill } from "./backup/restore.js";
+import { restore, drill, drillFiles, exportArtifact, latestArtifact, loadRunManifest } from "./backup/restore.js";
 import { S3 } from "./backup/s3.js";
 import { deploy } from "./deploy.js";
 import { housekeep } from "./housekeep.js";
@@ -34,7 +35,27 @@ import { formatBytes } from "./util.js";
 
 const [, , command, ...args] = process.argv;
 const flags = new Set(args.filter((a) => a.startsWith("--")));
-const positional = args.filter((a) => !a.startsWith("--"));
+
+// Options that take a value, so the value is not mistaken for a positional
+// argument ("export media --to /tmp/x" names one target, not two).
+const VALUE_OPTIONS = new Set(["--to"]);
+const positional = [];
+for (let i = 0; i < args.length; i++) {
+  if (args[i].startsWith("--")) {
+    if (VALUE_OPTIONS.has(args[i])) i++;
+    continue;
+  }
+  positional.push(args[i]);
+}
+
+/** Value of a "--name value" option, or null. */
+function optionValue(name) {
+  const i = args.indexOf(name);
+  if (i < 0) return null;
+  const value = args[i + 1];
+  if (!value || value.startsWith("--")) fail(`${name} needs a value`);
+  return value;
+}
 
 function fail(msg) {
   process.stderr.write(`error: ${msg}\n`);
@@ -50,6 +71,26 @@ function findTarget(config, kind, name) {
 
 const ICONS = { ok: "OK  ", warn: "WARN", fail: "FAIL" };
 
+/**
+ * How to unpack an exported archive.
+ *
+ * An archive read out of a volume or container is rooted at the name of the
+ * directory that was copied; one built from a host path is not. Restoring the
+ * first without stripping that component puts every file one directory too
+ * deep, which looks like it worked and 404s every image.
+ */
+async function extractionHint(target, artifact, store) {
+  if (target.type !== "files" || artifact.endsWith(".json")) return null;
+  // The manifest may only exist offsite - which is precisely the situation
+  // the runbook is written for, so this has to look there too.
+  const manifest = await loadRunManifest(target, artifact, { store }).catch(() => null);
+  if (!manifest) {
+    return { warning: "no manifest for this run, so it was never verified as complete; check it before trusting it" };
+  }
+  const strip = manifest.root ? "" : " --strip-components=1";
+  return { command: `tar -xz${strip} -C <destination> -f <file>` };
+}
+
 async function main() {
   if (!command || command === "help" || command === "--help" || flags.has("--help")) {
     const header = (await import("node:fs")).readFileSync(new URL(import.meta.url), "utf8");
@@ -64,8 +105,11 @@ async function main() {
   }
 
   if (command === "validate") {
-    loadConfig();
+    const cfg = loadConfig();
     process.stdout.write(`config at ${path.resolve(DEFAULT_CONFIG_PATH)} is valid\n`);
+    for (const note of coverageNotes(cfg)) {
+      process.stdout.write(`\nheads up: ${note.title}\n  ${note.detail}\n`);
+    }
     return;
   }
 
@@ -99,6 +143,10 @@ async function main() {
     case "backup-all": {
       let failed = 0;
       for (const target of config.backups) {
+        if (target.type === "external") {
+          process.stdout.write(`SKIP ${target.name}: external - ${target.note}\n`);
+          continue;
+        }
         try {
           const result = await runBackup(target, { docker, store });
           process.stdout.write(`OK   ${target.name}: ${result.lastDetail}\n`);
@@ -113,7 +161,10 @@ async function main() {
 
     case "restore": {
       const target = findTarget(config, "backups", positional[0] ?? fail("usage: restore <target> [artifact]"));
-      if (target.type !== "postgres") fail("restore currently supports postgres targets (files targets restore from their archive by hand; see RUNBOOK.md)");
+      if (target.type === "external")
+        fail(`"${target.name}" is external (${target.note}); nothing is stored here to restore`);
+      if (target.type !== "postgres")
+        fail("restore currently supports postgres targets; for media use: server-tools export <target> (see RUNBOOK.md)");
       const result = await restore(target, {
         docker,
         store,
@@ -126,14 +177,20 @@ async function main() {
 
     case "drill": {
       const target = findTarget(config, "backups", positional[0] ?? fail("usage: drill <target> [artifact]"));
-      if (target.type !== "postgres") fail("drill supports postgres targets");
-      const result = await drill(target, { docker, store, artifact: positional[1] ?? null });
+      if (target.type === "external")
+        fail(`"${target.name}" is external (${target.note}); this toolkit holds nothing to drill`);
+      const artifact = positional[1] ?? null;
+      const result =
+        target.type === "postgres"
+          ? await drill(target, { docker, store, artifact })
+          : await drillFiles(target, { store, artifact });
       process.stdout.write(`drill ok: ${result.lastDrillDetail}\n`);
       break;
     }
 
     case "artifacts": {
       const target = findTarget(config, "backups", positional[0] ?? fail("usage: artifacts <target>"));
+      if (target.type === "external") fail(`"${target.name}" is external (${target.note}); nothing is stored here`);
       const dir = store.backupDir(target.name);
       const local = await fsp.readdir(dir).catch(() => []);
       process.stdout.write("local:\n");
@@ -147,6 +204,39 @@ async function main() {
           process.stdout.write(`  ${k}\n`);
         }
       }
+      break;
+    }
+
+    case "export": {
+      // Hands the operator plaintext bytes, which is the whole point: an
+      // encrypted archive cannot be unpacked. Nothing is written back over
+      // the live data - where media belongs is the operator's call, not ours.
+      const target = findTarget(config, "backups", positional[0] ?? fail("usage: export <target> [artifact] [--to <file>]"));
+      if (target.type === "external") fail(`"${target.name}" is external (${target.note}); nothing is stored here to export`);
+      // Check the invocation before doing any work: telling someone their
+      // artifact is missing when what they actually mistyped is a flag sends
+      // them looking in the wrong place.
+      const to = optionValue("--to");
+      const name = positional[1] ?? (await latestArtifact(target, { store }));
+      const extractHint = await extractionHint(target, name, store);
+      const dest = to ? path.resolve(to) : path.join(store.tmpDir(), name.replace(/\.enc$/, ""));
+      // Exclusive create: this writes plaintext application data, so it must
+      // never land on top of a file the operator was not shown, and never
+      // inherit that file's permissions ("mode" is ignored for an existing
+      // file, which is exactly the wrong moment to be relaxed about it).
+      let bytes;
+      try {
+        bytes = await exportArtifact(target, name, dest, { store });
+      } catch (e) {
+        if (e.code === "EEXIST") fail(`${dest} already exists; pass a different --to rather than overwriting it`);
+        throw e;
+      }
+      process.stdout.write(
+        `${dest}\n${formatBytes(bytes)}, decrypted - delete it when you are done` +
+          `${to ? "" : " (housekeeping clears the temp directory on its own schedule)"}\n`,
+      );
+      if (extractHint?.command) process.stdout.write(`unpack with: ${extractHint.command}\n`);
+      if (extractHint?.warning) process.stdout.write(`warning: ${extractHint.warning}\n`);
       break;
     }
 
@@ -243,10 +333,22 @@ async function main() {
         process.stdout.write(`  ${ICONS[s.status] ?? "?   "} ${name.padEnd(26)} ${s.detail}  (${s.at})\n`);
       }
       process.stdout.write("backups:\n");
-      for (const [name, s] of Object.entries(backups)) {
+      for (const target of config.backups) {
+        if (target.type === "external") {
+          process.stdout.write(`  EXT  ${target.name.padEnd(26)} outside this toolkit: ${target.note}\n`);
+          continue;
+        }
+        const s = backups[target.name];
+        if (!s) {
+          process.stdout.write(`  ?    ${target.name.padEnd(26)} never run\n`);
+          continue;
+        }
         process.stdout.write(
-          `  ${s.lastResult === "ok" ? "OK  " : "FAIL"} ${name.padEnd(26)} last ${s.lastSuccess ?? "never"}  ${s.lastDetail ?? ""}\n`,
+          `  ${s.lastResult === "ok" ? "OK  " : "FAIL"} ${target.name.padEnd(26)} last ${s.lastSuccess ?? "never"}  ${s.lastDetail ?? ""}\n`,
         );
+      }
+      for (const note of coverageNotes(config)) {
+        process.stdout.write(`\nheads up: ${note.title}\n  ${note.detail}\n`);
       }
       break;
     }

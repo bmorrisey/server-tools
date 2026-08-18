@@ -7,7 +7,7 @@ import { createHash } from "node:crypto";
 import { Store } from "../src/store.js";
 import { startWebServer } from "../src/web/server.js";
 import { createLoginToken } from "../src/web/auth.js";
-import { sparkline, meter, statusPill } from "../src/web/ui.js";
+import { backupsPage, coverageBanners, deploysPage, sparkline, meter, statusPill } from "../src/web/ui.js";
 
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), "st-web-"));
 const store = new Store(dir);
@@ -360,4 +360,79 @@ test("ui fragments render sanely", () => {
   assert.match(meter(50), /width:50%/);
   assert.match(meter(96), /fail/);
   assert.match(meter(120), /width:100%/); // clamped
+});
+
+const uiSession = { email: "op@example.com", csrf: "tok" };
+
+test("the backups page shows an external target as declared, not as failing", () => {
+  const html = backupsPage({
+    session: uiSession,
+    backups: { "demo-db": { lastResult: "ok", lastSuccess: new Date().toISOString() } },
+    targets: [
+      { name: "demo-db", type: "postgres" },
+      { name: "demo-media", type: "external", note: "Object storage bucket demo-media" },
+    ],
+    notes: [],
+    csrf: "tok",
+  });
+  assert.match(html, /demo-media/);
+  assert.match(html, /outside this toolkit/);
+  assert.match(html, /Object storage bucket demo-media/);
+  // No action buttons for something this toolkit does not copy.
+  assert.doesNotMatch(html, /value="demo-media"/);
+  // A database target still gets both buttons.
+  assert.match(html, /name="target" value="demo-db"/);
+});
+
+test("a files target can be drilled from the dashboard and says where it reads from", () => {
+  const html = backupsPage({
+    session: uiSession,
+    backups: {},
+    targets: [{ name: "media", type: "files", source: { volume: "app_media" } }],
+    notes: [],
+    csrf: "tok",
+  });
+  assert.match(html, /files - volume app_media/);
+  assert.match(html, /run-drill/);
+});
+
+test("a coverage gap is stated on the page, not left implied", () => {
+  const html = backupsPage({
+    session: uiSession,
+    backups: {},
+    targets: [{ name: "demo-db", type: "postgres" }],
+    notes: [{ id: "media-not-declared", title: "Databases are backed up; media is not declared", detail: "..." }],
+    csrf: "tok",
+  });
+  assert.match(html, /banner warn/);
+  assert.match(html, /media is not declared/);
+  assert.equal(coverageBanners([]), "");
+});
+
+test("the deploys page distinguishes a registry target from one that builds here", () => {
+  const html = deploysPage({
+    session: uiSession,
+    deploys: {},
+    targets: [
+      { name: "app", dir: "/apps/app", project: "app", source: "registry", image: "ghcr.io/owner/app" },
+      { name: "site", dir: "/apps/site" },
+    ],
+    events: [],
+  });
+  assert.match(html, /registry - ghcr.io\/owner\/app/);
+  assert.match(html, /git - builds on this box/);
+  assert.match(html, /project app/);
+});
+
+test("a deploy that succeeded with a caveat is not shown as a failure", () => {
+  // The CLI exits 0 and the events feed shows amber; a red pill here would
+  // contradict both.
+  const html = deploysPage({
+    session: uiSession,
+    deploys: { app: { kind: "warn", at: new Date().toISOString(), from: "v1", to: "v2", detail: "healthy, but could not verify services" } },
+    targets: [{ name: "app", dir: "/apps/app", project: "app", source: "registry", image: "ghcr.io/o/app" }],
+    events: [{ topic: "deploy", kind: "warn", name: "app", detail: "could not verify services" }],
+  });
+  assert.match(html, /status warn/);
+  assert.doesNotMatch(html, /status fail/);
 });

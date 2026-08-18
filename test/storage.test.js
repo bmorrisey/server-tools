@@ -373,3 +373,24 @@ test("report composes a full picture and degrades when Docker is unreachable", a
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("an external target gets no storage row and no directory", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "st-ext-"));
+  try {
+    const store = new Store(dir);
+    store.ensureDirs();
+    const config = {
+      backups: [
+        { name: "db", type: "postgres" },
+        { name: "media", type: "external", note: "somewhere else" },
+      ],
+    };
+    const rows = await backupUsage(config, store);
+    assert.deepEqual(rows.map((r) => r.name), ["db"]);
+    // Asking for its directory would create one for a target that will never
+    // hold an artifact, and then report it as a row of zeroes.
+    assert.equal(fs.existsSync(path.join(dir, "backups", "media")), false);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

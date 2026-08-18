@@ -80,8 +80,11 @@ the deploy helper should manage, keeping container path = config path:
       - /home/you/apps/myapp:/apps/myapp        # <- your app checkout
 ```
 
-Media directories for `files` backup targets need to be visible too (a
-read-only mount is enough for manifest/verify: add `:ro`).
+Media for `files` backup targets does not need a mount if it lives in a
+Docker volume or inside a container: name it with `"source": { "volume": ... }`
+or `{ "container": ..., "path": ... }` and the agent reads it through the
+Docker socket, stopped stacks included. A plain host directory does need a
+mount (read-only is enough: add `:ro`).
 
 The `/:/host:ro` mount also lets the Storage page report container log file
 sizes. Without it the page still works; it just cannot show how big the log
@@ -173,8 +176,39 @@ docker compose exec agent node src/cli.js deploy myapp v1.2.3 --dry-run
 docker compose exec agent node src/cli.js deploy myapp v1.2.3
 ```
 
-The deploy records an event either way; a failed health check rolls back to
-the previous ref automatically.
+The deploy records an event either way; a failed health check rolls back
+automatically.
+
+With `"source": "registry"` (recommended when the box hosts more than one
+stack) the tag is an image tag: the agent pulls it, writes the reference into
+the app's `.env`, recreates the stack without building, and confirms the
+listed services are running that exact image. Two prerequisites:
+
+- The box must already be logged in to the registry: `docker login ghcr.io`.
+  The toolkit never handles registry credentials itself. `docker login` is a
+  client-side operation that writes `~/.docker/config.json`, so when the
+  agent runs in a container that file has to be mounted in as well:
+
+  ```yaml
+      volumes:
+        - ~/.docker/config.json:/root/.docker/config.json:ro   # registry auth
+  ```
+
+  Without it every pull of a private image fails with an authentication
+  error, and the deploy reports that nothing was changed.
+- The app's compose file must reference the variable, with no fallback you
+  would not want deployed:
+
+  ```yaml
+  services:
+    app:
+      image: ${APP_IMAGE}
+  ```
+
+Rollback re-points that variable at the value that was in `.env` before, so
+the first registry deploy of an app has nothing to roll back to and says so.
+Set `APP_IMAGE` to the currently deployed tag before the first deploy if you
+want that safety net from the start.
 
 ## Updating server-tools itself
 
@@ -195,3 +229,8 @@ State lives in the `server-tools-data` volume and survives rebuilds.
 | Login link says expired | Links are single-use, 15 min; generate a fresh one |
 | No alert emails | Check `alerts.smtp` host/port; port 465 = implicit TLS, 587 = STARTTLS; watch agent logs for `alert channel failed` |
 | Deploy says "working tree has local changes" | The app checkout is dirty; commit/stash on the box or clean it, then retry |
+| Registry deploy says "named no image before this deploy" | `.env` had no value for the image variable, so there is nothing to roll back to; set it to the running tag and redeploy |
+| Deploy says "could not verify services" but reports OK | Docker could not answer the read-only check, so the health gate decided instead. The release is probably fine; confirm with `docker compose -p <project> ps` |
+| Registry deploy says "services are not running <ref>" | The new image started and died, or a service was left on the old image; `docker compose -p <project> logs <service>` shows why. The stack has already been rolled back |
+| `files` backup says `no volume named "x" on this box`, `volume "x" exists but no container mounts it`, or `container "x" not found on this box` | The source cannot be resolved, so the run fails rather than backing up whatever else it can find. Fix the name; do not work around it |
+| `files` backup says "holds no files" | The source resolved but is empty, which an unmounted bind mount looks exactly like. Check the mount before setting `allowEmpty` |

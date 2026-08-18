@@ -78,9 +78,66 @@ The drill restores into a throwaway database (`st_drill_<timestamp>`) on the
 same container, reports table and row counts, then drops it. Run it monthly
 and after changing anything about backups. The result shows on the dashboard.
 
+### Scenario 4: restore media
+
+```bash
+server-tools drill app-media             # prove the archive first
+server-tools artifacts app-media         # find the archive to restore
+```
+
+A `files` drill reads the archive back and checks every file against the
+manifest that run wrote, so it proves the copy is intact without writing
+anything. To restore for real, decrypt the archive and unpack it where the
+media belongs:
+
+```bash
+server-tools export app-media                       # newest artifact
+server-tools export app-media <artifact> --to /tmp/media.tar.gz
+```
+
+`export` writes a decrypted `.tar.gz`, prints the path, refuses to overwrite
+an existing file, and prints the exact `tar` flags for that archive. Use
+those flags: an archive read out of a volume or container is rooted at the
+name of the directory that was copied, so unpacking it without
+`--strip-components=1` puts every file one level too deep. That looks like it
+worked and 404s every image, which is the failure this whole feature exists
+to prevent.
+
+`export` streams, so artifact size is not a limit - unless the artifact
+exists only offsite (a rebuilt box), where it is fetched whole into memory
+first. For a very large media archive in that situation, pull it from the
+bucket with your provider's own tool instead.
+
+Unpack into the volume through a container rather than writing to the
+volume's host path:
+
+```bash
+# volume or container source (archive rooted at the directory name)
+docker run --rm -i -v myapp_media:/restore alpine \
+  tar -xz --strip-components=1 -C /restore < /tmp/media.tar.gz
+
+# path source (already relative)
+docker run --rm -i -v myapp_media:/restore alpine \
+  tar -xz -C /restore < /tmp/media.tar.gz
+```
+
+Delete the decrypted copy when you are done; with no `--to` it lands in the
+data directory's temp folder, which housekeeping only clears on its own
+schedule (`tmpAge`, 2 days by default). A target marked `external` has
+nothing to restore from here; recover it from the provider.
+
+**Restore the database and the media together.** A database restored on its
+own comes up, renders every page, and 404s every image, which is the failure
+mode that looks like success.
+
 ## Backups stopped / backup-freshness is red
 
-1. `server-tools status` - read the last error recorded for the target.
+1. `server-tools status` - read the last error recorded for the target. It
+   also lists any target declared `external` and warns when databases are
+   backed up but no media target of either kind is configured.
+   The artifact directory carries the same news: a run that failed leaves a
+   `<name>-<stamp>.failed.json` beside the artifacts, and an archive with no
+   matching `.manifest.json` is a run that never finished.
 2. Common causes: database container renamed (fix config), disk full
    (`server-tools check disk-root`), S3 credentials rotated (update `.env`,
    `docker compose up -d` to reload), passphrase env var missing after an
@@ -145,7 +202,7 @@ The actions are deliberately conservative - none delete application data:
 | `reclaim-docker-space` | Removes unused Docker images + build cache | disk incidents |
 | `reclaim-build-cache`, `reclaim-dangling-images`, `remove-unused-images`, `remove-stopped-containers`, `trim-history` | Targeted disk reclamation, each previewed before it runs | the Storage page (see "Disk is filling up") |
 | `run-backup` | Runs a configured backup target now | backup-freshness incidents, and the Backups page |
-| `run-drill` | Restores the latest backup into a temporary database to prove it works, then removes it | the Backups page (database targets) |
+| `run-drill` | Proves a backup: a database target is restored into a temporary database and dropped again; a files target has its archive read back and checked against the manifest | the Backups page |
 
 The **Backups page** also carries "Back up now" and "Test restore" buttons for
 every target, so a routine backup or a restore drill is one click instead of a

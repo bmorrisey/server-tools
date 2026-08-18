@@ -3,7 +3,15 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { buildManifest, verifyManifest } from "../src/backup/backup.js";
+import {
+  buildManifest,
+  describeSource,
+  fileSource,
+  planPrune,
+  runIsRestorable,
+  shouldArchive,
+  verifyManifest,
+} from "../src/backup/backup.js";
 import { cleanDir } from "../src/housekeep.js";
 
 function fixtureTree() {
@@ -71,4 +79,122 @@ test("cleanDir removes only files older than maxAge and respects dryRun", async 
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("fileSource states where media lives and refuses to guess", () => {
+  assert.deepEqual(fileSource({ name: "m", path: "/srv/media" }), { kind: "path", path: "/srv/media" });
+  assert.deepEqual(fileSource({ name: "m", source: { path: "/srv/media" } }), { kind: "path", path: "/srv/media" });
+  assert.deepEqual(fileSource({ name: "m", source: { volume: "app_media" } }), {
+    kind: "volume",
+    volume: "app_media",
+    path: null,
+  });
+  assert.deepEqual(fileSource({ name: "m", source: { container: "app-1", path: "/app/storage" } }), {
+    kind: "container",
+    container: "app-1",
+    path: "/app/storage",
+  });
+  assert.throws(() => fileSource({ name: "m" }), /no source configured/);
+  assert.throws(() => fileSource({ name: "m", source: {} }), /must name a volume/);
+  assert.throws(() => fileSource({ name: "m", source: { container: "app-1" } }), /needs source.path/);
+});
+
+test("shouldArchive keeps the old manifest-only default only for the old path form", () => {
+  assert.equal(shouldArchive({ path: "/srv/media" }), false);
+  assert.equal(shouldArchive({ source: { volume: "v" } }), true);
+  assert.equal(shouldArchive({ source: { volume: "v" }, archive: false }), false);
+  assert.equal(shouldArchive({ path: "/srv/media", archive: true }), true);
+});
+
+test("describeSource names a source the way an operator would", () => {
+  assert.equal(describeSource({ kind: "volume", volume: "app_media" }), "volume app_media");
+  assert.equal(describeSource({ kind: "volume", volume: "app_media", path: "/data/x" }), "volume app_media:/data/x");
+  assert.equal(describeSource({ kind: "container", container: "app-1", path: "/app/storage" }), "container app-1:/app/storage");
+  assert.equal(describeSource({ kind: "path", path: "/srv/media" }), "/srv/media");
+});
+
+const RETENTION = { daily: 1, weekly: 0, monthly: 0 };
+
+const FILES = { type: "files" };
+
+test("planPrune keeps a run whole and never counts a partial write as one", () => {
+  const names = [
+    "m-20260101-030000.tar.gz.enc",
+    "m-20260101-030000.manifest.json",
+    "m-20260102-030000.tar.gz.enc",
+    "m-20260102-030000.manifest.json",
+    "m-20260103-030000.tar.gz.enc.part",
+  ];
+  const plan = planPrune(names, RETENTION, FILES);
+  assert.deepEqual(plan.partials, ["m-20260103-030000.tar.gz.enc.part"]);
+  assert.equal(plan.droppedRuns, 1);
+  assert.deepEqual(plan.drop.sort(), ["m-20260101-030000.manifest.json", "m-20260101-030000.tar.gz.enc"]);
+});
+
+test("planPrune keeps manifest-only runs instead of deleting them all", () => {
+  const names = ["m-20260101-030000.manifest.json", "m-20260102-030000.manifest.json"];
+  const plan = planPrune(names, RETENTION, FILES);
+  assert.deepEqual(plan.drop, ["m-20260101-030000.manifest.json"]);
+  assert.equal(plan.keep.has("20260102-030000"), true);
+});
+
+test("an archive with no manifest never evicts a run that can actually be restored", () => {
+  // Two runs that died after renaming the tar into place, and one complete
+  // run older than both. Counting the wreckage as backups would spend the
+  // whole retention budget on runs nothing can be restored from.
+  const names = [
+    "m-20260310-030000.tar.gz.enc",
+    "m-20260310-030000.manifest.json",
+    "m-20260311-030000.tar.gz.enc",
+    "m-20260312-030000.tar.gz.enc",
+  ];
+  const plan = planPrune(names, { daily: 2, weekly: 0, monthly: 0 }, FILES);
+  assert.equal(plan.drop.includes("m-20260310-030000.tar.gz.enc"), false);
+  assert.equal(plan.drop.includes("m-20260310-030000.manifest.json"), false);
+  assert.equal(plan.keep.has("20260310-030000"), true);
+});
+
+test("a postgres run needs its dump, a files run needs its manifest", () => {
+  assert.equal(runIsRestorable(["m-20260101-030000.sql.gz.enc"], "postgres"), true);
+  assert.equal(runIsRestorable(["m-20260101-030000.failed.json"], "postgres"), false);
+  assert.equal(runIsRestorable(["m-20260101-030000.tar.gz"], "files"), false);
+  assert.equal(runIsRestorable(["m-20260101-030000.tar.gz", "m-20260101-030000.manifest.json"], "files"), true);
+  // A marker beside a complete set means the run failed after writing it
+  // (an upload, say); the artifact on disk is still restorable.
+  assert.equal(
+    runIsRestorable(["m-1.sql.gz", "m-20260101-030000.failed.json"].map((f) => f), "postgres"),
+    true,
+  );
+});
+
+test("planPrune keeps recent failure markers and drops ones older than everything retained", () => {
+  const names = [
+    "m-20250101-030000.failed.json", // older than anything kept
+    "m-20260102-030000.tar.gz",
+    "m-20260103-040000.failed.json", // newer than the kept run
+  ];
+  const plan = planPrune(names, RETENTION);
+  assert.deepEqual(plan.drop, ["m-20250101-030000.failed.json"]);
+});
+
+test("failure markers are capped so a target that never succeeds cannot fill the disk", () => {
+  const names = Array.from({ length: 25 }, (_, i) => `m-202601${String(i + 1).padStart(2, "0")}-030000.failed.json`);
+  const plan = planPrune(names, RETENTION);
+  assert.equal(plan.drop.length, 15);
+  assert.equal(names.length - plan.drop.length, 10);
+  // The ones kept are the newest.
+  assert.equal(plan.drop.includes("m-20260125-030000.failed.json"), false);
+  assert.equal(plan.drop.includes("m-20260101-030000.failed.json"), true);
+});
+
+test("planPrune leaves a handful of failures alone when nothing has ever succeeded", () => {
+  const names = ["m-20260101-030000.failed.json", "m-20260102-030000.failed.json"];
+  assert.deepEqual(planPrune(names, RETENTION).drop, []);
+});
+
+test("verifyManifest refuses a manifest with no filesystem root", async () => {
+  await assert.rejects(
+    () => verifyManifest({ root: null, files: [], source: { kind: "volume", volume: "v" } }),
+    /no filesystem root/,
+  );
 });

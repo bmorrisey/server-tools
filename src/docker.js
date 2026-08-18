@@ -175,6 +175,59 @@ export class Docker {
     return hit ? this.inspect(hit.Id) : null;
   }
 
+  /** Details of a named volume, including its host Mountpoint. */
+  inspectVolume(name) {
+    return this.request("GET", `/volumes/${encodeURIComponent(name)}`);
+  }
+
+  /**
+   * Find a container that mounts `volumeName`, so its data can be read
+   * through that container's filesystem. Stopped containers count: a stack
+   * being down is exactly when someone reaches for a backup.
+   */
+  async findVolumeMount(volumeName) {
+    return pickVolumeMount(await this.listContainers(), volumeName);
+  }
+
+  /**
+   * Stream a tar archive of `containerPath` out of a container. This is the
+   * Engine's own copy endpoint, so it works on stopped containers and reads
+   * through volume mounts without needing anything installed in the image.
+   *
+   * Resolves with the response stream; the caller consumes it.
+   */
+  archive(nameOrId, containerPath, { timeoutMs = 60 * 60_000 } = {}) {
+    return new Promise((resolve, reject) => {
+      const query = new URLSearchParams({ path: containerPath });
+      const req = http.request(
+        {
+          socketPath: this.socketPath,
+          method: "GET",
+          path: `/containers/${encodeURIComponent(nameOrId)}/archive?${query}`,
+        },
+        (res) => {
+          if (res.statusCode !== 200) {
+            const chunks = [];
+            res.on("error", reject);
+            res.on("data", (c) => chunks.push(c));
+            res.on("end", () =>
+              reject(
+                new Error(
+                  `docker archive ${nameOrId}:${containerPath} -> ${res.statusCode}: ${Buffer.concat(chunks).toString("utf8").slice(0, 300)}`,
+                ),
+              ),
+            );
+            return;
+          }
+          resolve(res);
+        },
+      );
+      req.setTimeout(timeoutMs, () => req.destroy(new Error("docker archive timed out")));
+      req.on("error", reject);
+      req.end();
+    });
+  }
+
   /**
    * Run a command inside a container. Returns { exitCode, stdout, stderr }.
    *
@@ -251,6 +304,28 @@ export class Docker {
     const info = await this.request("GET", `/exec/${create.Id}/json`);
     return { exitCode: info.ExitCode ?? -1, stdout, stderr };
   }
+}
+
+/**
+ * Pick a container that mounts `volumeName`, preferring a running one so the
+ * archive read goes through a filesystem that is already mounted. Returns
+ * { id, name, destination } or null when nothing on the box mounts it.
+ */
+export function pickVolumeMount(containers, volumeName) {
+  const candidates = [];
+  for (const c of containers ?? []) {
+    const mount = (c.Mounts ?? []).find((m) => m.Type === "volume" && m.Name === volumeName && m.Destination);
+    if (!mount) continue;
+    candidates.push({
+      id: c.Id,
+      name: c.Names?.[0]?.replace(/^\//, "") ?? c.Id,
+      destination: mount.Destination,
+      running: c.State === "running",
+    });
+  }
+  if (!candidates.length) return null;
+  const chosen = candidates.find((c) => c.running) ?? candidates[0];
+  return { id: chosen.id, name: chosen.name, destination: chosen.destination };
 }
 
 /**

@@ -26,6 +26,7 @@ import * as auth from "./auth.js";
 import * as metrics from "../metrics.js";
 import * as storage from "../storage.js";
 import { sendMail } from "../smtp.js";
+import { coverageNotes } from "../config.js";
 import { diagnose, gatherContext, runAction, ACTION_IDS } from "../remediate.js";
 import { logger } from "../log.js";
 
@@ -252,7 +253,24 @@ export function startWebServer({ config, store, docker, alerter }) {
 
     if (path === "/") {
       const [host, sparks, incidents] = [await collectHost(config), hostSparks(store), await computeIncidents(config, checks, docker, { overviewOnly: true })];
-      return send(res, 200, ui.overviewPage({ session, host, checks, backups, deploys, events, sparks, incidents, flash, csrf: session.csrf }));
+      return send(
+        res,
+        200,
+        ui.overviewPage({
+          session,
+          host,
+          checks,
+          backups,
+          backupTargets: config.backups,
+          deploys,
+          events,
+          sparks,
+          incidents,
+          notes: coverageNotes(config),
+          flash,
+          csrf: session.csrf,
+        }),
+      );
     }
     if (path === "/checks") {
       return send(res, 200, ui.checksPage({ session, checks, historyByName: checkHistory(store), flash }));
@@ -281,7 +299,11 @@ export function startWebServer({ config, store, docker, alerter }) {
       return send(res, 200, ui.storagePage({ session, report, flash, csrf: session.csrf }));
     }
     if (path === "/backups") {
-      return send(res, 200, ui.backupsPage({ session, backups, targets: config.backups, flash, csrf: session.csrf }));
+      return send(
+        res,
+        200,
+        ui.backupsPage({ session, backups, targets: config.backups, notes: coverageNotes(config), flash, csrf: session.csrf }),
+      );
     }
     if (path === "/deploys") {
       return send(res, 200, ui.deploysPage({ session, deploys, targets: config.deploys, events, flash }));
@@ -303,6 +325,10 @@ export function startWebServer({ config, store, docker, alerter }) {
         },
         checks,
         backups,
+        externalTargets: (config.backups ?? [])
+          .filter((b) => b.type === "external")
+          .map((b) => ({ name: b.name, note: b.note })),
+        coverageNotes: coverageNotes(config),
         deploys,
         dockerReachable: await docker.ping(),
       });

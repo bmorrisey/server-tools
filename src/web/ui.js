@@ -102,6 +102,7 @@ a.card .label .go { color: var(--series); font-weight: 600; }
 .status.ok   { color: var(--good); background: var(--good-bg); }
 .status.warn { color: var(--warn); background: var(--warn-bg); }
 .status.fail { color: var(--crit); background: var(--crit-bg); }
+.status.external { color: var(--ink-2); background: var(--grid); }
 table { width: 100%; border-collapse: collapse; background: var(--surface);
   border: 1px solid var(--border); border-radius: 12px; overflow: hidden; }
 th, td { text-align: left; padding: 9px 14px; font-size: 14px; border-top: 1px solid var(--grid); }
@@ -129,6 +130,7 @@ button[disabled] { opacity: 0.55; cursor: progress; }
 .banner { margin: 0 0 18px; padding: 11px 16px; border-radius: 10px; font-size: 14px; border: 1px solid var(--border); }
 .banner.ok { background: var(--good-bg); color: var(--good); border-color: transparent; }
 .banner.err { background: var(--crit-bg); color: var(--crit); border-color: transparent; }
+.banner.warn { background: var(--warn-bg); color: var(--warn); border-color: transparent; }
 .incident { background: var(--surface); border: 1px solid var(--border); border-left: 3px solid var(--crit);
   border-radius: 12px; padding: 16px 18px; margin: 0 0 14px; }
 .incident.warn { border-left-color: #fab219; }
@@ -403,7 +405,7 @@ export function statCard({ label, value, detail = "", extra = "", href = "" }) {
     : `<div class="card">${inner}</div>`;
 }
 
-export function overviewPage({ session, host, checks, backups, deploys, events, sparks, incidents = [], flash, csrf }) {
+export function overviewPage({ session, host, checks, backups, backupTargets = [], deploys, events, sparks, incidents = [], notes = [], flash, csrf }) {
   const counts = { ok: 0, warn: 0, fail: 0 };
   for (const c of Object.values(checks)) counts[c.status] = (counts[c.status] ?? 0) + 1;
   const headline =
@@ -452,17 +454,32 @@ export function overviewPage({ session, host, checks, backups, deploys, events, 
     )
     .join("");
 
-  const backupCards = Object.entries(backups)
-    .map(([name, b]) => {
-      const ok = b.lastResult === "ok";
-      const age = b.lastSuccess ? formatDuration(Date.now() - Date.parse(b.lastSuccess)) + " ago" : "never";
-      return statCard({
-        label: `Backup: ${esc(name)}`,
-        value: statusPill(ok ? "ok" : "fail"),
-        detail: `last success ${esc(age)}${b.lastSizeBytes ? ` - ${formatBytes(b.lastSizeBytes)}` : ""}${b.offsite ? " - offsite" : ""}<br>${esc(b.lastDetail ?? "")}${b.lastDrill ? `<br>drill ${esc(b.lastDrillResult)}: ${esc((b.lastDrillDetail ?? "").slice(0, 120))}` : ""}`,
-      });
-    })
-    .join("\n");
+  // External targets have no state to report, and that is the report: they
+  // are listed so the page never implies a deployment is fully covered when
+  // half of what a restore needs lives somewhere else.
+  const externalCards = backupTargets
+    .filter((t) => t.type === "external")
+    .map((t) =>
+      statCard({
+        label: `Backup: ${esc(t.name)}`,
+        value: '<span class="status external">external</span>',
+        detail: `outside this toolkit<br>${esc(t.note ?? "")}`,
+      }),
+    );
+  const backupCards = [
+    ...Object.entries(backups)
+      .filter(([name]) => !backupTargets.some((t) => t.name === name && t.type === "external"))
+      .map(([name, b]) => {
+        const ok = b.lastResult === "ok";
+        const age = b.lastSuccess ? formatDuration(Date.now() - Date.parse(b.lastSuccess)) + " ago" : "never";
+        return statCard({
+          label: `Backup: ${esc(name)}`,
+          value: statusPill(ok ? "ok" : "fail"),
+          detail: `last success ${esc(age)}${b.lastSizeBytes ? ` - ${formatBytes(b.lastSizeBytes)}` : ""}${b.offsite ? " - offsite" : ""}<br>${esc(b.lastDetail ?? "")}${b.lastDrill ? `<br>drill ${esc(b.lastDrillResult)}: ${esc((b.lastDrillDetail ?? "").slice(0, 120))}` : ""}`,
+        });
+      }),
+    ...externalCards,
+  ].join("\n");
 
   const eventItems = events
     .slice(-10)
@@ -490,6 +507,7 @@ ${attention}
 <div class="grid">${hostCards}</div>
 
 <h2 style="margin-top:24px">Backups</h2>
+${coverageBanners(notes)}
 <div class="grid wide">${backupCards || '<p class="sub">No backup targets configured.</p>'}</div>
 
 <h2 style="margin-top:24px">Checks</h2>
@@ -548,11 +566,31 @@ ${values.filter((v) => v !== null).length > 1 ? sparkline(values, { width: 640, 
   return layout({ title: name, page: "/checks", session, body, flash });
 }
 
-export function backupsPage({ session, backups, targets, flash, csrf }) {
+/**
+ * A target this toolkit does not copy. It gets a row of its own rather than
+ * being left out, because a deployment whose media lives in a bucket is a
+ * different recovery shape from one whose media is backed up here, and the
+ * only wrong answer is showing nothing at all.
+ */
+function externalRow(t) {
+  return `<tr>
+<td><span class="status external">external</span></td>
+<td>${esc(t.name)}<br><span class="detail">outside this toolkit</span></td>
+<td colspan="4"><span class="detail">${esc(t.note ?? "")}</span></td>
+<td><span class="detail">nothing to run</span></td>
+</tr>`;
+}
+
+export function backupsPage({ session, backups, targets, notes = [], flash, csrf }) {
   const rows = targets
     .map((t) => {
+      if (t.type === "external") return externalRow(t);
       const b = backups[t.name] ?? {};
       const ok = b.lastResult === "ok";
+      const drillConfirm =
+        t.type === "postgres"
+          ? `Run a restore drill for "${t.name}"? It restores the latest backup into a temporary database to prove it works, then removes it. This can take a moment.`
+          : `Run a restore drill for "${t.name}"? It reads the latest archive back and checks every file against the manifest. This can take a moment.`;
       const buttons = [
         actionForm({
           id: "run-backup",
@@ -565,23 +603,21 @@ export function backupsPage({ session, backups, targets, flash, csrf }) {
           small: true,
           working: `Backing up "${t.name}". A large database can take several minutes. You can leave this page; the result is recorded under Events.`,
         }),
-        t.type === "postgres"
-          ? actionForm({
-              id: "run-drill",
-              label: "Test restore",
-              kind: "caution",
-              confirm: `Run a restore drill for "${t.name}"? It restores the latest backup into a temporary database to prove it works, then removes it. This can take a moment.`,
-              params: { target: t.name },
-              csrf,
-              returnPath: "/backups",
-              small: true,
-              working: `Running a restore drill for "${t.name}". This restores a full copy, so it can take several minutes. You can leave this page; the result is recorded under Events.`,
-            })
-          : "",
+        actionForm({
+          id: "run-drill",
+          label: "Test restore",
+          kind: "caution",
+          confirm: drillConfirm,
+          params: { target: t.name },
+          csrf,
+          returnPath: "/backups",
+          small: true,
+          working: `Running a restore drill for "${t.name}". This reads a full copy back, so it can take several minutes. You can leave this page; the result is recorded under Events.`,
+        }),
       ].join("");
       return `<tr>
 <td>${b.lastResult ? statusPill(ok ? "ok" : "fail") : '<span class="detail">never run</span>'}</td>
-<td>${esc(t.name)}<br><span class="detail">${esc(t.type)}${t.schedule ? ` - ${esc(t.schedule)}` : " - manual"}</span></td>
+<td>${esc(t.name)}<br><span class="detail">${esc(describeTarget(t))}${t.schedule ? ` - ${esc(t.schedule)}` : " - manual"}</span></td>
 <td class="num">${b.lastSuccess ? esc(formatDuration(Date.now() - Date.parse(b.lastSuccess))) + " ago" : "-"}</td>
 <td class="num">${b.lastSizeBytes ? formatBytes(b.lastSizeBytes) : "-"}</td>
 <td>${b.offsite ? "yes" : "-"}</td>
@@ -591,12 +627,34 @@ export function backupsPage({ session, backups, targets, flash, csrf }) {
     })
     .join("");
   const body = `<h1>Backups</h1>
-<p class="sub">Back up any target now, or run a restore drill to prove a database backup actually restores - no terminal needed. Encrypted artifacts are kept locally and, when configured, uploaded offsite.</p>
+<p class="sub">Back up any target now, or run a restore drill to prove a backup actually restores - no terminal needed. Encrypted artifacts are kept locally and, when configured, uploaded offsite.</p>
+${coverageBanners(notes)}
 <table>
 <thead><tr><th>Status</th><th>Target</th><th>Last success</th><th>Size</th><th>Offsite</th><th>Restore drill</th><th>Actions</th></tr></thead>
 <tbody>${rows || '<tr><td colspan="7" class="detail">No backup targets configured.</td></tr>'}</tbody>
 </table>`;
   return layout({ title: "Backups", page: "/backups", session, body, flash });
+}
+
+/** What a target covers, in the operator's terms rather than the schema's. */
+function describeTarget(t) {
+  if (t.type !== "files") return t.type;
+  const s = t.source ?? {};
+  if (s.volume) return `files - volume ${s.volume}`;
+  if (s.container) return `files - ${s.container}:${s.path}`;
+  return `files - ${s.path ?? t.path ?? "?"}`;
+}
+
+/**
+ * Coverage gaps, stated once where the operator is already looking at
+ * backups. This is deliberately not a check: only the operator knows whether
+ * a deployment with no media target is fine or half-covered, and the point is
+ * to ask rather than to quietly show green.
+ */
+export function coverageBanners(notes = []) {
+  return notes
+    .map((n) => `<div class="banner warn">&#9888; <strong>${esc(n.title)}</strong><br>${esc(n.detail)}</div>`)
+    .join("");
 }
 
 /** Wrap a long table in a collapsed disclosure once it stops being scannable. */
@@ -842,13 +900,26 @@ ${logsPanel}`;
   return layout({ title: "Storage", page: "/storage", session, body, flash });
 }
 
+/**
+ * A deploy can also land as "succeeded, but something could not be proven".
+ * Rendering that as a red failure contradicts the CLI (which exits 0) and the
+ * events feed beside it, so the pill has to carry the same three states the
+ * recorder writes.
+ */
+function deployPill(kind) {
+  return statusPill(kind === "ok" ? "ok" : kind === "warn" ? "warn" : "fail");
+}
+
 export function deploysPage({ session, deploys, targets, events, flash }) {
   const rows = targets
     .map((t) => {
       const d = deploys[t.name];
+      const registry = t.source === "registry";
+      const source = registry ? `registry - ${esc(t.image)}` : "git - builds on this box";
       return `<tr>
-<td>${d ? statusPill(d.kind === "ok" ? "ok" : "fail") : '<span class="detail">no deploys recorded</span>'}</td>
-<td>${esc(t.name)}<br><span class="detail">${esc(t.dir)}</span></td>
+<td>${d ? deployPill(d.kind) : '<span class="detail">no deploys recorded</span>'}</td>
+<td>${esc(t.name)}<br><span class="detail">${esc(t.dir)}${t.project ? ` - project ${esc(t.project)}` : ""}</span></td>
+<td><span class="detail">${source}</span></td>
 <td class="num">${d ? esc((d.at ?? "").replace("T", " ").replace("Z", "")) : "-"}</td>
 <td>${d ? `${esc(d.from)} &rarr; ${esc(d.to)}` : "-"}</td>
 <td><span class="detail">${d ? esc((d.detail ?? "").slice(0, 140)) : ""}</span></td>
@@ -861,14 +932,14 @@ export function deploysPage({ session, deploys, targets, events, flash }) {
     .reverse()
     .map(
       (e) =>
-        `<li><time>${esc((e.ts ?? "").replace("T", " ").replace("Z", ""))}</time>${statusPill(e.kind === "ok" ? "ok" : "fail")} ${esc(e.name ?? "")}: ${esc((e.detail ?? "").slice(0, 160))}</li>`,
+        `<li><time>${esc((e.ts ?? "").replace("T", " ").replace("Z", ""))}</time>${deployPill(e.kind)} ${esc(e.name ?? "")}: ${esc((e.detail ?? "").slice(0, 160))}</li>`,
     )
     .join("");
   const body = `<h1>Deploys</h1>
-<p class="sub">Deploy from the box: <code>server-tools deploy &lt;target&gt; &lt;tag&gt;</code>. Failed health checks roll back automatically.</p>
+<p class="sub">Deploy from the box: <code>server-tools deploy &lt;target&gt; &lt;tag&gt;</code>. Registry targets pull a prebuilt image and prove the named services are running it; git targets build here. Either way, a failed health check rolls back automatically.</p>
 <table>
-<thead><tr><th>Last result</th><th>Target</th><th>When</th><th>Refs</th><th>Detail</th></tr></thead>
-<tbody>${rows || '<tr><td colspan="5" class="detail">No deploy targets configured.</td></tr>'}</tbody>
+<thead><tr><th>Last result</th><th>Target</th><th>Source</th><th>When</th><th>Refs</th><th>Detail</th></tr></thead>
+<tbody>${rows || '<tr><td colspan="6" class="detail">No deploy targets configured.</td></tr>'}</tbody>
 </table>
 <h2 style="margin-top:24px">History</h2>
 <ul class="events">${history || '<li class="sub">No deploy events recorded.</li>'}</ul>`;
