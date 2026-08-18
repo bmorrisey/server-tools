@@ -255,3 +255,23 @@ test("a corrupt size field is refused rather than trusted", () => {
   const scanner = new TarScanner();
   assert.throws(() => scanner.update(header), /invalid size/);
 });
+
+test("a size too large for an octal field is read from the base-256 encoding", async () => {
+  // Files at or above 8 GiB cannot be expressed in the 12-byte octal field,
+  // so tar switches encoding. Media archives are where that shows up.
+  const size = 9_000_000_000;
+  const header = tarHeader({ name: "big.bin", size: 0 });
+  const field = Buffer.alloc(12);
+  field[0] = 0x80;
+  field.writeBigUInt64BE(BigInt(size), 4);
+  field.copy(header, 124);
+  header.write("        ", 148, 8, "latin1");
+  let sum = 0;
+  for (let i = 0; i < 512; i++) sum += header[i];
+  header.write(`${sum.toString(8).padStart(6, "0")}\0 `, 148, 8, "latin1");
+
+  const scanner = new TarScanner();
+  scanner.update(header);
+  // Streaming 9 GB is not the point; that the size was decoded is.
+  assert.equal(scanner.dataLeft, size);
+});

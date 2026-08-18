@@ -773,3 +773,24 @@ test("registry mode looks again after health too", async () => {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("an annotated .env line still yields a usable rollback target", async () => {
+  // An operator pinning a tag during an incident writes a comment next to it.
+  // Reading the comment as part of the reference makes safeRef reject it, and
+  // a routine automatic rollback becomes a manual one.
+  assert.equal(readEnvVar("APP_IMAGE=ghcr.io/o/app:v1 # pinned for the incident\n", "APP_IMAGE"), "ghcr.io/o/app:v1");
+  assert.equal(readEnvVar('APP_IMAGE="ghcr.io/o/app:v1" # pinned\n', "APP_IMAGE"), "ghcr.io/o/app:v1");
+
+  const dir = scratch("DB_PASSWORD=hunter2\nAPP_IMAGE=ghcr.io/o/app:v1  # pinned for the incident\n");
+  const before = fs.readFileSync(path.join(dir, ".env"), "utf8");
+  try {
+    const docker = fakeDocker();
+    const result = await deploy(registryTarget(dir), "v2", { store: null, exec: docker.exec, health: unhealthy });
+    assert.equal(result.rolledBack, true);
+    assert.doesNotMatch(result.detail, /unsafe docker reference/);
+    assert.ok(docker.calls.some((c) => c === "docker pull ghcr.io/o/app:v1"));
+    assert.equal(fs.readFileSync(path.join(dir, ".env"), "utf8"), before);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

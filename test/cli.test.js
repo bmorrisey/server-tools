@@ -71,3 +71,29 @@ test("an option that needs a value says so instead of swallowing the next flag",
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("export prints the strip flag that matches the archive's shape", () => {
+  // The two source kinds root their archives differently. Printing the wrong
+  // flag puts every restored file one directory too deep, which looks like it
+  // worked and 404s every image.
+  const { dir, file, dataDir } = withConfig([{ name: "media", type: "files", path: path.join(os.tmpdir(), "unused"), encrypt: false }]);
+  try {
+    const backups = path.join(dataDir, "backups", "media");
+    fs.mkdirSync(backups, { recursive: true });
+    const stamp = "20260101-030000";
+    fs.writeFileSync(path.join(backups, `media-${stamp}.tar.gz`), "not really gzip");
+
+    // A manifest with a filesystem root came from `tar -C dir .`: already relative.
+    fs.writeFileSync(path.join(backups, `media-${stamp}.manifest.json`), JSON.stringify({ root: "/srv/media", files: [] }));
+    let out = run(file, ["export", "media", `media-${stamp}.tar.gz`, "--to", path.join(dir, "a.tar.gz")]).out;
+    assert.match(out, /unpack with: tar -xz -C/);
+    assert.doesNotMatch(out, /strip-components/);
+
+    // One taken through the Docker socket is rooted at the copied directory.
+    fs.writeFileSync(path.join(backups, `media-${stamp}.manifest.json`), JSON.stringify({ root: null, files: [] }));
+    out = run(file, ["export", "media", `media-${stamp}.tar.gz`, "--to", path.join(dir, "b.tar.gz")]).out;
+    assert.match(out, /unpack with: tar -xz --strip-components=1 -C/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
