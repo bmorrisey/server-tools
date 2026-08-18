@@ -846,9 +846,12 @@ export function deploysPage({ session, deploys, targets, events, flash }) {
   const rows = targets
     .map((t) => {
       const d = deploys[t.name];
+      const registry = t.source === "registry";
+      const source = registry ? `registry - ${esc(t.image)}` : "git - builds on this box";
       return `<tr>
 <td>${d ? statusPill(d.kind === "ok" ? "ok" : "fail") : '<span class="detail">no deploys recorded</span>'}</td>
-<td>${esc(t.name)}<br><span class="detail">${esc(t.dir)}</span></td>
+<td>${esc(t.name)}<br><span class="detail">${esc(t.dir)}${t.project ? ` - project ${esc(t.project)}` : ""}</span></td>
+<td><span class="detail">${source}</span></td>
 <td class="num">${d ? esc((d.at ?? "").replace("T", " ").replace("Z", "")) : "-"}</td>
 <td>${d ? `${esc(d.from)} &rarr; ${esc(d.to)}` : "-"}</td>
 <td><span class="detail">${d ? esc((d.detail ?? "").slice(0, 140)) : ""}</span></td>
@@ -865,10 +868,10 @@ export function deploysPage({ session, deploys, targets, events, flash }) {
     )
     .join("");
   const body = `<h1>Deploys</h1>
-<p class="sub">Deploy from the box: <code>server-tools deploy &lt;target&gt; &lt;tag&gt;</code>. Failed health checks roll back automatically.</p>
+<p class="sub">Deploy from the box: <code>server-tools deploy &lt;target&gt; &lt;tag&gt;</code>. Registry targets pull a prebuilt image and prove the named services are running it; git targets build here. Either way, a failed health check rolls back automatically.</p>
 <table>
-<thead><tr><th>Last result</th><th>Target</th><th>When</th><th>Refs</th><th>Detail</th></tr></thead>
-<tbody>${rows || '<tr><td colspan="5" class="detail">No deploy targets configured.</td></tr>'}</tbody>
+<thead><tr><th>Last result</th><th>Target</th><th>Source</th><th>When</th><th>Refs</th><th>Detail</th></tr></thead>
+<tbody>${rows || '<tr><td colspan="6" class="detail">No deploy targets configured.</td></tr>'}</tbody>
 </table>
 <h2 style="margin-top:24px">History</h2>
 <ul class="events">${history || '<li class="sub">No deploy events recorded.</li>'}</ul>`;

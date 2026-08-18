@@ -18,7 +18,7 @@ agent trusts is Node itself.
 | Alerting | Email (built-in SMTP client) and/or webhook (generic JSON or Discord-style); alerts fire on state change with a consecutive-failure threshold, and again on recovery |
 | Backups | Scheduled `pg_dump` streamed through gzip + AES-256-GCM, kept locally and optionally uploaded to any S3-compatible bucket; grandfather-father-son retention; file-tree manifests with integrity verification for media directories |
 | Restore | One-command restore, plus a `drill` command that restores the latest artifact into a scratch database and validates it, so you find out your backups work before you need them |
-| Deploys | `server-tools deploy <app> <tag>`: fetch, checkout, rebuild, health-verify, and roll back automatically if the new version does not come up healthy |
+| Deploys | `server-tools deploy <app> <tag>`: pull a prebuilt image from a registry (nothing compiles on the box), re-point the stack, prove the named services are running that exact image, health-verify, and roll back to the previous tag automatically if it does not come up. Building from a git checkout on the box is still supported for single-app hosts |
 | Housekeeping | Prunes its own history, expires temp files, age-based cleanup of directories you configure |
 | Storage | A page that answers "what is eating my disk": images, container layers, volumes, build cache, and backups broken down by size and by Docker Compose project, plus previewed one-click cleanups. Volumes are reported but never deleted for you |
 | Incident cards | Every failing check becomes a plain-language card: what it means, the likely causes (with live detail like reclaimable disk space and recent container logs), and safe one-click fixes - restart a container, reclaim unused Docker space, run a backup now. No SSH, no jargon |
@@ -94,7 +94,7 @@ src/
   store.js        JSON state + JSONL history under dataDir (cat/jq friendly)
   backup/         pg_dump + files backup, encryption, S3 SigV4, retention,
                   restore, drill
-  deploy.js       tag checkout + compose build + health gate + auto-rollback
+  deploy.js       registry pull or tag checkout + health gate + auto-rollback
   housekeep.js    history/temp/directory cleanup
   storage.js      disk usage analysis + previewed, conservative reclamation
   remediate.js    plain-language incident diagnosis + one-click safe actions
@@ -106,14 +106,18 @@ src/
 The defaults model a conventional self-hosted web application; every
 assumption is configurable per target:
 
-- Each app runs under Docker Compose in a directory that is a git checkout;
-  deploying a release means checking out a tag and running
-  `docker compose up -d --build`.
+- Each app runs under Docker Compose in its own directory. Deploying a
+  release means pointing the stack at a new image tag and recreating it
+  (`"source": "registry"`), or, on a box that hosts nothing else, checking
+  out a tag and building there (`"source": "git"`).
 - Each app exposes an HTTP health endpoint that returns 2xx when healthy
   (JSON bodies can be asserted on, but a bare 200 is enough).
 - Databases are Postgres containers; backups run `pg_dump` inside the
   container via the Docker API, so nothing extra is installed on the host.
-- Media/uploads live in a directory (or volume mount) on the box.
+- Media/uploads live in a directory, a Docker volume, or a path inside a
+  container on the box - all three can be backed up. When they live in an
+  S3-compatible bucket instead, say so with an `external` backup target so
+  the dashboard reports the recovery you actually have.
 
 Applications that hold end-to-end-encrypted content stay encrypted: backups
 copy bytes as they are, and the dashboard only ever shows counts, sizes, and

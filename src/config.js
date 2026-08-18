@@ -99,6 +99,45 @@ export function validateConfig(cfg) {
     need(typeof d.name === "string" && d.name, `${where}.name is required`);
     need(typeof d.dir === "string" && d.dir, `${where}.dir is required (compose project directory)`);
     need(typeof d.healthUrl === "string" && d.healthUrl.startsWith("http"), `${where}.healthUrl must be an http(s) URL`);
+    const source = d.source ?? "git";
+    need(["git", "registry"].includes(source), `${where}.source must be "git" or "registry"`);
+    if (d.project !== undefined)
+      need(
+        typeof d.project === "string" && /^[a-z0-9][a-z0-9_-]*$/.test(d.project),
+        `${where}.project must be a compose project name (lowercase letters, digits, "-" or "_")`,
+      );
+    if (d.services !== undefined)
+      need(
+        Array.isArray(d.services) && d.services.length > 0 && d.services.every((s) => typeof s === "string" && s),
+        `${where}.services must be a non-empty array of compose service names`,
+      );
+    if (d.healthAttempts !== undefined)
+      need(Number.isInteger(d.healthAttempts) && d.healthAttempts > 0, `${where}.healthAttempts must be a positive integer`);
+    if (d.healthDelay !== undefined)
+      need(parseDuration(d.healthDelay) !== null, `${where}.healthDelay "${d.healthDelay}" is not a duration`);
+    if (source === "registry") {
+      // A bare "docker compose" on a box with several stacks acts on a project
+      // derived from the directory, so the project name is stated, not guessed.
+      need(typeof d.project === "string" && d.project, `${where}.project is required for registry deploys (the "docker compose -p" name)`);
+      need(typeof d.image === "string" && d.image, `${where}.image is required for registry deploys (repository without a tag)`);
+      if (typeof d.image === "string" && d.image)
+        need(
+          !d.image.split("/").pop().includes(":") && !d.image.includes("@"),
+          `${where}.image must not include a tag or digest; the tag is the deploy argument`,
+        );
+      need(
+        Array.isArray(d.services) && d.services.length > 0,
+        `${where}.services is required for registry deploys (the services that must end up running the new image)`,
+      );
+      if (d.imageEnvVar !== undefined)
+        need(
+          typeof d.imageEnvVar === "string" && /^[A-Za-z_][A-Za-z0-9_]*$/.test(d.imageEnvVar),
+          `${where}.imageEnvVar must be a valid environment variable name`,
+        );
+    } else {
+      need(d.image === undefined, `${where}.image only applies to registry deploys (set "source": "registry")`);
+      need(d.imageEnvVar === undefined, `${where}.imageEnvVar only applies to registry deploys (set "source": "registry")`);
+    }
   }
 
   const hk = cfg.housekeeping ?? {};

@@ -51,7 +51,22 @@
     {
       "name": "myapp",
       "dir": "/apps/myapp",
+      "project": "myapp",
+      "source": "registry",
+      "image": "ghcr.io/owner/myapp",
+      "imageEnvVar": "APP_IMAGE",
+      "services": ["app", "worker"],
       "healthUrl": "https://app.example.com/api/health",
+      "healthAttempts": 20,
+      "healthDelay": "6s"
+    },
+    {
+      "name": "marketing",
+      "dir": "/apps/marketing",
+      "project": "marketing",
+      "source": "git",
+      "services": ["web"],
+      "healthUrl": "https://www.example.com/",
       "healthAttempts": 20,
       "healthDelay": "6s"
     }

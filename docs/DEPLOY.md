@@ -80,8 +80,11 @@ the deploy helper should manage, keeping container path = config path:
       - /home/you/apps/myapp:/apps/myapp        # <- your app checkout
 ```
 
-Media directories for `files` backup targets need to be visible too (a
-read-only mount is enough for manifest/verify: add `:ro`).
+Media for `files` backup targets does not need a mount if it lives in a
+Docker volume or inside a container: name it with `"source": { "volume": ... }`
+or `{ "container": ..., "path": ... }` and the agent reads it through the
+Docker socket, stopped stacks included. A plain host directory does need a
+mount (read-only is enough: add `:ro`).
 
 The `/:/host:ro` mount also lets the Storage page report container log file
 sizes. Without it the page still works; it just cannot show how big the log
@@ -173,8 +176,30 @@ docker compose exec agent node src/cli.js deploy myapp v1.2.3 --dry-run
 docker compose exec agent node src/cli.js deploy myapp v1.2.3
 ```
 
-The deploy records an event either way; a failed health check rolls back to
-the previous ref automatically.
+The deploy records an event either way; a failed health check rolls back
+automatically.
+
+With `"source": "registry"` (recommended when the box hosts more than one
+stack) the tag is an image tag: the agent pulls it, writes the reference into
+the app's `.env`, recreates the stack without building, and confirms the
+listed services are running that exact image. Two prerequisites:
+
+- The box must already be logged in to the registry, as the user the agent
+  runs as: `docker login ghcr.io`. The toolkit never handles registry
+  credentials itself.
+- The app's compose file must reference the variable, with no fallback you
+  would not want deployed:
+
+  ```yaml
+  services:
+    app:
+      image: ${APP_IMAGE}
+  ```
+
+Rollback re-points that variable at the value that was in `.env` before, so
+the first registry deploy of an app has nothing to roll back to and says so.
+Set `APP_IMAGE` to the currently deployed tag before the first deploy if you
+want that safety net from the start.
 
 ## Updating server-tools itself
 
@@ -195,3 +220,6 @@ State lives in the `server-tools-data` volume and survives rebuilds.
 | Login link says expired | Links are single-use, 15 min; generate a fresh one |
 | No alert emails | Check `alerts.smtp` host/port; port 465 = implicit TLS, 587 = STARTTLS; watch agent logs for `alert channel failed` |
 | Deploy says "working tree has local changes" | The app checkout is dirty; commit/stash on the box or clean it, then retry |
+| Registry deploy says "no previous image recorded" | `.env` had no value for the image variable, so there is nothing to roll back to; set it to the running tag and redeploy |
+| Registry deploy says "services are not running <ref>" | The new image started and died, or a service was left on the old image; `docker compose -p <project> logs <service>` shows why. The stack has already been rolled back |
+| `files` backup says "cannot determine where <name> lives" | The volume or container named in `source` is not on this box, or nothing mounts that volume; fix the name rather than letting the target fall back to a partial backup |

@@ -189,18 +189,81 @@ schedule archives weekly.
 
 ## Deploys
 
+Common fields: `name`, `dir` (the compose project directory), `healthUrl`,
+`healthAttempts`, `healthDelay`, `project`, `source`, `services`.
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `source` | `"git"` | `"git"` builds on the box from a checkout; `"registry"` pulls an already-built image by tag. |
+| `project` | derived from `dir` | The `docker compose -p` project name. Required for `registry`; strongly recommended everywhere else (see below). |
+| `services` | none | Compose services that must end up running the new release. Required for `registry`. |
+| `healthAttempts` | `20` | How many times to poll `healthUrl`. |
+| `healthDelay` | `"6s"` | Wait between polls. |
+
+On a box that runs a single stack, `docker compose` in the project directory
+resolves to the project you meant. On a box with several, the project name is
+derived from the directory and only errors if ports happen to collide, so it
+is worth stating: set `project` to the name `docker compose ls` already shows
+for that stack.
+
+### `registry` source (recommended on a shared box)
+
 ```json
-{ "name": "myapp", "dir": "/apps/myapp",
+{ "name": "myapp", "dir": "/apps/myapp", "project": "myapp",
+  "source": "registry",
+  "image": "ghcr.io/owner/myapp",
+  "imageEnvVar": "APP_IMAGE",
+  "services": ["app", "worker"],
+  "healthUrl": "https://app.example.com/api/health" }
+```
+
+`server-tools deploy myapp v1.2.3` then: pulls `ghcr.io/owner/myapp:v1.2.3`
+(using whatever registry credentials the box is already logged in with),
+writes `APP_IMAGE=ghcr.io/owner/myapp:v1.2.3` into `<dir>/.env`, runs
+`docker compose -p myapp up -d --no-build`, confirms every container of every
+listed service is `running` **and** on the image ID that was just pulled,
+then polls `healthUrl`. On any failure it re-points `APP_IMAGE` at the value
+that was in `.env` before, brings the stack back on that image, and reports
+the rollback.
+
+Nothing compiles on the host, so a release cannot starve the other stacks
+sharing the box, and a rollback costs a pull rather than a second build. Two
+consequences worth knowing:
+
+- `image` must not carry a tag or digest; the tag is the deploy argument.
+- The reference is **written to `.env`** rather than exported for one
+  command. Compose stores no such state, so a later plain
+  `docker compose up -d` would otherwise re-resolve `${APP_IMAGE:-...}` and
+  quietly recreate the stack on the default tag. Reference it from your
+  compose file as `image: ${APP_IMAGE}` and give it no fallback you would
+  not want deployed.
+- Rollback needs a previous value in `.env`. On the very first registry
+  deploy there is none, and the toolkit says so rather than guessing a tag.
+
+The app's compose file, `.env`, and directory must be visible to the agent
+(bind-mount it into the container at the same path you configure).
+
+### `git` source (build on the box)
+
+```json
+{ "name": "myapp", "dir": "/apps/myapp", "project": "myapp",
   "healthUrl": "https://app.example.com/api/health",
+  "services": ["app"],
   "healthAttempts": 20, "healthDelay": "6s" }
 ```
 
-`server-tools deploy myapp v1.2.3` then: verifies the working tree is clean,
+`server-tools deploy myapp v1.2.3` verifies the working tree is clean,
 fetches tags, checks out `v1.2.3`, runs `docker compose up -d --build`, polls
-`healthUrl` (`healthAttempts` x `healthDelay`), and on build or health
-failure checks the previous commit back out, rebuilds, and reports the
-rollback. The app directory must be visible to the agent (bind-mount it into
-the container at the same path you configure).
+`healthUrl`, and on build or health failure checks the previous commit back
+out, rebuilds, and reports the rollback.
+
+The build runs on the host, which is what makes this mode a poor fit for a
+box hosting anything else: compiling a front-end can take the load average
+into double digits for minutes, and the unrelated stacks feel it. Health
+polling is also weaker here than it looks, because the previous containers
+stay up and healthy for the whole build - so a poll can pass against the old
+release. Listing `services` closes part of that gap: after the build those
+services must be running before the deploy is believed.
 
 ## Housekeeping
 

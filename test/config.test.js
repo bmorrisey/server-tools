@@ -99,3 +99,57 @@ test("loadConfig reports invalid JSON and missing files clearly", () => {
   assert.throws(() => loadConfig(file), /not valid JSON/);
   fs.rmSync(dir, { recursive: true, force: true });
 });
+
+test("registry deploys must state project, image, and services", () => {
+  const cfg = withDefaults({
+    ...minimal,
+    deploys: [{ name: "app", dir: "/apps/app", healthUrl: "https://a/health", source: "registry" }],
+  });
+  const problems = validateConfig(cfg);
+  assert.ok(problems.some((p) => p.includes("deploys[0].project is required")));
+  assert.ok(problems.some((p) => p.includes("deploys[0].image is required")));
+  assert.ok(problems.some((p) => p.includes("deploys[0].services is required")));
+});
+
+test("a registry image carries no tag; the tag is the deploy argument", () => {
+  const base = { name: "app", dir: "/apps/app", healthUrl: "https://a/health", source: "registry", project: "app", services: ["app"] };
+  assert.ok(
+    validateConfig(withDefaults({ ...minimal, deploys: [{ ...base, image: "ghcr.io/o/app:latest" }] })).some((p) =>
+      p.includes("must not include a tag"),
+    ),
+  );
+  assert.deepEqual(validateConfig(withDefaults({ ...minimal, deploys: [{ ...base, image: "ghcr.io/o/app" }] })), []);
+});
+
+test("git deploys stay valid without the registry fields and reject them when set", () => {
+  assert.deepEqual(
+    validateConfig(withDefaults({ ...minimal, deploys: [{ name: "app", dir: "/apps/app", healthUrl: "https://a/health" }] })),
+    [],
+  );
+  const problems = validateConfig(
+    withDefaults({
+      ...minimal,
+      deploys: [{ name: "app", dir: "/apps/app", healthUrl: "https://a/health", image: "ghcr.io/o/app", source: "git" }],
+    }),
+  );
+  assert.ok(problems.some((p) => p.includes("only applies to registry deploys")));
+});
+
+test("deploy source, project name, and services shape are validated", () => {
+  const problems = validateConfig(
+    withDefaults({
+      ...minimal,
+      deploys: [
+        { name: "a", dir: "/a", healthUrl: "https://a/h", source: "svn" },
+        { name: "b", dir: "/b", healthUrl: "https://b/h", project: "Not Valid" },
+        { name: "c", dir: "/c", healthUrl: "https://c/h", services: [] },
+        { name: "d", dir: "/d", healthUrl: "https://d/h", healthDelay: "soon", healthAttempts: 0 },
+      ],
+    }),
+  );
+  assert.ok(problems.some((p) => p.includes('deploys[0].source must be "git" or "registry"')));
+  assert.ok(problems.some((p) => p.includes("deploys[1].project must be a compose project name")));
+  assert.ok(problems.some((p) => p.includes("deploys[2].services must be a non-empty array")));
+  assert.ok(problems.some((p) => p.includes("deploys[3].healthDelay")));
+  assert.ok(problems.some((p) => p.includes("deploys[3].healthAttempts")));
+});
