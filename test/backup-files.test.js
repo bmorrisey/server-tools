@@ -9,6 +9,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import crypto from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { Store } from "../src/store.js";
 import { runBackup } from "../src/backup/backup.js";
@@ -250,6 +251,90 @@ test("a source pointing at a file rather than a directory says so", async () => 
       () => runBackup(target(), { docker: stubDocker(singleTar), store }),
       /is a file, not a directory/,
     );
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("excludes drop the same files from the archive and the manifest", async () => {
+  // The trap: tar's default matching is an unanchored glob, so "cache" would
+  // also drop "sub/cache" while buildManifest kept it. The backup reports
+  // success and every drill from then on fails with a nonsense message.
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "st-excl-"));
+  try {
+    const media = path.join(root, "media");
+    fs.mkdirSync(path.join(media, "cache"), { recursive: true });
+    fs.mkdirSync(path.join(media, "sub", "cache"), { recursive: true });
+    fs.writeFileSync(path.join(media, "cache", "a"), "a");
+    fs.writeFileSync(path.join(media, "sub", "cache", "b"), "b");
+    fs.writeFileSync(path.join(media, "keep.txt"), "keep");
+    const store = new Store(path.join(root, "data"));
+    store.ensureDirs();
+
+    const t = { name: "media", type: "files", path: media, archive: true, encrypt: false, exclude: ["cache"] };
+    const patch = await runBackup(t, { docker: null, store });
+    assert.match(patch.lastDetail, /^2 files/);
+
+    const result = await drillFiles(t, { store });
+    assert.equal(result.lastDrillResult, "ok");
+
+    const verified = await verifyArchive(t, { store });
+    assert.equal(verified.ok, true, JSON.stringify(verified.problems));
+    assert.equal(verified.checked, 2); // keep.txt and sub/cache/b
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("an offsite failure cannot turn a complete local backup into wreckage", async () => {
+  const { root, tarPath, store } = fixture();
+  try {
+    // The manifest is the completeness marker, so it has to be on disk before
+    // anything is uploaded; otherwise a 503 leaves an archive nothing will
+    // restore from and retention eventually evicts.
+    const failing = {
+      ...target(),
+      s3: { bucket: "b", region: "auto", accessKeyId: "k", secretAccessKey: "s" },
+    };
+    const { S3 } = await import("../src/backup/s3.js");
+    const originalPutFile = S3.prototype.putFile;
+    S3.prototype.putFile = async () => {
+      throw new Error("S3 PUT -> 503: SlowDown");
+    };
+    try {
+      await assert.rejects(() => runBackup(failing, { docker: stubDocker(tarPath), store }), /503/);
+    } finally {
+      S3.prototype.putFile = originalPutFile;
+    }
+    const files = fs.readdirSync(store.backupDir("media"));
+    assert.equal(files.filter((f) => f.endsWith(".manifest.json")).length, 1, "the local run is still complete");
+    const { planPrune } = await import("../src/backup/backup.js");
+    assert.equal(planPrune(files, { daily: 7 }, { type: "files" }).keep.size, 1);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a large encrypted archive is drilled without being held in memory", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "st-big-"));
+  try {
+    const src = path.join(root, "src");
+    fs.mkdirSync(path.join(src, "storage"), { recursive: true });
+    // Incompressible, so the artifact is genuinely this size on disk.
+    fs.writeFileSync(path.join(src, "storage", "blob.bin"), crypto.randomBytes(24 * 1024 * 1024));
+    const tarPath = path.join(root, "big.tar");
+    assert.equal(spawnSync("tar", ["-cf", tarPath, "-C", src, "storage"]).status, 0);
+    const store = new Store(path.join(root, "data"));
+    store.ensureDirs();
+
+    const t = target({ encrypt: true, passphrase: "a passphrase long enough" });
+    await runBackup(t, { docker: stubDocker(tarPath), store });
+    const before = process.memoryUsage().heapUsed;
+    const result = await drillFiles(t, { store });
+    const grew = process.memoryUsage().heapUsed - before;
+    assert.equal(result.lastDrillResult, "ok");
+    // Streaming, not buffering: the whole artifact would be several times this.
+    assert.ok(grew < 16 * 1024 * 1024, `drill grew the heap by ${Math.round(grew / 1024 / 1024)} MiB`);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

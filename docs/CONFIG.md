@@ -179,9 +179,9 @@ Media, wherever it lives. `source` says which of three places that is, and
 it is always stated rather than inferred:
 
 ```json
-{ "name": "app-media", "type": "files",
+{ "name": "app-media", "type": "files", "app": "myapp",
   "source": { "volume": "myapp_media" },
-  "schedule": "05:30", "exclude": ["tmp"],
+  "schedule": "05:30",
   "passphrase": "${BACKUP_PASSPHRASE}",
   "retention": { "daily": 7, "weekly": 4, "monthly": 6 } }
 ```
@@ -199,7 +199,9 @@ exactly when someone reaches for a backup. A source that cannot be resolved
 never falls back to "a directory, probably", because the backup that
 produces looks complete and is not.
 
-`exclude` applies to a `path` source only. The Engine hands back a volume or
+`exclude` applies to a `path` source only, and its entries are literal paths
+relative to the source root, not patterns: the archive and the manifest have
+to drop exactly the same files, or every restore drill fails from then on. The Engine hands back a volume or
 container subtree as one stream, so an exclusion there could only be applied
 to the manifest, leaving it describing something the archive does not
 contain and failing every restore drill from then on. Config validation
@@ -243,8 +245,10 @@ freshness to have, and config validation says so.
 
 ### Coverage
 
-Give targets an optional `"app": "myapp"` and coverage is judged per
-application; without it the whole deployment is treated as one, which is the
+A `files` target counts as coverage only when it actually keeps a copy: a
+manifest-only target indexes media it does not back up, and gets a note of
+its own saying so. Give targets an optional `"app": "myapp"` and coverage is
+judged per application; without it the whole deployment is treated as one, which is the
 honest reading of a config that does not group itself. An application whose
 backup targets are all `postgres` is either fine or half covered, and only
 you know which. The dashboard, `server-tools validate`, and

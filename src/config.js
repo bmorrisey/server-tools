@@ -13,6 +13,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { parseDuration, parseSchedule } from "./util.js";
+import { shouldArchive } from "./backup/backup.js";
 
 export const DEFAULT_CONFIG_PATH = process.env.SERVER_TOOLS_CONFIG || "./config.json";
 
@@ -105,6 +106,11 @@ export function validateConfig(cfg) {
             `${where}.source names both a volume and a container; pick one`,
           );
           for (const k of named) need(typeof s[k] === "string" && s[k], `${where}.source.${k} must be a non-empty string`);
+          if (typeof s.path === "string")
+            need(
+              !s.path.split("/").includes(".."),
+              `${where}.source.path must not contain ".."; name the directory directly`,
+            );
           if (s.container !== undefined) need(typeof s.path === "string" && s.path, `${where}.source.container needs source.path`);
           // The Engine hands back the whole subtree in one stream, so an
           // exclude could only be applied to the manifest, leaving it
@@ -116,11 +122,20 @@ export function validateConfig(cfg) {
           );
         }
       }
-      if (b.exclude !== undefined)
+      if (b.exclude !== undefined) {
         need(
           Array.isArray(b.exclude) && b.exclude.every((x) => typeof x === "string" && x),
           `${where}.exclude must be an array of relative paths`,
         );
+        // Exclusions are matched literally and anchored at the root, so that
+        // the archive and the manifest drop exactly the same files. A glob
+        // would quietly match nothing rather than what the operator meant.
+        if (Array.isArray(b.exclude))
+          need(
+            b.exclude.every((x) => typeof x !== "string" || !/[*?[\]]/.test(x)),
+            `${where}.exclude entries are literal paths relative to the source root, not patterns`,
+          );
+      }
       if (b.allowEmpty !== undefined)
         need(typeof b.allowEmpty === "boolean", `${where}.allowEmpty must be true or false`);
     }
@@ -286,20 +301,39 @@ export function coverageNotes(cfg) {
   const notes = [];
   for (const [app, targets] of groups) {
     const databases = targets.filter((b) => b.type === "postgres");
-    const media = targets.filter((b) => b.type === "files" || b.type === "external");
-    if (databases.length === 0 || media.length > 0) continue;
+    if (databases.length === 0) continue;
     const which = app ? `"${app}"` : "this deployment";
-    notes.push({
-      id: app ? `media-not-declared:${app}` : "media-not-declared",
-      app: app || null,
-      title: app
-        ? `${app}: databases are backed up, media is not declared`
-        : "Databases are backed up; media is not declared",
-      detail:
-        `Every backup target for ${which} is a database (${databases.map((b) => b.name).join(", ")}). ` +
-        "A database restored without its media is not a restore - the app comes up and every image 404s. " +
-        'Add a "files" target for media this toolkit can copy, or an "external" target naming where it lives instead.',
-    });
+    // A manifest-only files target indexes media without copying a byte of
+    // it, so on its own it is not coverage - it just makes the gap harder to
+    // see, which is the shape this warning exists to catch.
+    const indexedOnly = targets.filter((b) => b.type === "files" && !shouldArchive(b));
+    const copied = targets.filter((b) => b.type === "files" && shouldArchive(b));
+    const declared = targets.filter((b) => b.type === "external");
+    if (copied.length > 0 || declared.length > 0) continue;
+    notes.push(
+      indexedOnly.length > 0
+        ? {
+            id: app ? `media-indexed-only:${app}` : "media-indexed-only",
+            app: app || null,
+            title: app
+              ? `${app}: media is indexed but not copied`
+              : "Media is indexed but not copied",
+            detail:
+              `${indexedOnly.map((b) => b.name).join(", ")} writes a manifest and no archive, so it can verify media that still exists but restores none of it. ` +
+              'Set "archive": true to keep a copy, or declare an "external" target if the real copy lives somewhere else.',
+          }
+        : {
+            id: app ? `media-not-declared:${app}` : "media-not-declared",
+            app: app || null,
+            title: app
+              ? `${app}: databases are backed up, media is not declared`
+              : "Databases are backed up; media is not declared",
+            detail:
+              `Every backup target for ${which} is a database (${databases.map((b) => b.name).join(", ")}). ` +
+              "A database restored without its media is not a restore - the app comes up and every image 404s. " +
+              'Add a "files" target for media this toolkit can copy, or an "external" target naming where it lives instead.',
+          },
+    );
   }
   return notes;
 }

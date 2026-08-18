@@ -228,10 +228,38 @@ test("coverageNotes asks once when every target is a database", () => {
   assert.equal(dbOnly.length, 1);
   assert.equal(dbOnly[0].id, "media-not-declared");
 
-  // Either kind of media target answers the question.
-  assert.deepEqual(coverageNotes({ backups: [{ type: "postgres" }, { type: "files" }] }), []);
+  // A target that actually copies media answers the question, as does one
+  // that says the media lives somewhere else.
+  assert.deepEqual(coverageNotes({ backups: [{ type: "postgres" }, { type: "files", source: { volume: "v" } }] }), []);
+  assert.deepEqual(coverageNotes({ backups: [{ type: "postgres" }, { type: "files", path: "/m", archive: true }] }), []);
   assert.deepEqual(coverageNotes({ backups: [{ type: "postgres" }, { type: "external" }] }), []);
   // Nothing to say about a deployment with no database at all.
   assert.deepEqual(coverageNotes({ backups: [] }), []);
   assert.deepEqual(coverageNotes({}), []);
+});
+
+test("a manifest-only media target is not mistaken for a copy of the media", () => {
+  // It indexes a tree that still exists and restores none of it, so counting
+  // it as coverage would just make the gap harder to see.
+  const notes = coverageNotes({
+    backups: [
+      { name: "db", type: "postgres" },
+      { name: "media", type: "files", path: "/srv/media" },
+    ],
+  });
+  assert.equal(notes.length, 1);
+  assert.equal(notes[0].id, "media-indexed-only");
+  assert.match(notes[0].detail, /manifest and no archive/);
+});
+
+test("coverage is judged per application when targets name one", () => {
+  const notes = coverageNotes({
+    backups: [
+      { name: "a-db", type: "postgres", app: "alpha" },
+      { name: "a-media", type: "files", app: "alpha", source: { volume: "v" } },
+      { name: "b-db", type: "postgres", app: "beta" },
+    ],
+  });
+  assert.equal(notes.length, 1);
+  assert.equal(notes[0].app, "beta");
 });

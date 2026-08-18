@@ -119,3 +119,127 @@ test("directories, symlinks, and hard links contribute no files", async () => {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+/* -------------------------------------------------------------------------
+ * PAX archives.
+ *
+ * The tests above shell out to GNU tar, which uses GNU 'L' records for long
+ * names. The Docker Engine does not: it writes with Go's archive/tar, which
+ * forces a PAX extended header for any non-ASCII name, any name over 100
+ * bytes, and any large size. Building those headers by hand is the only way
+ * to exercise the path the Engine actually takes.
+ * ---------------------------------------------------------------------- */
+
+function tarHeader({ name = "", size = 0, typeflag = "0", prefix = "" }) {
+  const b = Buffer.alloc(512);
+  b.write(name, 0, 100, "utf8");
+  b.write("0000644\0", 100, 8, "latin1");
+  b.write("0000000\0", 108, 8, "latin1");
+  b.write("0000000\0", 116, 8, "latin1");
+  b.write(`${size.toString(8).padStart(11, "0")}\0`, 124, 12, "latin1");
+  b.write("00000000000\0", 136, 12, "latin1");
+  b.write("        ", 148, 8, "latin1"); // checksum field reads as spaces
+  b.write(typeflag, 156, 1, "latin1");
+  b.write("ustar\0", 257, 6, "latin1");
+  b.write("00", 263, 2, "latin1");
+  b.write(prefix, 345, 155, "utf8");
+  let sum = 0;
+  for (let i = 0; i < 512; i++) sum += b[i];
+  b.write(`${sum.toString(8).padStart(6, "0")}\0 `, 148, 8, "latin1");
+  return b;
+}
+
+/** A PAX record: "<byte-length> key=value\n", where the length counts itself. */
+function paxRecord(kv) {
+  const body = Buffer.from(`${kv}\n`, "utf8");
+  for (let n = body.length + 2; n < body.length + 10; n++) {
+    if (Buffer.byteLength(String(n)) + 1 + body.length === n) {
+      return Buffer.concat([Buffer.from(`${n} `, "latin1"), body]);
+    }
+  }
+  throw new Error("no fixed point");
+}
+
+const pad = (buf) => Buffer.concat([buf, Buffer.alloc((512 - (buf.length % 512)) % 512)]);
+
+/** An entry the way Go writes it: a PAX header, then the ustar fallback. */
+function paxEntry(realPath, body, { fallback = "unused", records = null } = {}) {
+  const data = Buffer.from(body);
+  const payload = Buffer.concat(records ?? [paxRecord(`path=${realPath}`)]);
+  return Buffer.concat([
+    tarHeader({ name: `PaxHeaders/0/${fallback}`, size: payload.length, typeflag: "x" }),
+    pad(payload),
+    tarHeader({ name: fallback, size: data.length }),
+    pad(data),
+  ]);
+}
+
+const endOfArchive = Buffer.alloc(1024);
+
+test("a PAX header carries a non-ASCII name through intact", async () => {
+  // Go writes a lossy ASCII fallback in the ustar name field, so losing the
+  // PAX record does not fail loudly: it indexes the wrong path and the drill,
+  // reading the same stream the same way, agrees with itself.
+  const archive = Buffer.concat([
+    paxEntry("storage/写真.jpg", "abcd", { fallback: "storage/.jpg" }),
+    paxEntry("storage/画像.jpg", "efghi", { fallback: "storage/.jpg" }),
+    endOfArchive,
+  ]);
+  const result = await scanTarStream(Readable.from([archive]), { strip: 1 });
+  assert.equal(result.complete, true);
+  assert.deepEqual(result.files.map((f) => f.path).sort(), ["画像.jpg", "写真.jpg"].sort());
+  assert.equal(result.files.find((f) => f.path === "写真.jpg").sha256, sha("abcd"));
+});
+
+test("a PAX size record is honoured, so the stream does not desync", async () => {
+  const body = "0123456789";
+  const archive = Buffer.concat([
+    paxEntry("storage/big.bin", body, {
+      fallback: "storage/big.bin",
+      // Go sorts its keys, so anything alphabetically before "path" arrives
+      // first; the parser has to walk past it to reach the rest.
+      records: [paxRecord("SCHILY.xattr.user.k=v"), paxRecord("path=storage/big.bin"), paxRecord(`size=${body.length}`)],
+    }),
+    paxEntry("storage/after.txt", "ok", { fallback: "storage/after.txt" }),
+    endOfArchive,
+  ]);
+  const result = await scanTarStream(Readable.from([archive]), { strip: 1 });
+  assert.equal(result.complete, true);
+  assert.deepEqual(result.files.map((f) => f.path).sort(), ["after.txt", "big.bin"]);
+  assert.equal(result.files.find((f) => f.path === "big.bin").size, 10);
+});
+
+test("a corrupt header is rejected rather than indexed as garbage", async () => {
+  const bad = tarHeader({ name: "storage/a.txt", size: 4 });
+  bad[10] = 0x41; // flip a byte the checksum covers
+  await assert.rejects(
+    () => scanTarStream(Readable.from([Buffer.concat([bad, pad(Buffer.from("data")), endOfArchive])])),
+    /checksum mismatch/,
+  );
+});
+
+test("an implausible metadata record is refused instead of buffered", async () => {
+  const huge = tarHeader({ name: "PaxHeaders/0/x", size: 8 * 1024 * 1024, typeflag: "x" });
+  await assert.rejects(() => scanTarStream(Readable.from([huge])), /implausible/);
+});
+
+test("bytes after the end-of-archive marker are dropped, not buffered", async () => {
+  const scanner = new TarScanner({ strip: 1 });
+  scanner.update(Buffer.concat([paxEntry("storage/a.txt", "x", { fallback: "storage/a.txt" }), endOfArchive]));
+  scanner.update(Buffer.alloc(4 * 1024 * 1024)); // trailing padding from a blocking factor
+  assert.equal(scanner.buf.length, 0);
+  const result = scanner.finish();
+  assert.equal(result.complete, true);
+  assert.deepEqual(result.files.map((f) => f.path), ["a.txt"]);
+});
+
+test("a single stray zero block does not end the archive early", async () => {
+  const archive = Buffer.concat([
+    paxEntry("storage/a.txt", "x", { fallback: "storage/a.txt" }),
+    Buffer.alloc(512), // one zero block: not a terminator
+    paxEntry("storage/b.txt", "y", { fallback: "storage/b.txt" }),
+    endOfArchive,
+  ]);
+  const result = await scanTarStream(Readable.from([archive]), { strip: 1 });
+  assert.deepEqual(result.files.map((f) => f.path).sort(), ["a.txt", "b.txt"]);
+});

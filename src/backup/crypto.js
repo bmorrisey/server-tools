@@ -43,10 +43,82 @@ export async function encryptStream(passphrase, source, sink) {
   return total + tag.length;
 }
 
+const HEADER_BYTES = MAGIC.length + 16 + 12;
+const TAG_BYTES = 16;
+
 /**
- * Decrypt a whole encrypted file buffer. For restore-sized artifacts we read
- * the file fully; the GCM tag sits at the end so true streaming decryption
- * would need to hold back 16 bytes - buffer simplicity wins here.
+ * Decrypt a readable stream of ciphertext into `sink`.
+ *
+ * The GCM tag sits at the end of the file, so this holds back the last 16
+ * bytes as it goes and feeds them to the cipher as the tag. Worth the
+ * bookkeeping: media archives are the large artifacts by definition, and the
+ * restore drill that reads them back runs inside the long-running agent,
+ * where a multi-gigabyte readFile does not fail softly.
+ *
+ * Corruption or a wrong passphrase still fails loudly, at the end.
+ */
+export function decryptStream(passphrase, source, sink) {
+  return new Promise((resolve, reject) => {
+    let header = Buffer.alloc(0);
+    let held = Buffer.alloc(0);
+    let decipher = null;
+    let failed = false;
+
+    const fail = (e) => {
+      if (failed) return;
+      failed = true;
+      source.destroy();
+      reject(e);
+    };
+
+    const feed = new Transform({
+      transform(chunk, _enc, cb) {
+        try {
+          if (!decipher) {
+            header = Buffer.concat([header, chunk]);
+            if (header.length < HEADER_BYTES) return cb();
+            if (!header.subarray(0, MAGIC.length).equals(MAGIC)) {
+              return cb(new Error("not a server-tools encrypted artifact (bad magic)"));
+            }
+            const salt = header.subarray(MAGIC.length, MAGIC.length + 16);
+            const iv = header.subarray(MAGIC.length + 16, HEADER_BYTES);
+            decipher = crypto.createDecipheriv("aes-256-gcm", deriveKey(passphrase, salt), iv);
+            chunk = header.subarray(HEADER_BYTES);
+            header = Buffer.alloc(0);
+          }
+          // Everything but the trailing tag-sized window is safe to decrypt;
+          // what the window holds at end-of-stream is the tag itself.
+          const buf = Buffer.concat([held, chunk]);
+          if (buf.length <= TAG_BYTES) {
+            held = buf;
+            return cb();
+          }
+          held = buf.subarray(buf.length - TAG_BYTES);
+          cb(null, decipher.update(buf.subarray(0, buf.length - TAG_BYTES)));
+        } catch (e) {
+          cb(e);
+        }
+      },
+      flush(cb) {
+        try {
+          if (!decipher) return cb(new Error("artifact is too short to be an encrypted artifact"));
+          if (held.length !== TAG_BYTES) return cb(new Error("artifact is truncated: no authentication tag"));
+          decipher.setAuthTag(held);
+          cb(null, decipher.final());
+        } catch (e) {
+          cb(e);
+        }
+      },
+    });
+
+    pipeline(source, feed, sink).then(resolve, fail);
+  });
+}
+
+/**
+ * Decrypt a whole encrypted file buffer. Used where the plaintext is wanted
+ * as one value anyway (a SQL dump handed to psql); anything large enough to
+ * matter should use decryptStream instead.
  */
 export function decryptBuffer(passphrase, buf) {
   if (!buf.subarray(0, 5).equals(MAGIC)) throw new Error("not a server-tools encrypted artifact (bad magic)");

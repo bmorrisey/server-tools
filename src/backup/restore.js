@@ -13,15 +13,17 @@
  * and checked against the manifest its run wrote. A database restored without
  * its media is not a restore, so both halves have to be provable.
  */
+import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
 import zlib from "node:zlib";
-import { Readable } from "node:stream";
-import { decryptBuffer, isEncryptedArtifact } from "./crypto.js";
+import { PassThrough, Readable } from "node:stream";
+import { decryptBuffer, decryptStream, isEncryptedArtifact } from "./crypto.js";
 import { shouldArchive, verifyManifest } from "./backup.js";
 import { scanTarStream } from "./tar.js";
 import { S3 } from "./s3.js";
 import { formatBytes } from "../util.js";
+import { pipeline as pipelineAsync } from "node:stream/promises";
 import { logger } from "../log.js";
 
 const log = logger("restore");
@@ -187,7 +189,7 @@ export async function drill(target, { docker, store, artifact = null }) {
  * ---------------------------------------------------------------------- */
 
 /** The manifest written by the same run as `artifactName`. */
-async function loadRunManifest(target, artifactName, { store }) {
+export async function loadRunManifest(target, artifactName, { store }) {
   const stamp = String(artifactName).match(/\d{8}-\d{6}/)?.[0];
   if (!stamp) throw new Error(`cannot tell which run "${artifactName}" belongs to`);
   const name = `${target.name}-${stamp}.manifest.json`;
@@ -225,21 +227,66 @@ export function compareToManifest(scan, manifest) {
 }
 
 /**
- * Read an archive back and check it against its manifest. Decryption needs
- * the whole ciphertext in memory (the GCM tag is at the end), but the
- * decompressed tar is streamed through the scanner, so a large media archive
- * never lands in memory expanded.
+ * A readable of an artifact's plaintext bytes, decrypting as it goes.
+ *
+ * Nothing here holds the artifact in memory: a media archive can be tens of
+ * gigabytes, and the drill that reads it back runs inside the long-running
+ * agent. Only an artifact that is not on disk falls back to the buffered
+ * offsite path, because the S3 client hands back a Buffer.
+ */
+async function artifactStream(target, artifactName, { store }) {
+  const localPath = path.join(store.backupDir(target.name), artifactName);
+  const exists = await fsp.stat(localPath).then(() => true, () => false);
+  if (!exists) return Readable.from(await loadArtifactBytes(target, artifactName, { store }));
+
+  const head = await readHead(localPath, 5);
+  if (!isEncryptedArtifact(Buffer.concat([head, Buffer.alloc(45)]))) return fs.createReadStream(localPath);
+  if (!target.passphrase) throw new Error("artifact is encrypted but no passphrase is configured");
+
+  const plain = new PassThrough();
+  decryptStream(target.passphrase, fs.createReadStream(localPath), plain).catch((e) => plain.destroy(e));
+  return plain;
+}
+
+function readHead(filePath, bytes) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    const stream = fs.createReadStream(filePath, { start: 0, end: bytes - 1 });
+    stream.on("data", (c) => chunks.push(c));
+    stream.on("end", () => resolve(Buffer.concat(chunks)));
+    stream.on("error", reject);
+  });
+}
+
+/**
+ * Read an archive back and check it against its manifest, start to finish,
+ * without the artifact or its expanded contents landing in memory.
  */
 export async function verifyArchive(target, { store, artifact = null }) {
   const name = artifact ?? (await latestArtifact(target, { store }));
   const manifest = await loadRunManifest(target, name, { store });
-  const compressed = await loadArtifactBytes(target, name, { store });
   // A manifest with a filesystem root came from `tar -C dir .`, so its paths
   // are already relative; one taken through the Docker socket is rooted at
   // the basename of the copied path and drops that component.
   const strip = manifest.root ? 0 : 1;
-  const scan = await scanTarStream(Readable.from(compressed).pipe(zlib.createGunzip()), { strip });
+  const source = await artifactStream(target, name, { store });
+  const scan = await scanTarStream(source.pipe(zlib.createGunzip()), { strip });
   return { artifact: name, ...compareToManifest(scan, manifest) };
+}
+
+/** Write an artifact's plaintext to `dest`, streaming. Returns bytes written. */
+export async function exportArtifact(target, artifactName, dest, { store }) {
+  const source = await artifactStream(target, artifactName, { store });
+  const handle = await fsp.open(dest, "wx", 0o600);
+  try {
+    let bytes = 0;
+    const count = new PassThrough();
+    count.on("data", (c) => (bytes += c.length));
+    await pipelineAsync(source, count, handle.createWriteStream());
+    return bytes;
+  } finally {
+    await handle.close();
+  }
 }
 
 /**

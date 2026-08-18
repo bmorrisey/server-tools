@@ -27,7 +27,7 @@ import { Store } from "./store.js";
 import { Docker } from "./docker.js";
 import { runCheck } from "./checks.js";
 import { runBackup } from "./backup/backup.js";
-import { restore, drill, drillFiles, latestArtifact, loadArtifactBytes } from "./backup/restore.js";
+import { restore, drill, drillFiles, exportArtifact, latestArtifact, loadRunManifest } from "./backup/restore.js";
 import { S3 } from "./backup/s3.js";
 import { deploy } from "./deploy.js";
 import { housekeep } from "./housekeep.js";
@@ -51,8 +51,10 @@ for (let i = 0; i < args.length; i++) {
 /** Value of a "--name value" option, or null. */
 function optionValue(name) {
   const i = args.indexOf(name);
-  const value = i >= 0 ? args[i + 1] : undefined;
-  return value && !value.startsWith("--") ? value : null;
+  if (i < 0) return null;
+  const value = args[i + 1];
+  if (!value || value.startsWith("--")) fail(`${name} needs a value`);
+  return value;
 }
 
 function fail(msg) {
@@ -79,16 +81,14 @@ const ICONS = { ok: "OK  ", warn: "WARN", fail: "FAIL" };
  */
 async function extractionHint(target, artifact, store) {
   if (target.type !== "files" || artifact.endsWith(".json")) return null;
-  const stamp = artifact.match(/\d{8}-\d{6}/)?.[0];
-  if (!stamp) return null;
-  const manifestPath = path.join(store.backupDir(target.name), `${target.name}-${stamp}.manifest.json`);
-  const manifest = await fsp
-    .readFile(manifestPath, "utf8")
-    .then(JSON.parse)
-    .catch(() => null);
-  if (!manifest) return "no manifest for this run, so it was never verified as complete; check it before trusting it";
+  // The manifest may only exist offsite - which is precisely the situation
+  // the runbook is written for, so this has to look there too.
+  const manifest = await loadRunManifest(target, artifact, { store }).catch(() => null);
+  if (!manifest) {
+    return { warning: "no manifest for this run, so it was never verified as complete; check it before trusting it" };
+  }
   const strip = manifest.root ? "" : " --strip-components=1";
-  return `tar -xz${strip} -C <destination> -f <file>`;
+  return { command: `tar -xz${strip} -C <destination> -f <file>` };
 }
 
 async function main() {
@@ -161,8 +161,10 @@ async function main() {
 
     case "restore": {
       const target = findTarget(config, "backups", positional[0] ?? fail("usage: restore <target> [artifact]"));
+      if (target.type === "external")
+        fail(`"${target.name}" is external (${target.note}); nothing is stored here to restore`);
       if (target.type !== "postgres")
-        fail("restore currently supports postgres targets (files targets restore from their archive by hand; see RUNBOOK.md)");
+        fail("restore currently supports postgres targets; for media use: server-tools export <target> (see RUNBOOK.md)");
       const result = await restore(target, {
         docker,
         store,
@@ -214,28 +216,23 @@ async function main() {
       const extractHint = await extractionHint(target, name, store);
       const to = optionValue("--to");
       const dest = to ? path.resolve(to) : path.join(store.tmpDir(), name.replace(/\.enc$/, ""));
-      const bytes = await loadArtifactBytes(target, name, { store });
       // Exclusive create: this writes plaintext application data, so it must
       // never land on top of a file the operator was not shown, and never
       // inherit that file's permissions ("mode" is ignored for an existing
       // file, which is exactly the wrong moment to be relaxed about it).
-      let handle;
+      let bytes;
       try {
-        handle = await fsp.open(dest, "wx", 0o600);
+        bytes = await exportArtifact(target, name, dest, { store });
       } catch (e) {
         if (e.code === "EEXIST") fail(`${dest} already exists; pass a different --to rather than overwriting it`);
         throw e;
       }
-      try {
-        await handle.writeFile(bytes);
-      } finally {
-        await handle.close();
-      }
       process.stdout.write(
-        `${dest}\n${formatBytes(bytes.length)}, decrypted - delete it when you are done` +
+        `${dest}\n${formatBytes(bytes)}, decrypted - delete it when you are done` +
           `${to ? "" : " (housekeeping clears the temp directory on its own schedule)"}\n`,
       );
-      if (extractHint) process.stdout.write(`unpack with: ${extractHint}\n`);
+      if (extractHint?.command) process.stdout.write(`unpack with: ${extractHint.command}\n`);
+      if (extractHint?.warning) process.stdout.write(`warning: ${extractHint.warning}\n`);
       break;
     }
 

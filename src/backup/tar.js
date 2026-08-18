@@ -67,18 +67,31 @@ export function normalizeEntryPath(name, strip = 0) {
   return p.replace(/\/+$/, "");
 }
 
-/** Parse the PAX extended-header payload into { key: value }. */
-export function parsePax(text) {
+/**
+ * Parse the PAX extended-header payload into { key: value }.
+ *
+ * Records are `<byte-length> <key>=<value>\n`, and that length is in BYTES.
+ * Measuring it in JavaScript string units would come up short for any
+ * non-ASCII name and silently discard the whole record set - which is not a
+ * corner case here: the Docker Engine writes with Go's archive/tar, and Go
+ * forces PAX for exactly those names. The fallback would then be the lossy
+ * ASCII name in the ustar header, so a photo called "写真.jpg" would be
+ * indexed as ".jpg". Hence the buffer arithmetic.
+ */
+export function parsePax(payload) {
+  const buf = Buffer.isBuffer(payload) ? payload : Buffer.from(String(payload ?? ""), "utf8");
   const out = {};
   let i = 0;
-  while (i < text.length) {
-    const sp = text.indexOf(" ", i);
+  while (i < buf.length) {
+    const sp = buf.indexOf(0x20, i);
     if (sp < 0) break;
-    const len = Number(text.slice(i, sp));
-    if (!Number.isInteger(len) || len <= 0 || i + len > text.length) break;
-    const record = text.slice(sp + 1, i + len).replace(/\n$/, "");
-    const eq = record.indexOf("=");
-    if (eq > 0) out[record.slice(0, eq)] = record.slice(eq + 1);
+    const len = Number(buf.toString("latin1", i, sp));
+    if (!Number.isInteger(len) || len <= 0 || i + len > buf.length) break;
+    let end = i + len;
+    if (buf[end - 1] === 0x0a) end--;
+    const record = buf.subarray(sp + 1, end);
+    const eq = record.indexOf(0x3d);
+    if (eq > 0) out[record.toString("utf8", 0, eq)] = record.toString("utf8", eq + 1);
     i += len;
   }
   return out;
@@ -202,11 +215,13 @@ export class TarScanner {
       this.totalBytes += this.entry.size;
       this.entry = null;
     } else if (this.collect) {
-      const text = Buffer.concat(this.collect).toString("utf8");
+      const raw = Buffer.concat(this.collect);
       if (this.collectKind === "L") {
-        this.override = { ...this.override, path: normalizeEntryPath(text.replace(/\0.*$/s, ""), 0) };
+        const text = raw.toString("utf8").replace(/\0.*$/s, "");
+        this.override = { ...this.override, path: normalizeEntryPath(text, 0) };
       } else if (this.collectKind === "x") {
-        const pax = parsePax(text);
+        // Byte offsets, so the payload stays a Buffer all the way in.
+        const pax = parsePax(raw);
         const next = { ...this.override };
         if (pax.path) next.path = pax.path;
         if (pax.size !== undefined && Number.isFinite(Number(pax.size))) next.size = Number(pax.size);

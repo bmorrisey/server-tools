@@ -177,7 +177,11 @@ export async function runBackup(target, { docker, store }) {
       recordResult(store, target, patch);
       store.append("events", { topic: "backup", kind: "ok", name: target.name, detail: result.detail });
       log.info(`backup ${target.name}: ${result.detail}`);
-      await prune(target, { store });
+      // Retention runs after the success is recorded and outside its error
+      // path: a bucket listing that times out is a housekeeping problem, not
+      // a reason to tell the operator their backup failed and drop a marker
+      // beside a perfectly good artifact.
+      await prune(target, { store }).catch((e) => log.warn(`prune for ${target.name} failed: ${e.message}`));
       return patch;
     } catch (e) {
       // Cleanup must never replace the error that caused it: the recorded
@@ -304,17 +308,19 @@ async function backupFiles(target, stamp, { docker, store }) {
     if (archiving) artifact = tarName;
   }
 
+  // Manifest last, but last *locally* and before anything is uploaded. Its
+  // presence is what says the run finished, so a bucket returning 503 must
+  // not be able to leave a complete archive on disk that nothing will restore
+  // from. Offsite then gets the same ordering for the same reason.
+  await writeAtomic(path.join(dir, manifestName), JSON.stringify(manifest, null, 2));
+
   let offsite = false;
   const s3 = s3For(target);
   if (s3) {
     if (archiving) await s3.putFile(`${target.name}/${artifact}`, path.join(dir, artifact));
+    await s3.put(`${target.name}/${manifestName}`, Buffer.from(JSON.stringify(manifest)));
     offsite = true;
   }
-
-  // Manifest last, locally and offsite: its presence is what says the run
-  // finished. A directory holding an archive and no manifest is a failed run.
-  await writeAtomic(path.join(dir, manifestName), JSON.stringify(manifest, null, 2));
-  if (s3) await s3.put(`${target.name}/${manifestName}`, Buffer.from(JSON.stringify(manifest)));
 
   const where = describeSource(src);
   return {
@@ -324,7 +330,7 @@ async function backupFiles(target, stamp, { docker, store }) {
     detail:
       `${manifest.files.length} files, ${formatBytes(manifest.totalBytes)} from ${where}` +
       `${archiving ? `, archived ${formatBytes(sizeBytes)}${encrypted ? " encrypted" : ""}` : ", manifest only"}` +
-      `${offsite ? ", uploaded offsite" : ""}`,
+      `${offsite ? (archiving ? ", uploaded offsite" : ", manifest uploaded offsite") : ""}`,
   };
 }
 
@@ -499,10 +505,26 @@ export async function verifyManifest(manifest, { sample = 25 } = {}) {
   return { ok: problems.length === 0, checked: manifest.files.length, hashed: shuffled.length, problems: problems.slice(0, 50) };
 }
 
-/** tar+gzip a directory using the system tar binary, optionally encrypting. */
+/**
+ * tar+gzip a directory using the system tar binary, optionally encrypting.
+ *
+ * The exclusions are anchored and literal so that tar removes exactly what
+ * buildManifest removed. Left to its defaults tar treats a pattern as an
+ * unanchored glob, so "cache" would also drop "sub/cache" while the manifest
+ * kept it - and an archive that disagrees with its manifest fails every
+ * restore drill from then on, while the backup itself still reports success.
+ */
 function tarGz(dir, outPath, passphrase, exclude = []) {
   return new Promise((resolve, reject) => {
-    const args = ["-cz", ...exclude.flatMap((e) => ["--exclude", e]), "-C", dir, "."];
+    const args = [
+      "-cz",
+      "--no-wildcards",
+      "--anchored",
+      ...exclude.flatMap((e) => ["--exclude", `./${String(e).replace(/^\.?\//, "")}`]),
+      "-C",
+      dir,
+      ".",
+    ];
     const tar = spawn("tar", args, { stdio: ["ignore", "pipe", "pipe"] });
     let stderr = "";
     tar.stderr.on("data", (c) => (stderr += c));
@@ -580,11 +602,14 @@ export function planPrune(names, retention, { type = "postgres" } = {}) {
     backups.map((r) => ({ key: r.stamp, date: dateFromArtifactName(r.stamp) })),
     retention,
   );
-  const oldestKept = [...plan.keep].sort()[0] ?? null;
+  const keptStamps = [...plan.keep].sort();
+  const newestKept = keptStamps[keptStamps.length - 1] ?? null;
 
-  // A target that has never succeeded has no retained run to measure its
-  // markers against, so cap them by count as well: an hourly schedule against
-  // a misconfigured source would otherwise write thousands of them a year.
+  // Wreckage is measured against the NEWEST retained run: once a good backup
+  // exists that is newer, an orphan archive has nothing left to say and is
+  // just disk. A target that has never succeeded has no run to measure
+  // against at all, so markers are capped by count as well - an hourly
+  // schedule against a misconfigured source would write thousands a year.
   const failedStamps = [...runs.values()]
     .filter((r) => !r.backup)
     .map((r) => r.stamp)
@@ -596,7 +621,7 @@ export function planPrune(names, retention, { type = "postgres" } = {}) {
   for (const run of [...runs.values()].sort((a, b) => a.stamp.localeCompare(b.stamp))) {
     const stale = run.backup
       ? !plan.keep.has(run.stamp)
-      : (oldestKept !== null && run.stamp < oldestKept) || excessFailures.has(run.stamp);
+      : (newestKept !== null && run.stamp < newestKept) || excessFailures.has(run.stamp);
     if (!stale) continue;
     drop.push(...run.files);
     droppedRuns++;
