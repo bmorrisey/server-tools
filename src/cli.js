@@ -7,8 +7,9 @@
  *   server-tools backup <target>         run one backup target now
  *   server-tools backup-all              run every configured backup target
  *   server-tools restore <target> [artifact] [--force]
- *   server-tools drill <target> [artifact]
+ *   server-tools drill <target> [artifact]  prove a backup restores (db) or matches its manifest (files)
  *   server-tools artifacts <target>      list local + offsite artifacts
+ *   server-tools export <target> [artifact] [--to <file>]   write a decrypted copy of an artifact
  *   server-tools deploy <target> <ref> [--dry-run]
  *   server-tools housekeep [--dry-run]
  *   server-tools storage [--json]        what is using the disk, and what is reclaimable
@@ -21,12 +22,12 @@
  */
 import fsp from "node:fs/promises";
 import path from "node:path";
-import { loadConfig, DEFAULT_CONFIG_PATH } from "./config.js";
+import { coverageNotes, loadConfig, DEFAULT_CONFIG_PATH } from "./config.js";
 import { Store } from "./store.js";
 import { Docker } from "./docker.js";
 import { runCheck } from "./checks.js";
 import { runBackup } from "./backup/backup.js";
-import { restore, drill } from "./backup/restore.js";
+import { restore, drill, drillFiles, latestArtifact, loadArtifactBytes } from "./backup/restore.js";
 import { S3 } from "./backup/s3.js";
 import { deploy } from "./deploy.js";
 import { housekeep } from "./housekeep.js";
@@ -34,7 +35,25 @@ import { formatBytes } from "./util.js";
 
 const [, , command, ...args] = process.argv;
 const flags = new Set(args.filter((a) => a.startsWith("--")));
-const positional = args.filter((a) => !a.startsWith("--"));
+
+// Options that take a value, so the value is not mistaken for a positional
+// argument ("export media --to /tmp/x" names one target, not two).
+const VALUE_OPTIONS = new Set(["--to"]);
+const positional = [];
+for (let i = 0; i < args.length; i++) {
+  if (args[i].startsWith("--")) {
+    if (VALUE_OPTIONS.has(args[i])) i++;
+    continue;
+  }
+  positional.push(args[i]);
+}
+
+/** Value of a "--name value" option, or null. */
+function optionValue(name) {
+  const i = args.indexOf(name);
+  const value = i >= 0 ? args[i + 1] : undefined;
+  return value && !value.startsWith("--") ? value : null;
+}
 
 function fail(msg) {
   process.stderr.write(`error: ${msg}\n`);
@@ -64,8 +83,11 @@ async function main() {
   }
 
   if (command === "validate") {
-    loadConfig();
+    const cfg = loadConfig();
     process.stdout.write(`config at ${path.resolve(DEFAULT_CONFIG_PATH)} is valid\n`);
+    for (const note of coverageNotes(cfg)) {
+      process.stdout.write(`\nheads up: ${note.title}\n  ${note.detail}\n`);
+    }
     return;
   }
 
@@ -99,6 +121,10 @@ async function main() {
     case "backup-all": {
       let failed = 0;
       for (const target of config.backups) {
+        if (target.type === "external") {
+          process.stdout.write(`SKIP ${target.name}: external - ${target.note}\n`);
+          continue;
+        }
         try {
           const result = await runBackup(target, { docker, store });
           process.stdout.write(`OK   ${target.name}: ${result.lastDetail}\n`);
@@ -113,7 +139,8 @@ async function main() {
 
     case "restore": {
       const target = findTarget(config, "backups", positional[0] ?? fail("usage: restore <target> [artifact]"));
-      if (target.type !== "postgres") fail("restore currently supports postgres targets (files targets restore from their archive by hand; see RUNBOOK.md)");
+      if (target.type !== "postgres")
+        fail("restore currently supports postgres targets (files targets restore from their archive by hand; see RUNBOOK.md)");
       const result = await restore(target, {
         docker,
         store,
@@ -126,8 +153,13 @@ async function main() {
 
     case "drill": {
       const target = findTarget(config, "backups", positional[0] ?? fail("usage: drill <target> [artifact]"));
-      if (target.type !== "postgres") fail("drill supports postgres targets");
-      const result = await drill(target, { docker, store, artifact: positional[1] ?? null });
+      if (target.type === "external")
+        fail(`"${target.name}" is external (${target.note}); this toolkit holds nothing to drill`);
+      const artifact = positional[1] ?? null;
+      const result =
+        target.type === "postgres"
+          ? await drill(target, { docker, store, artifact })
+          : await drillFiles(target, { store, artifact });
       process.stdout.write(`drill ok: ${result.lastDrillDetail}\n`);
       break;
     }
@@ -147,6 +179,21 @@ async function main() {
           process.stdout.write(`  ${k}\n`);
         }
       }
+      break;
+    }
+
+    case "export": {
+      // Hands the operator plaintext bytes, which is the whole point: an
+      // encrypted archive cannot be unpacked. Nothing is written back over
+      // the live data - where media belongs is the operator's call, not ours.
+      const target = findTarget(config, "backups", positional[0] ?? fail("usage: export <target> [artifact] [--to <file>]"));
+      if (target.type === "external") fail(`"${target.name}" is external (${target.note}); nothing is stored here to export`);
+      const name = positional[1] ?? (await latestArtifact(target, { store }));
+      const to = optionValue("--to");
+      const dest = to ? path.resolve(to) : path.join(store.tmpDir(), name.replace(/\.enc$/, ""));
+      const bytes = await loadArtifactBytes(target, name, { store });
+      await fsp.writeFile(dest, bytes, { mode: 0o600 });
+      process.stdout.write(`${dest}\n${formatBytes(bytes.length)}, decrypted - delete it when you are done\n`);
       break;
     }
 
@@ -243,10 +290,22 @@ async function main() {
         process.stdout.write(`  ${ICONS[s.status] ?? "?   "} ${name.padEnd(26)} ${s.detail}  (${s.at})\n`);
       }
       process.stdout.write("backups:\n");
-      for (const [name, s] of Object.entries(backups)) {
+      for (const target of config.backups) {
+        if (target.type === "external") {
+          process.stdout.write(`  EXT  ${target.name.padEnd(26)} outside this toolkit: ${target.note}\n`);
+          continue;
+        }
+        const s = backups[target.name];
+        if (!s) {
+          process.stdout.write(`  ?    ${target.name.padEnd(26)} never run\n`);
+          continue;
+        }
         process.stdout.write(
-          `  ${s.lastResult === "ok" ? "OK  " : "FAIL"} ${name.padEnd(26)} last ${s.lastSuccess ?? "never"}  ${s.lastDetail ?? ""}\n`,
+          `  ${s.lastResult === "ok" ? "OK  " : "FAIL"} ${target.name.padEnd(26)} last ${s.lastSuccess ?? "never"}  ${s.lastDetail ?? ""}\n`,
         );
+      }
+      for (const note of coverageNotes(config)) {
+        process.stdout.write(`\nheads up: ${note.title}\n  ${note.detail}\n`);
       }
       break;
     }

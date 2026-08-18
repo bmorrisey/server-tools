@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { validateConfig, withDefaults, loadConfig } from "../src/config.js";
+import { coverageNotes, validateConfig, withDefaults, loadConfig } from "../src/config.js";
 
 const minimal = {
   dataDir: "./data",
@@ -152,4 +152,86 @@ test("deploy source, project name, and services shape are validated", () => {
   assert.ok(problems.some((p) => p.includes("deploys[2].services must be a non-empty array")));
   assert.ok(problems.some((p) => p.includes("deploys[3].healthDelay")));
   assert.ok(problems.some((p) => p.includes("deploys[3].healthAttempts")));
+});
+
+test("a files target must say where the media lives", () => {
+  const problems = validateConfig(
+    withDefaults({
+      ...minimal,
+      backups: [
+        { name: "a", type: "files", encrypt: false },
+        { name: "b", type: "files", encrypt: false, source: {} },
+        { name: "c", type: "files", encrypt: false, source: { container: "app-1" } },
+        { name: "d", type: "files", encrypt: false, source: { volume: "v", container: "app-1", path: "/x" } },
+      ],
+    }),
+  );
+  assert.ok(problems.some((p) => p.includes("backups[0].path is required")));
+  assert.ok(problems.some((p) => p.includes('backups[1].source must name one of "volume"')));
+  assert.ok(problems.some((p) => p.includes("backups[2].source.container needs source.path")));
+  assert.ok(problems.some((p) => p.includes("backups[3].source names both a volume and a container")));
+});
+
+test("volume and container file sources validate", () => {
+  assert.deepEqual(
+    validateConfig(
+      withDefaults({
+        ...minimal,
+        backups: [
+          { name: "a", type: "files", encrypt: false, source: { volume: "app_media" } },
+          { name: "b", type: "files", encrypt: false, source: { container: "app-1", path: "/app/storage" } },
+          { name: "c", type: "files", encrypt: false, path: "/srv/media" },
+        ],
+      }),
+    ),
+    [],
+  );
+});
+
+test("an external target needs a note and copies nothing", () => {
+  const problems = validateConfig(
+    withDefaults({
+      ...minimal,
+      backups: [{ name: "media", type: "external", schedule: "03:30", retention: { daily: 1 }, s3: { bucket: "b" } }],
+    }),
+  );
+  assert.ok(problems.some((p) => p.includes("backups[0].note is required")));
+  assert.ok(problems.some((p) => p.includes("backups[0].schedule does not apply")));
+  assert.ok(problems.some((p) => p.includes("backups[0].retention does not apply")));
+  assert.ok(problems.some((p) => p.includes("backups[0].s3 does not apply")));
+  // No passphrase is demanded of a target that never writes an artifact.
+  assert.ok(!problems.some((p) => p.includes("passphrase")));
+
+  assert.deepEqual(
+    validateConfig(withDefaults({ ...minimal, backups: [{ name: "media", type: "external", note: "R2 bucket" }] })),
+    [],
+  );
+});
+
+test("a freshness check cannot watch a target that is never backed up here", () => {
+  const problems = validateConfig(
+    withDefaults({
+      ...minimal,
+      backups: [{ name: "media", type: "external", note: "R2 bucket" }],
+      checks: [
+        { name: "media-fresh", type: "backup-freshness", target: "media" },
+        { name: "ghost-fresh", type: "backup-freshness", target: "typo" },
+      ],
+    }),
+  );
+  assert.ok(problems.some((p) => p.includes("is an external target")));
+  assert.ok(problems.some((p) => p.includes('checks[1].target "typo" is not a configured backup target')));
+});
+
+test("coverageNotes asks once when every target is a database", () => {
+  const dbOnly = coverageNotes({ backups: [{ name: "db", type: "postgres" }] });
+  assert.equal(dbOnly.length, 1);
+  assert.equal(dbOnly[0].id, "media-not-declared");
+
+  // Either kind of media target answers the question.
+  assert.deepEqual(coverageNotes({ backups: [{ type: "postgres" }, { type: "files" }] }), []);
+  assert.deepEqual(coverageNotes({ backups: [{ type: "postgres" }, { type: "external" }] }), []);
+  // Nothing to say about a deployment with no database at all.
+  assert.deepEqual(coverageNotes({ backups: [] }), []);
+  assert.deepEqual(coverageNotes({}), []);
 });

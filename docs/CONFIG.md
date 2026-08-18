@@ -139,7 +139,7 @@ depths, pending jobs, orphan counts - anything you can print as a number).
 
 ## Backups
 
-Common fields: `name`, `type` (`postgres` | `files`), `schedule`,
+Common fields: `name`, `type` (`postgres` | `files` | `external`), `schedule`,
 `passphrase`, `encrypt`, `retention`, `s3`.
 
 - `schedule`: `"03:30"` (daily), `"sun 04:30"` (weekly), or an interval like
@@ -175,17 +175,79 @@ bytes are treated as failures (an empty dump never counts as success).
 
 ### `files` target
 
+Media, wherever it lives. `source` says which of three places that is, and
+it is always stated rather than inferred:
+
 ```json
-{ "name": "app-media", "type": "files", "path": "/apps/myapp/storage",
-  "schedule": "sun 04:30", "archive": false, "exclude": ["tmp"],
-  "passphrase": "${BACKUP_PASSPHRASE}" }
+{ "name": "app-media", "type": "files",
+  "source": { "volume": "myapp_media" },
+  "schedule": "05:30", "exclude": ["tmp"],
+  "passphrase": "${BACKUP_PASSPHRASE}",
+  "retention": { "daily": 7, "weekly": 4, "monthly": 6 } }
 ```
 
-Always writes a manifest (relative path, size, sha256 for every file) used
-for integrity verification. With `"archive": true` it also builds an
-encrypted `.tar.gz` of the tree and uploads it when `s3` is configured. For
-large media trees prefer `archive: false` plus provider-side replication, or
-schedule archives weekly.
+| `source` | Meaning |
+| --- | --- |
+| `{ "volume": "myapp_media" }` | A Docker volume. Read through a container that mounts it, so nothing needs bind-mounting into the agent. Optionally add `"path"` to copy a subdirectory of the mount. |
+| `{ "container": "myapp-app-1", "path": "/app/storage" }` | A path inside a container, volume mounts included. |
+| `{ "path": "/apps/myapp/storage" }` | A directory the agent can see itself (bind-mount it in). Equivalent to the older top-level `"path"`, which still works. |
+
+Volume and container sources are read with the Docker Engine's own copy
+endpoint, which works on **stopped** containers - a stack being down is
+exactly when someone reaches for a backup. A source that cannot be resolved
+(no such volume, nothing mounting it, no such container) fails the run. It
+never falls back to "a directory, probably", because the backup that
+produces looks complete and is not.
+
+Every run writes a manifest: the relative path, size, and sha256 of every
+file. `archive` adds a `.tar.gz` of the same bytes, encrypted like a database
+dump and uploaded when `s3` is configured. It defaults to **true** for
+targets that declare a `source`, because a manifest alone verifies a tree
+that still exists and restores nothing. Targets using the older top-level
+`path` keep the manifest-only default so existing configs do not suddenly
+start writing tarballs; set `"archive": true` on those when you want a real
+copy.
+
+`server-tools drill app-media` proves the artifact: it reads the archive back
+byte for byte and checks every file against the manifest that run wrote. For
+a manifest-only target it re-checks the live tree instead.
+
+### `external` target
+
+```json
+{ "name": "app-media", "type": "external",
+  "note": "Object storage bucket app-media, replicated by the provider" }
+```
+
+Backs up nothing, is never "fresh", and takes no `schedule`, `retention`, or
+`s3`. Its whole job is to be honest: media in an S3-compatible bucket is not
+backable by this toolkit in any useful sense, and does not need to be for a
+same-bucket restore - but it does mean the artifacts here are not
+self-contained, and that is exactly what an operator needs told before
+trusting them. Declaring one makes the dashboard say *media for this app is
+outside the toolkit* instead of saying nothing.
+
+A `backup-freshness` check cannot point at an external target; there is no
+freshness to have, and config validation says so.
+
+### Coverage
+
+A deployment whose backup targets are all `postgres` is either fine or half
+covered, and only you know which. The dashboard, `server-tools validate`, and
+`server-tools status` all say so once rather than showing green: a database
+restored without its media is not a restore - the app comes up, the pages
+render, and every image 404s. Adding a `files` target or an `external` target
+answers the question either way.
+
+### Artifacts on disk
+
+Every artifact is written to `<name>.part` and renamed on success, so a
+process that dies mid-write leaves nothing that looks like a backup. For
+`files` targets the manifest is written last, which makes its presence the
+completeness marker; a run that failed leaves a
+`<name>-<stamp>.failed.json` in the target directory saying what went wrong.
+Retention applies per run, so an archive and its manifest are kept or dropped
+together.
 
 ## Deploys
 

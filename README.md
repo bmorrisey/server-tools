@@ -16,8 +16,8 @@ agent trusts is Node itself.
 | --- | --- |
 | Health checks | HTTP (status/latency/JSON assertions), TCP, TLS cert expiry, disk, memory, load, container health, Postgres liveness, backup freshness, arbitrary in-container commands |
 | Alerting | Email (built-in SMTP client) and/or webhook (generic JSON or Discord-style); alerts fire on state change with a consecutive-failure threshold, and again on recovery |
-| Backups | Scheduled `pg_dump` streamed through gzip + AES-256-GCM, kept locally and optionally uploaded to any S3-compatible bucket; grandfather-father-son retention; file-tree manifests with integrity verification for media directories |
-| Restore | One-command restore, plus a `drill` command that restores the latest artifact into a scratch database and validates it, so you find out your backups work before you need them |
+| Backups | Scheduled `pg_dump` streamed through gzip + AES-256-GCM, kept locally and optionally uploaded to any S3-compatible bucket; grandfather-father-son retention. Media is covered too: a directory, a Docker volume, or a path inside a container (read straight from the Engine, so a stopped stack still backs up), each with a sha256 manifest. Media that lives in a bucket instead is declared `external` so the dashboard reports the recovery you actually have rather than showing green |
+| Restore | One-command restore, plus a `drill` command that proves an artifact before you need it: a database is restored into a scratch database and validated, a media archive is read back and checked file by file against its manifest |
 | Deploys | `server-tools deploy <app> <tag>`: pull a prebuilt image from a registry (nothing compiles on the box), re-point the stack, prove the named services are running that exact image, health-verify, and roll back to the previous tag automatically if it does not come up. Building from a git checkout on the box is still supported for single-app hosts |
 | Housekeeping | Prunes its own history, expires temp files, age-based cleanup of directories you configure |
 | Storage | A page that answers "what is eating my disk": images, container layers, volumes, build cache, and backups broken down by size and by Docker Compose project, plus previewed one-click cleanups. Volumes are reported but never deleted for you |
@@ -92,7 +92,7 @@ src/
   docker.js       Docker Engine API over the unix socket (no docker CLI needed)
   metrics.js      host cpu/mem/load/disk from /proc and statfs
   store.js        JSON state + JSONL history under dataDir (cat/jq friendly)
-  backup/         pg_dump + files backup, encryption, S3 SigV4, retention,
+  backup/         pg_dump + media backup, encryption, S3 SigV4, retention,
                   restore, drill
   deploy.js       registry pull or tag checkout + health gate + auto-rollback
   housekeep.js    history/temp/directory cleanup

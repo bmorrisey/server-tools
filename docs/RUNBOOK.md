@@ -78,9 +78,46 @@ The drill restores into a throwaway database (`st_drill_<timestamp>`) on the
 same container, reports table and row counts, then drops it. Run it monthly
 and after changing anything about backups. The result shows on the dashboard.
 
+### Scenario 4: restore media
+
+```bash
+server-tools drill app-media             # prove the archive first
+server-tools artifacts app-media         # find the archive to restore
+```
+
+A `files` drill reads the archive back and checks every file against the
+manifest that run wrote, so it proves the copy is intact without writing
+anything. To restore for real, decrypt the archive and unpack it where the
+media belongs:
+
+```bash
+server-tools export app-media                       # newest artifact
+server-tools export app-media <artifact> --to /tmp/media.tar.gz
+```
+
+`export` writes a decrypted `.tar.gz` and prints the path; it never writes
+back over live data, because where media belongs is your call. Unpack it into
+the volume through a container rather than writing to the volume's host path:
+
+```bash
+docker run --rm -i -v myapp_media:/restore alpine tar -xz -C /restore < /tmp/media.tar.gz
+```
+
+Delete the decrypted copy when you are done. A target marked `external` has
+nothing to restore from here; recover it from the provider.
+
+**Restore the database and the media together.** A database restored on its
+own comes up, renders every page, and 404s every image, which is the failure
+mode that looks like success.
+
 ## Backups stopped / backup-freshness is red
 
-1. `server-tools status` - read the last error recorded for the target.
+1. `server-tools status` - read the last error recorded for the target. It
+   also lists any target declared `external` and warns when databases are
+   backed up but no media target of either kind is configured.
+   The artifact directory carries the same news: a run that failed leaves a
+   `<name>-<stamp>.failed.json` beside the artifacts, and an archive with no
+   matching `.manifest.json` is a run that never finished.
 2. Common causes: database container renamed (fix config), disk full
    (`server-tools check disk-root`), S3 credentials rotated (update `.env`,
    `docker compose up -d` to reload), passphrase env var missing after an
@@ -145,7 +182,7 @@ The actions are deliberately conservative - none delete application data:
 | `reclaim-docker-space` | Removes unused Docker images + build cache | disk incidents |
 | `reclaim-build-cache`, `reclaim-dangling-images`, `remove-unused-images`, `remove-stopped-containers`, `trim-history` | Targeted disk reclamation, each previewed before it runs | the Storage page (see "Disk is filling up") |
 | `run-backup` | Runs a configured backup target now | backup-freshness incidents, and the Backups page |
-| `run-drill` | Restores the latest backup into a temporary database to prove it works, then removes it | the Backups page (database targets) |
+| `run-drill` | Proves a backup: a database target is restored into a temporary database and dropped again; a files target has its archive read back and checked against the manifest | the Backups page |
 
 The **Backups page** also carries "Back up now" and "Test restore" buttons for
 every target, so a routine backup or a restore drill is one click instead of a

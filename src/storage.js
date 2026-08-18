@@ -30,7 +30,8 @@
 import fsp from "node:fs/promises";
 import path from "node:path";
 import * as metrics from "./metrics.js";
-import { planRetention, dateFromArtifactName } from "./backup/retention.js";
+import { dateFromArtifactName } from "./backup/retention.js";
+import { planPrune } from "./backup/backup.js";
 import { parseDuration, formatBytes } from "./util.js";
 import { logger } from "./log.js";
 
@@ -387,15 +388,17 @@ export async function backupUsage(config, store) {
       totalBytes += st.size;
       files.push({ key: name, size: st.size, date: dateFromArtifactName(name) });
     }
-    const artifacts = files.filter((f) => f.date && !f.key.endsWith(".json"));
-    const plan = planRetention(artifacts, target.retention);
-    const dropped = artifacts.filter((f) => plan.drop.includes(f.key));
+    // Same plan the scheduler applies after every run, so the number shown is
+    // exactly what the button would delete.
+    const plan = planPrune(files.map((f) => f.key), target.retention);
+    const dropping = new Set(plan.drop);
+    const dropped = files.filter((f) => dropping.has(f.key));
     rows.push({
       name: target.name,
       fileCount: files.length,
-      artifactCount: artifacts.length,
+      artifactCount: files.filter((f) => f.date).length,
       totalBytes,
-      prunableCount: dropped.length,
+      prunableCount: plan.droppedRuns,
       prunableBytes: dropped.reduce((sum, f) => sum + f.size, 0),
       retention: target.retention ?? { daily: 7, weekly: 4, monthly: 6 },
     });
@@ -635,7 +638,7 @@ export function buildPlan(r) {
       kind: "safe",
       bytes: b.prunableBytes,
       count: b.prunableCount,
-      what: `Deletes ${b.prunableCount} backup artifact${b.prunableCount > 1 ? "s" : ""} that are already older than your retention policy (${b.retention.daily} daily, ${b.retention.weekly} weekly, ${b.retention.monthly} monthly).`,
+      what: `Deletes ${b.prunableCount} backup run${b.prunableCount > 1 ? "s" : ""} (artifacts and their manifests) already older than your retention policy (${b.retention.daily} daily, ${b.retention.weekly} weekly, ${b.retention.monthly} monthly).`,
       risk: "Removes only copies the schedule was going to remove anyway. Your most recent backups are kept.",
     });
   }

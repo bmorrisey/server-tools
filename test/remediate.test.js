@@ -100,10 +100,20 @@ test("runAction validates targets against config", async () => {
     assert.equal(r.ok, false);
     assert.match(r.message, /not a configured backup target/);
 
+    // A files target is drillable now; with nothing recorded it fails clearly
+    // rather than being refused for its type.
     const filesConfig = { checks: [], backups: [{ name: "media", type: "files", path: "/x" }] };
     r = await runAction("run-drill", { target: "media" }, { docker: null, store, config: filesConfig });
     assert.equal(r.ok, false);
-    assert.match(r.message, /apply to database targets/);
+    assert.match(r.message, /no manifest recorded/);
+
+    // An external target is declared, not copied, so there is nothing to run.
+    const externalConfig = { checks: [], backups: [{ name: "media", type: "external", note: "bucket elsewhere" }] };
+    for (const action of ["run-drill", "run-backup"]) {
+      r = await runAction(action, { target: "media" }, { docker: null, store, config: externalConfig });
+      assert.equal(r.ok, false);
+      assert.match(r.message, /external/);
+    }
 
     // Unknown action id.
     r = await runAction("format-c-drive", {}, { docker: null, store, config });

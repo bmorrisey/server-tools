@@ -13,7 +13,8 @@
     { "name": "disk-root", "type": "disk", "path": "/host", "warnPct": 80, "failPct": 92, "interval": "5m" },
     { "name": "memory", "type": "memory", "warnPct": 85, "failPct": 95, "interval": "2m" },
     { "name": "load", "type": "load", "warnPerCore": 1.5, "failPerCore": 3, "interval": "2m" },
-    { "name": "db-backup-fresh", "type": "backup-freshness", "target": "app-db", "warnAfter": "26h", "failAfter": "50h", "interval": "30m" }
+    { "name": "db-backup-fresh", "type": "backup-freshness", "target": "app-db", "warnAfter": "26h", "failAfter": "50h", "interval": "30m" },
+    { "name": "media-backup-fresh", "type": "backup-freshness", "target": "app-media", "warnAfter": "26h", "failAfter": "50h", "interval": "30m" }
   ],
 
   "backups": [
@@ -38,12 +39,16 @@
     {
       "name": "app-media",
       "type": "files",
-      "path": "/apps/myapp/storage",
-      "schedule": "sun 04:30",
+      "source": { "volume": "myapp_media" },
+      "schedule": "05:30",
       "passphrase": "${BACKUP_PASSPHRASE}",
-      "archive": false,
       "exclude": ["tmp"],
-      "retention": { "daily": 4, "weekly": 4, "monthly": 3 }
+      "retention": { "daily": 7, "weekly": 4, "monthly": 6 }
+    },
+    {
+      "name": "marketing-media",
+      "type": "external",
+      "note": "Object storage bucket marketing-assets; replicated by the provider, not copied here"
     }
   ],
 

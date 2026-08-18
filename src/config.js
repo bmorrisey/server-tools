@@ -59,15 +59,24 @@ export function validateConfig(cfg) {
     if (c.type === "disk") need(typeof c.path === "string", `${where}.path is required`);
     if (c.type === "container") need(typeof c.container === "string", `${where}.container is required`);
     if (c.type === "postgres") need(typeof c.container === "string", `${where}.container is required`);
-    if (c.type === "backup-freshness")
+    if (c.type === "backup-freshness") {
       need(typeof c.target === "string", `${where}.target (backup target name) is required`);
+      if (typeof c.target === "string") {
+        const target = (cfg.backups ?? []).find((b) => b.name === c.target);
+        need(Boolean(target), `${where}.target "${c.target}" is not a configured backup target, so it can never be fresh`);
+        need(
+          target?.type !== "external",
+          `${where}.target "${c.target}" is an external target; it is never backed up here, so freshness is not a thing to check`,
+        );
+      }
+    }
     if (c.type === "command") need(typeof c.command === "string", `${where}.command is required`);
   }
 
   for (const [i, b] of (cfg.backups ?? []).entries()) {
     const where = `backups[${i}]`;
     need(typeof b.name === "string" && b.name, `${where}.name is required`);
-    need(["postgres", "files"].includes(b.type), `${where}.type must be "postgres" or "files"`);
+    need(["postgres", "files", "external"].includes(b.type), `${where}.type must be "postgres", "files", or "external"`);
     if (b.schedule !== undefined)
       need(parseSchedule(b.schedule) !== null, `${where}.schedule "${b.schedule}" is not a valid schedule`);
     if (b.type === "postgres") {
@@ -75,8 +84,38 @@ export function validateConfig(cfg) {
       need(typeof b.database === "string", `${where}.database is required`);
       need(typeof b.user === "string", `${where}.user is required`);
     }
-    if (b.type === "files") need(typeof b.path === "string", `${where}.path is required`);
-    if (b.encrypt !== false)
+    if (b.type === "files") {
+      // Where the data lives is stated, never inferred: a target that guesses
+      // produces a partial backup that reads as a complete one.
+      const s = b.source;
+      if (s === undefined) {
+        need(typeof b.path === "string" && b.path, `${where}.path is required (or use "source")`);
+      } else {
+        need(s && typeof s === "object" && !Array.isArray(s), `${where}.source must be an object`);
+        if (s && typeof s === "object" && !Array.isArray(s)) {
+          const named = ["volume", "container", "path"].filter((k) => s[k] !== undefined);
+          need(
+            named.length > 0,
+            `${where}.source must name one of "volume", "container" (with "path"), or "path"`,
+          );
+          need(
+            !(s.volume !== undefined && s.container !== undefined),
+            `${where}.source names both a volume and a container; pick one`,
+          );
+          for (const k of named) need(typeof s[k] === "string" && s[k], `${where}.source.${k} must be a non-empty string`);
+          if (s.container !== undefined) need(typeof s.path === "string" && s.path, `${where}.source.container needs source.path`);
+        }
+      }
+    }
+    if (b.type === "external") {
+      // An external target exists to be honest about what is not covered, so
+      // the note is the whole point of it, and it must never look "fresh".
+      need(typeof b.note === "string" && b.note.trim(), `${where}.note is required for an external target (say where the data actually lives)`);
+      need(b.schedule === undefined, `${where}.schedule does not apply to an external target; nothing is copied`);
+      need(b.s3 === undefined, `${where}.s3 does not apply to an external target; nothing is copied`);
+      need(b.retention === undefined, `${where}.retention does not apply to an external target; nothing is copied`);
+    }
+    if (b.type !== "external" && b.encrypt !== false)
       need(
         typeof b.passphrase === "string" && b.passphrase.length >= 12,
         `${where}.passphrase must be set (>= 12 chars) unless encrypt is false; use "\${ENV_VAR}"`,
@@ -177,6 +216,36 @@ export function validateConfig(cfg) {
   }
 
   return problems;
+}
+
+/**
+ * Gaps in a deployment that only the operator can resolve.
+ *
+ * These are not validation errors - a box may legitimately have nothing but
+ * databases to back up. They exist because the one answer the dashboard must
+ * not give on its own is "all green" for a deployment whose media has never
+ * been backed up at all. A database restored without its media is not a
+ * restore: the app boots, the pages render, and every image 404s.
+ *
+ * Declaring an `external` target is a valid resolution: it says the media is
+ * outside this toolkit, which is a recovery shape an operator can plan for.
+ */
+export function coverageNotes(cfg) {
+  const notes = [];
+  const backups = cfg?.backups ?? [];
+  const databases = backups.filter((b) => b.type === "postgres");
+  const media = backups.filter((b) => b.type === "files" || b.type === "external");
+  if (databases.length > 0 && media.length === 0) {
+    notes.push({
+      id: "media-not-declared",
+      title: "Databases are backed up; media is not declared",
+      detail:
+        `All ${databases.length} backup target${databases.length > 1 ? "s are" : " is"} a database. ` +
+        "A database restored without its media is not a restore - the app comes up and every image 404s. " +
+        'Add a "files" target for media this toolkit can copy, or an "external" target naming where it lives instead.',
+    });
+  }
+  return notes;
 }
 
 /** Fill defaults the rest of the code relies on. */

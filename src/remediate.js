@@ -19,7 +19,7 @@
  * - Everything is described so the UI and the CLI render the same words.
  */
 import { runBackup, prune as pruneBackups } from "./backup/backup.js";
-import { drill } from "./backup/restore.js";
+import { drill, drillFiles } from "./backup/restore.js";
 import { housekeep } from "./housekeep.js";
 import * as storage from "./storage.js";
 import { formatBytes, parseDuration } from "./util.js";
@@ -312,6 +312,8 @@ export async function runAction(actionId, params, { docker, store, config }) {
       case "run-backup": {
         const target = configuredBackup(config, params.target);
         if (!target) return record(false, `"${params.target}" is not a configured backup target`);
+        if (target.type === "external")
+          return record(false, `"${target.name}" is declared as external (${target.note ?? "outside this toolkit"}); this toolkit does not copy it`);
         const result = await runBackup(target, { docker, store });
         return record(true, `Backup "${target.name}" complete: ${result.lastDetail}`);
       }
@@ -321,14 +323,17 @@ export async function runAction(actionId, params, { docker, store, config }) {
         if (!target) return record(false, `"${params.target}" is not a configured backup target`);
         const plan = await pruneBackups(target, { store });
         storage.invalidate();
-        return record(true, `Pruned ${plan.drop.length} old artifact(s) for "${target.name}".`);
+        return record(true, `Pruned ${plan.droppedRuns} old backup run(s) for "${target.name}".`);
       }
 
       case "run-drill": {
         const target = configuredBackup(config, params.target);
         if (!target) return record(false, `"${params.target}" is not a configured backup target`);
-        if (target.type !== "postgres") return record(false, `Restore drills apply to database targets; "${target.name}" is a files target`);
-        const result = await drill(target, { docker, store });
+        if (target.type === "external")
+          return record(false, `"${target.name}" is declared as external (${target.note ?? "outside this toolkit"}); there is nothing here to drill`);
+        if (target.type !== "postgres" && target.type !== "files")
+          return record(false, `Restore drills apply to database and files targets`);
+        const result = target.type === "postgres" ? await drill(target, { docker, store }) : await drillFiles(target, { store });
         return record(true, `Restore drill passed for "${target.name}": ${result.lastDrillDetail}`);
       }
 
