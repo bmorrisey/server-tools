@@ -13,7 +13,8 @@ import crypto from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { Store } from "../src/store.js";
 import { runBackup } from "../src/backup/backup.js";
-import { drillFiles, exportArtifact, verifyArchive } from "../src/backup/restore.js";
+import { Readable } from "node:stream";
+import { compareToManifest, drillFiles, exportArtifact, latestArtifact, verifyArchive } from "../src/backup/restore.js";
 import { scanTarStream } from "../src/backup/tar.js";
 
 function fixture() {
@@ -510,6 +511,84 @@ test("a manifest-only docker-sourced target says why it cannot be drilled", asyn
     const t = target({ archive: false });
     await runBackup(t, { docker: stubDocker(tarPath), store });
     await assert.rejects(() => drillFiles(t, { store }), /set "archive": true to make it provable/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a failed drill does not leak the file descriptor it was reading", async () => {
+  const { root, tarPath, store } = fixture();
+  try {
+    const t = target({ encrypt: true, passphrase: "a passphrase long enough" });
+    await runBackup(t, { docker: stubDocker(tarPath), store });
+    const dir = store.backupDir("media");
+    const name = fs.readdirSync(dir).find((f) => f.endsWith(".tar.gz.enc"));
+
+    // Decrypts cleanly, then fails in gunzip: the error travels the opposite
+    // way from a corrupt tag, so it is the direction that strands the source.
+    const { encryptStream } = await import("../src/backup/crypto.js");
+    const sink = fs.createWriteStream(path.join(dir, name));
+    await encryptStream("a passphrase long enough", Readable.from([Buffer.alloc(200_000, 0x41)]), sink);
+
+    const openArtifacts = () =>
+      fs
+        .readdirSync("/proc/self/fd")
+        .map((fd) => {
+          try {
+            return fs.readlinkSync(`/proc/self/fd/${fd}`);
+          } catch {
+            return "";
+          }
+        })
+        .filter((target) => target.includes(dir)).length;
+
+    const baseline = openArtifacts();
+    for (let i = 0; i < 6; i++) await verifyArchive(t, { store }).catch(() => {});
+    await new Promise((r) => setTimeout(r, 200));
+    // One descriptor per attempt, held for the life of the agent, on exactly
+    // the corrupt archive an operator retries.
+    assert.equal(openArtifacts(), baseline);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("export refuses to overwrite, leaving the existing file untouched", async () => {
+  const { root, tarPath, store } = fixture();
+  try {
+    const t = target();
+    await runBackup(t, { docker: stubDocker(tarPath), store });
+    const name = fs.readdirSync(store.backupDir("media")).find((f) => f.endsWith(".tar.gz"));
+    const dest = path.join(root, "taken.tar.gz");
+    fs.writeFileSync(dest, "something the operator cares about");
+    await assert.rejects(() => exportArtifact(t, name, dest, { store }), (e) => e.code === "EEXIST");
+    assert.equal(fs.readFileSync(dest, "utf8"), "something the operator cares about");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("an archive holding more than its manifest claims is a failed drill", async () => {
+  // The safety net under both the anchored excludes and the docker-source
+  // exclude refusal: if those ever diverge again, this is what notices.
+  const scan = { complete: true, totalBytes: 3, files: [{ path: "a", size: 1, sha256: "x" }, { path: "extra", size: 2, sha256: "y" }] };
+  const result = compareToManifest(scan, { files: [{ path: "a", size: 1, sha256: "x" }] });
+  assert.equal(result.ok, false);
+  assert.match(result.problems[0], /extra: in archive but not in the manifest/);
+});
+
+test("a concurrent partial write never shadows the finished artifact", async () => {
+  const { root, tarPath, store } = fixture();
+  try {
+    const t = target();
+    await runBackup(t, { docker: stubDocker(tarPath), store });
+    const dir = store.backupDir("media");
+    const name = fs.readdirSync(dir).find((f) => f.endsWith(".tar.gz"));
+    // ".part" sorts after the finished artifact of the same stamp, so picking
+    // it would fail the drill on a perfectly healthy target.
+    fs.writeFileSync(path.join(dir, `${name}.part`), "half a run");
+    assert.equal(await latestArtifact(t, { store }), name);
+    assert.equal((await drillFiles(t, { store })).lastDrillResult, "ok");
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

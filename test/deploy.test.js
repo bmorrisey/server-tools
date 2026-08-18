@@ -661,3 +661,83 @@ test("a rollback uses a locally present image when the registry is unreachable",
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("git mode looks again after health, and catches a service that boots then dies", async () => {
+  const dir = scratch();
+  try {
+    // `up` returns as soon as containers start, so the first check cannot see
+    // a worker that falls over a few seconds in. Registry mode takes a second
+    // look after health polling; git mode has the same exposure.
+    let inspects = 0;
+    const exec = async (cmd, args) => {
+      if (cmd === "git" && args.includes("rev-parse")) return { code: 0, stdout: "abc1234", stderr: "" };
+      if (cmd === "git" && args.includes("describe")) return { code: 0, stdout: "v1.0.0", stderr: "" };
+      if (args.includes("ps")) return { code: 0, stdout: "cid1", stderr: "" };
+      if (args[0] === "inspect") {
+        inspects++;
+        const state = inspects === 1 ? "running" : "exited";
+        return { code: 0, stdout: `cid1\tsha256:i\t${state}\t/legacy-worker-1`, stderr: "" };
+      }
+      return { code: 0, stdout: "", stderr: "" };
+    };
+    const store = fakeStore();
+    const target = { name: "legacy", dir, services: ["worker"], healthUrl: "http://127.0.0.1:1/health" };
+    const result = await deploy(target, "v2.0.0", { store, exec, health: healthy });
+    assert.equal(inspects, 2, "the second look is what makes this detectable");
+    assert.equal(result.ok, false);
+    assert.equal(result.rolledBack, true);
+    assert.match(result.detail, /did not stay up/);
+    assert.equal(store.deploys.legacy.kind, "rollback");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a one-off verification hiccup clears once the second look succeeds", async () => {
+  const dir = scratch();
+  try {
+    let calls = 0;
+    const exec = async (cmd, args) => {
+      if (cmd === "git" && args.includes("rev-parse")) return { code: 0, stdout: "abc1234", stderr: "" };
+      if (cmd === "git" && args.includes("describe")) return { code: 0, stdout: "v1.0.0", stderr: "" };
+      if (args.includes("ps")) {
+        calls++;
+        if (calls === 1) return { code: 1, stdout: "", stderr: "Cannot connect to the Docker daemon" };
+        return { code: 0, stdout: "cid1", stderr: "" };
+      }
+      if (args[0] === "inspect") return { code: 0, stdout: "cid1\tsha256:i\trunning\t/legacy-web-1", stderr: "" };
+      return { code: 0, stdout: "", stderr: "" };
+    };
+    const store = fakeStore();
+    const target = { name: "legacy", dir, services: ["web"], healthUrl: "http://127.0.0.1:1/health" };
+    const result = await deploy(target, "v2.0.0", { store, exec, health: healthy });
+    assert.equal(result.ok, true);
+    // Reporting a permanent warning for a hiccup a retry already cleared
+    // teaches operators to ignore the warning.
+    assert.equal(store.deploys.legacy.kind, "ok");
+    assert.doesNotMatch(result.detail, /could not verify/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a service missing from the compose file is not blamed on the build", async () => {
+  const dir = scratch();
+  try {
+    const exec = async (cmd, args) => {
+      if (cmd === "git" && args.includes("rev-parse")) return { code: 0, stdout: "abc1234", stderr: "" };
+      if (cmd === "git" && args.includes("describe")) return { code: 0, stdout: "v1.0.0", stderr: "" };
+      if (args.includes("ps")) return { code: 1, stdout: "", stderr: "no such service: worker" };
+      return { code: 0, stdout: "", stderr: "" };
+    };
+    const target = { name: "legacy", dir, services: ["worker"], healthUrl: "http://127.0.0.1:1/health" };
+    const result = await deploy(target, "v2.0.0", { store: null, exec, health: healthy });
+    assert.equal(result.ok, false);
+    // "build failed" would send the operator to build logs for a typo in the
+    // compose file.
+    assert.match(result.detail, /^rollout failed/);
+    assert.match(result.detail, /not in the compose file/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

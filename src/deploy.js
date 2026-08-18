@@ -356,6 +356,14 @@ export function verifyContainers(entries, { imageId = null } = {}) {
 function unverifiable(message) {
   const e = new Error(`could not verify services: ${message}`);
   e.unverifiable = true;
+  e.rollout = true;
+  return e;
+}
+
+/** A rollout that answered, and the answer was no. */
+function rolloutFailure(message) {
+  const e = new Error(message);
+  e.rollout = true;
   return e;
 }
 
@@ -377,7 +385,11 @@ async function inspectServices(exec, target, services) {
       const reason = (ps.stderr || ps.stdout).slice(-300);
       // "no such service" is a config error: leniency there would leave the
       // whole verification guarantee switched off for every deploy.
-      if (/no such service/i.test(reason)) throw new Error(`service "${service}" is not in the compose file`);
+      if (/no such service/i.test(reason)) {
+        const e = new Error(`service "${service}" is not in the compose file`);
+        e.rollout = true;
+        throw e;
+      }
       throw unverifiable(`docker compose ps failed: ${reason}`);
     }
     const ids = ps.stdout.split("\n").map((l) => l.trim()).filter(Boolean);
@@ -613,7 +625,7 @@ async function deployGit(target, ref, { store, dryRun, exec, health }) {
     if (target.services?.length) {
       try {
         const verify = verifyContainers(await inspectServices(exec, target, target.services));
-        if (!verify.ok) throw new Error(`services did not come up: ${verify.problems.join("; ")}`);
+        if (!verify.ok) throw rolloutFailure(`services did not come up: ${verify.problems.join("; ")}`);
       } catch (e) {
         // Same rule as registry mode: a read-only check that could not be
         // performed must not cause a write. Let the health gate decide - but
@@ -625,7 +637,10 @@ async function deployGit(target, ref, { store, dryRun, exec, health }) {
       }
     }
   } catch (e) {
-    const what = e.message.startsWith("services did not come up") ? "rollout" : "build";
+    // The build and the rollout fail for different reasons and are read in
+    // different logs, so the label has to come from the error rather than
+    // from matching its text.
+    const what = e.rollout ? "rollout" : "build";
     log.error(`${what} failed for ${target.name}; rolling back to ${from}`);
     await git(exec, dir, "checkout", from);
     await build().catch((e2) => log.error(`rollback build also failed: ${e2.message}`));
@@ -634,22 +649,38 @@ async function deployGit(target, ref, { store, dryRun, exec, health }) {
   }
 
   const healthResult = await health(target.healthUrl, healthWaitFor(target));
-  if (!healthResult.healthy) {
-    log.error(`health check failed after deploy of ${target.name}; rolling back to ${from}`);
+  const rollbackTo = async (reason) => {
+    log.error(`${reason} after deploy of ${target.name}; rolling back to ${from}`);
     await git(exec, dir, "checkout", from);
     await build().catch((e2) => log.error(`rollback build failed: ${e2.message}`));
     const rollbackHealth = await health(target.healthUrl, healthWaitFor(target));
     record(
       "rollback",
-      `health failed on ${ref} (${healthResult.lastError}); rolled back to ${fromRef} (${rollbackHealth.healthy ? "healthy" : "STILL UNHEALTHY"})`,
+      `${reason} on ${ref}; rolled back to ${fromRef} (${rollbackHealth.healthy ? "healthy" : "STILL UNHEALTHY"})`,
     );
     return {
       ok: false,
       from: fromRef,
       to: ref,
       rolledBack: true,
-      detail: `health check failed (${healthResult.lastError}); rolled back, now ${rollbackHealth.healthy ? "healthy" : "STILL UNHEALTHY - intervene"}`,
+      detail: `${reason}; rolled back, now ${rollbackHealth.healthy ? "healthy" : "STILL UNHEALTHY - intervene"}`,
     };
+  };
+
+  if (!healthResult.healthy) return rollbackTo(`health check failed (${healthResult.lastError})`);
+
+  // The same second look registry mode takes, for the same reason: `up`
+  // returns as soon as containers start, so the first check cannot see a
+  // worker that boots and dies a few seconds later.
+  if (target.services?.length) {
+    try {
+      const settled = verifyContainers(await inspectServices(exec, target, target.services));
+      if (!settled.ok) throw rolloutFailure(settled.problems.join("; "));
+      unproven = null;
+    } catch (e) {
+      if (!e.unverifiable) return rollbackTo(`services did not stay up (${e.message})`);
+      unproven = e.message;
+    }
   }
 
   const caveat = unproven ? `, but ${unproven}` : "";

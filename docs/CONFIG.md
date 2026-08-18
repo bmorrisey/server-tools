@@ -204,12 +204,11 @@ never falls back to "a directory, probably", because the backup that
 produces looks complete and is not.
 
 `exclude` applies to a `path` source only, and its entries are literal paths
-relative to the source root, not patterns: the archive and the manifest have
-to drop exactly the same files, or every restore drill fails from then on. The Engine hands back a volume or
-container subtree as one stream, so an exclusion there could only be applied
-to the manifest, leaving it describing something the archive does not
-contain and failing every restore drill from then on. Config validation
-refuses that combination; narrow `source.path` instead.
+relative to the source root, not patterns. The archive and the manifest have
+to drop exactly the same files, or every restore drill fails from then on.
+The Engine hands back a volume or container subtree as one stream, so an
+exclusion there could reach only the manifest; config validation refuses
+that combination, and narrowing `source.path` is how to do it instead.
 
 A run that finds no files fails rather than recording an empty backup, since
 an unmounted bind mount and an empty directory look identical afterwards and
@@ -257,10 +256,10 @@ freshness to have, and config validation says so.
 A `files` target counts as coverage only when it actually keeps a copy: a
 manifest-only target indexes media it does not back up, and gets a note of
 its own saying so. Give targets an optional `"app": "myapp"` and coverage is
-judged per application; without it the whole deployment is treated as one, which is the
-honest reading of a config that does not group itself. An application whose
-backup targets are all `postgres` is either fine or half covered, and only
-you know which. The dashboard, `server-tools validate`, and
+judged per application; without it the whole deployment is treated as one,
+which is the honest reading of a config that does not group itself. An
+application whose backup targets are all `postgres` is either fine or half
+covered, and only you know which. The dashboard, `server-tools validate`, and
 `server-tools status` all say so once rather than showing green: a database
 restored without its media is not a restore - the app comes up, the pages
 render, and every image 404s. Adding a `files` target or an `external` target
@@ -331,7 +330,7 @@ back on that image, and reports the rollback. A failure during the pull
 changes nothing at all and says so.
 
 Nothing compiles on the host, so a release cannot starve the other stacks
-sharing the box, and a rollback costs a pull rather than a second build. Two
+sharing the box, and a rollback costs a pull rather than a second build. Four
 consequences worth knowing:
 
 - `image` must not carry a tag or digest; the tag is the deploy argument. A
