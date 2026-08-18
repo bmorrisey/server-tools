@@ -21,12 +21,12 @@ test("composeArgs names the project when the target does", () => {
     "up",
     "-d",
   ]);
-  assert.deepEqual(composeArgs({ dir: "/apps/x", project: "gs-alpha" }, ["ps", "-a", "-q", "app"]), [
+  assert.deepEqual(composeArgs({ dir: "/apps/x", project: "myapp" }, ["ps", "-a", "-q", "app"]), [
     "compose",
     "--project-directory",
     "/apps/x",
     "-p",
-    "gs-alpha",
+    "myapp",
     "ps",
     "-a",
     "-q",
@@ -88,10 +88,10 @@ test("imageRef builds tag and digest references and rejects unsafe ones", () => 
 });
 
 test("parseInspectLines reads the docker inspect format and strips name slashes", () => {
-  const out = "sha256:cid1\tsha256:img1\trunning\t/gs-alpha-app-1\nsha256:cid2\tsha256:img1\texited\t/gs-alpha-worker-1\n";
+  const out = "sha256:cid1\tsha256:img1\trunning\t/myapp-app-1\nsha256:cid2\tsha256:img1\texited\t/myapp-worker-1\n";
   assert.deepEqual(parseInspectLines(out), [
-    { id: "sha256:cid1", image: "sha256:img1", status: "running", name: "gs-alpha-app-1" },
-    { id: "sha256:cid2", image: "sha256:img1", status: "exited", name: "gs-alpha-worker-1" },
+    { id: "sha256:cid1", image: "sha256:img1", status: "running", name: "myapp-app-1" },
+    { id: "sha256:cid2", image: "sha256:img1", status: "exited", name: "myapp-worker-1" },
   ]);
   assert.deepEqual(parseInspectLines(""), []);
   assert.deepEqual(parseInspectLines("garbage\n"), []);
@@ -737,6 +737,38 @@ test("a service missing from the compose file is not blamed on the build", async
     // compose file.
     assert.match(result.detail, /^rollout failed/);
     assert.match(result.detail, /not in the compose file/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("registry mode looks again after health too", async () => {
+  const dir = scratch();
+  try {
+    // Issue 8's second pitfall: `up` returns as soon as containers start, so
+    // the first check cannot see a container that dies four seconds in. This
+    // is the older of the two modes and was the less-tested one.
+    let inspects = 0;
+    const exec = async (cmd, args) => {
+      if (args[0] === "pull") return { code: 0, stdout: "", stderr: "" };
+      if (args[0] === "image" && args[1] === "inspect") return { code: 0, stdout: "sha256:new", stderr: "" };
+      if (args.includes("ps")) return { code: 0, stdout: "cid1", stderr: "" };
+      if (args[0] === "inspect") {
+        inspects++;
+        // Healthy on the first look, dead on the second, and healthy again
+        // once the rollback has put the previous image back.
+        const state = inspects === 2 ? "exited" : "running";
+        return { code: 0, stdout: `cid1\tsha256:new\t${state}\t/myapp-web-1`, stderr: "" };
+      }
+      return { code: 0, stdout: "", stderr: "" };
+    };
+    const result = await deploy(registryTarget(dir), "v2", { store: null, exec, health: healthy });
+    assert.ok(inspects >= 2, "the second look is what makes this detectable");
+    assert.equal(result.ok, false);
+    assert.equal(result.rolledBack, true);
+    assert.match(result.detail, /post-health check failed/);
+    assert.doesNotMatch(result.detail, /ALSO FAILED/);
+    assert.equal(readEnvVar(fs.readFileSync(path.join(dir, ".env"), "utf8"), "APP_IMAGE"), "ghcr.io/o/app:v1");
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

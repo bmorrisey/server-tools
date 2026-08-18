@@ -423,3 +423,16 @@ test("the deploys page distinguishes a registry target from one that builds here
   assert.match(html, /git - builds on this box/);
   assert.match(html, /project app/);
 });
+
+test("a deploy that succeeded with a caveat is not shown as a failure", () => {
+  // The CLI exits 0 and the events feed shows amber; a red pill here would
+  // contradict both.
+  const html = deploysPage({
+    session: uiSession,
+    deploys: { app: { kind: "warn", at: new Date().toISOString(), from: "v1", to: "v2", detail: "healthy, but could not verify services" } },
+    targets: [{ name: "app", dir: "/apps/app", project: "app", source: "registry", image: "ghcr.io/o/app" }],
+    events: [{ topic: "deploy", kind: "warn", name: "app", detail: "could not verify services" }],
+  });
+  assert.match(html, /status warn/);
+  assert.doesNotMatch(html, /status fail/);
+});

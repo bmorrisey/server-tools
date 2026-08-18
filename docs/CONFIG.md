@@ -302,6 +302,15 @@ registry mode it would outrank the image reference just written. Anything
 else a build genuinely needs from the agent's environment goes in
 `composeEnv`; anything the application needs belongs in its own `.env`.
 
+When a target lists `services`, both modes check them twice: once as soon as
+compose returns, and again after the health poll. The second look is the one
+that matters, because `up` returns the moment containers start and cannot
+see a worker that boots and dies a few seconds later - so a deploy can be
+rolled back *after* a passing health check, and the recorded detail says
+which check failed. If Docker cannot answer the question at all, that is
+reported as a caveat rather than treated as a failure: a read-only check
+should never be able to recreate a stack.
+
 On a box that runs a single stack, `docker compose` in the project directory
 resolves to the project you meant. On a box with several, the project name is
 derived from the directory and only errors if ports happen to collide, so it
@@ -360,16 +369,15 @@ The app's compose file, `.env`, and directory must be visible to the agent
 
 `server-tools deploy myapp v1.2.3` verifies the working tree is clean,
 fetches tags, checks out `v1.2.3`, runs `docker compose up -d --build`, polls
-`healthUrl`, and on build or health failure checks the previous commit back
-out, rebuilds, and reports the rollback.
+`healthUrl`, and on failure checks the previous commit back out, rebuilds,
+and reports the rollback.
 
 The build runs on the host, which is what makes this mode a poor fit for a
 box hosting anything else: compiling a front-end can take the load average
 into double digits for minutes, and the unrelated stacks feel it. Health
 polling is also weaker here than it looks, because the previous containers
 stay up and healthy for the whole build - so a poll can pass against the old
-release. Listing `services` closes part of that gap: after the build those
-services must be running before the deploy is believed.
+release. Listing `services` closes part of that gap.
 
 ## Housekeeping
 

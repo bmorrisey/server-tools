@@ -7,6 +7,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
@@ -589,6 +590,110 @@ test("a concurrent partial write never shadows the finished artifact", async () 
     fs.writeFileSync(path.join(dir, `${name}.part`), "half a run");
     assert.equal(await latestArtifact(t, { store }), name);
     assert.equal((await drillFiles(t, { store })).lastDrillResult, "ok");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a volume subpath resolves against the mount, not the container's cwd", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "st-sub-"));
+  try {
+    const src = path.join(root, "src");
+    fs.mkdirSync(path.join(src, "photos"), { recursive: true });
+    fs.writeFileSync(path.join(src, "photos", "one.jpg"), "x");
+    const tarPath = path.join(root, "sub.tar");
+    assert.equal(spawnSync("tar", ["-cf", tarPath, "-C", src, "photos"]).status, 0);
+    const store = new Store(path.join(root, "data"));
+    store.ensureDirs();
+
+    let asked = null;
+    const docker = {
+      findVolumeMount: async () => ({ id: "cid", name: "app-1", destination: "/data" }),
+      inspectVolume: async () => ({}),
+      findContainer: async () => ({ Id: "cid" }),
+      archive: async (_id, p) => {
+        asked = p;
+        return fs.createReadStream(tarPath);
+      },
+    };
+    await runBackup(
+      { name: "media", type: "files", source: { volume: "app_media", path: "photos" }, encrypt: false },
+      { docker, store },
+    );
+    // Sent to the Engine as "photos" it would resolve against the container's
+    // working directory and archive something else entirely.
+    assert.equal(asked, "/data/photos");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("nothing is written under its final name until it is complete", async () => {
+  const { root, tarPath, store } = fixture();
+  try {
+    // Both writers, checked by watching the directory while the run is in
+    // flight: a file that dies mid-write must not be left wearing a name that
+    // reads as a backup.
+    const dir = store.backupDir("media");
+    const seen = new Set();
+    const docker = stubDocker(tarPath, {
+      archive: async () => {
+        for (const f of fs.readdirSync(dir)) seen.add(f);
+        return fs.createReadStream(tarPath);
+      },
+    });
+    await runBackup(target(), { docker, store });
+    for (const f of seen) {
+      assert.ok(f.endsWith(".part"), `${f} was visible under its final name mid-run`);
+    }
+
+    // And the manifest, whose presence is what marks a run complete.
+    const manifestWrites = [];
+    const originalWriteFile = fsp.writeFile;
+    fsp.writeFile = async (p, ...rest) => {
+      if (String(p).includes("manifest")) manifestWrites.push(String(p));
+      return originalWriteFile(p, ...rest);
+    };
+    try {
+      await runBackup(target(), { docker: stubDocker(tarPath), store });
+    } finally {
+      fsp.writeFile = originalWriteFile;
+    }
+    assert.ok(manifestWrites.length > 0);
+    for (const p of manifestWrites) {
+      assert.ok(p.endsWith(".part"), `manifest written directly to ${p}`);
+    }
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a host-path archive is also written under .part first", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "st-part-"));
+  try {
+    const media = path.join(root, "media");
+    fs.mkdirSync(media, { recursive: true });
+    fs.writeFileSync(path.join(media, "a.txt"), "hello");
+    const store = new Store(path.join(root, "data"));
+    store.ensureDirs();
+    const dir = store.backupDir("media");
+
+    // The system tar writes this one, so watch which names it opens: a tar
+    // that dies partway must not leave a file whose size prints happily.
+    const opened = [];
+    const original = fs.createWriteStream;
+    fs.createWriteStream = (p, ...rest) => {
+      if (String(p).startsWith(dir)) opened.push(String(p));
+      return original(p, ...rest);
+    };
+    try {
+      await runBackup({ name: "media", type: "files", path: media, archive: true, encrypt: false }, { docker: null, store });
+    } finally {
+      fs.createWriteStream = original;
+    }
+    assert.ok(opened.length > 0);
+    for (const p of opened) assert.ok(p.endsWith(".part"), `${p} was opened under its final name`);
+    assert.equal(fs.readdirSync(dir).some((f) => f.endsWith(".part")), false);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
