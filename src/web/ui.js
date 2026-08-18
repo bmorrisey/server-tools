@@ -462,7 +462,7 @@ export function overviewPage({ session, host, checks, backups, backupTargets = [
     .map((t) =>
       statCard({
         label: `Backup: ${esc(t.name)}`,
-        value: '<span class="status external">&#8212; external</span>',
+        value: '<span class="status external">external</span>',
         detail: `outside this toolkit<br>${esc(t.note ?? "")}`,
       }),
     );
@@ -574,7 +574,7 @@ ${values.filter((v) => v !== null).length > 1 ? sparkline(values, { width: 640, 
  */
 function externalRow(t) {
   return `<tr>
-<td><span class="status external">&#8212; external</span></td>
+<td><span class="status external">external</span></td>
 <td>${esc(t.name)}<br><span class="detail">outside this toolkit</span></td>
 <td colspan="4"><span class="detail">${esc(t.note ?? "")}</span></td>
 <td><span class="detail">nothing to run</span></td>

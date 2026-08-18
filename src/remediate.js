@@ -321,6 +321,8 @@ export async function runAction(actionId, params, { docker, store, config }) {
       case "prune-backups": {
         const target = configuredBackup(config, params.target);
         if (!target) return record(false, `"${params.target}" is not a configured backup target`);
+        if (target.type === "external")
+          return record(false, `"${target.name}" is declared as external (${target.note ?? "outside this toolkit"}); it stores nothing here`);
         const plan = await pruneBackups(target, { store });
         storage.invalidate();
         return record(true, `Pruned ${plan.droppedRuns} old backup run(s) for "${target.name}".`);

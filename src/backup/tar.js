@@ -17,6 +17,9 @@ import crypto from "node:crypto";
 
 const BLOCK = 512;
 
+/** Long-name and PAX records are held in memory; this caps how much. */
+const MAX_META_BYTES = 1024 * 1024;
+
 /** Read a tar numeric field: octal, or GNU base-256 for large values. */
 function readNumber(buf) {
   if (buf.length && buf[0] & 0x80) {
@@ -27,7 +30,28 @@ function readNumber(buf) {
   const s = buf.toString("latin1").replace(/\0.*$/s, "").trim();
   if (!s) return 0;
   const n = parseInt(s, 8);
-  return Number.isFinite(n) ? n : 0;
+  // A size that is negative or not a number is a corrupt header, not a hint;
+  // letting it through produces a manifest with negative totals.
+  return Number.isFinite(n) && n >= 0 ? n : -1;
+}
+
+/**
+ * The ustar header checksum: the sum of every header byte with the checksum
+ * field itself read as spaces. Checking it is the standard defence against a
+ * desynced stream, where a data block happens to look like a plausible
+ * header and the rest of the archive is silently indexed as garbage.
+ */
+function headerChecksumOk(header) {
+  const stored = readNumber(header.subarray(148, 156));
+  if (stored < 0) return false;
+  let unsigned = 0;
+  let signed = 0;
+  for (let i = 0; i < BLOCK; i++) {
+    const b = i >= 148 && i < 156 ? 0x20 : header[i];
+    unsigned += b;
+    signed += b > 127 ? b - 256 : b;
+  }
+  return stored === unsigned || stored === signed;
 }
 
 function readString(buf) {
@@ -73,6 +97,8 @@ export class TarScanner {
     this.buf = Buffer.alloc(0);
     this.files = [];
     this.totalBytes = 0;
+    this.dropped = 0; // entries removed by `strip`, tracked so an archive
+    this.zeroBlocks = 0; // that yields nothing can be told from an empty one
     this.sawEnd = false;
     this.finished = false;
 
@@ -86,16 +112,30 @@ export class TarScanner {
   }
 
   update(chunk) {
-    if (this.finished) return;
+    // Past the end-of-archive marker there is only padding. Dropping it
+    // rather than buffering it keeps memory flat on a stream whose tail we
+    // do not control.
+    if (this.finished || this.sawEnd) return;
     this.buf = this.buf.length ? Buffer.concat([this.buf, chunk]) : Buffer.from(chunk);
     for (;;) {
       if (this.phase === "header") {
-        if (this.sawEnd || this.buf.length < BLOCK) return;
+        if (this.buf.length < BLOCK) return;
         const header = this.buf.subarray(0, BLOCK);
         this.buf = this.buf.subarray(BLOCK);
         if (header.every((b) => b === 0)) {
-          this.sawEnd = true;
-          return;
+          // The format ends an archive with two zero blocks. Treating one as
+          // the end would let a stray zero block truncate the index while
+          // still reporting the scan as complete.
+          if (++this.zeroBlocks >= 2) {
+            this.sawEnd = true;
+            this.buf = Buffer.alloc(0);
+            return;
+          }
+          continue;
+        }
+        this.zeroBlocks = 0;
+        if (!headerChecksumOk(header)) {
+          throw new Error("tar header checksum mismatch; the archive is corrupt or the stream desynced");
         }
         this.#startEntry(header);
         continue;
@@ -122,6 +162,7 @@ export class TarScanner {
 
   #startEntry(header) {
     const size = this.override.size ?? readNumber(header.subarray(124, 136));
+    if (size < 0) throw new Error("tar entry declares an invalid size; refusing to index a corrupt archive");
     const typeflag = String.fromCharCode(header[156] || 0x30);
     const prefix = readString(header.subarray(345, 500));
     const rawName = readString(header.subarray(0, 100));
@@ -133,11 +174,17 @@ export class TarScanner {
     this.padLeft = (BLOCK - (size % BLOCK)) % BLOCK;
 
     if (typeflag === "L" || typeflag === "K" || typeflag === "x" || typeflag === "g") {
+      // These records are metadata about the next entry, so they are held in
+      // memory. A header claiming a gigabyte of "metadata" is not one.
+      if (size > MAX_META_BYTES) {
+        throw new Error(`tar metadata record of ${size} bytes is implausible; refusing to buffer it`);
+      }
       this.collect = [];
       this.collectKind = typeflag;
     } else if (typeflag === "0" || typeflag === "\0" || typeflag === "7") {
       const path = normalizeEntryPath(name, this.strip);
       if (path) this.entry = { path, size, hash: crypto.createHash("sha256") };
+      else this.dropped++;
       this.override = {};
     } else {
       // Directories, links, devices: recorded by tar, nothing to hash.
@@ -179,7 +226,7 @@ export class TarScanner {
     this.finished = true;
     const clean = this.phase === "header" && !this.entry;
     const files = [...this.files].sort((a, b) => a.path.localeCompare(b.path));
-    return { files, totalBytes: this.totalBytes, complete: this.sawEnd && clean };
+    return { files, totalBytes: this.totalBytes, dropped: this.dropped, complete: this.sawEnd && clean };
   }
 }
 

@@ -184,9 +184,18 @@ stack) the tag is an image tag: the agent pulls it, writes the reference into
 the app's `.env`, recreates the stack without building, and confirms the
 listed services are running that exact image. Two prerequisites:
 
-- The box must already be logged in to the registry, as the user the agent
-  runs as: `docker login ghcr.io`. The toolkit never handles registry
-  credentials itself.
+- The box must already be logged in to the registry: `docker login ghcr.io`.
+  The toolkit never handles registry credentials itself. `docker login` is a
+  client-side operation that writes `~/.docker/config.json`, so when the
+  agent runs in a container that file has to be mounted in as well:
+
+  ```yaml
+      volumes:
+        - ~/.docker/config.json:/root/.docker/config.json:ro   # registry auth
+  ```
+
+  Without it every pull of a private image fails with an authentication
+  error, and the deploy reports that nothing was changed.
 - The app's compose file must reference the variable, with no fallback you
   would not want deployed:
 

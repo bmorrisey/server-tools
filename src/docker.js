@@ -208,6 +208,7 @@ export class Docker {
         (res) => {
           if (res.statusCode !== 200) {
             const chunks = [];
+            res.on("error", reject);
             res.on("data", (c) => chunks.push(c));
             res.on("end", () =>
               reject(

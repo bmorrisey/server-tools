@@ -29,6 +29,11 @@ services:
       - /:/host:ro
       # Application directories the deploy helper manages (read-write).
       # - /home/you/apps/myapp:/apps/myapp
+      # Registry credentials for "source": "registry" deploys. "docker login"
+      # writes this file on the host; the pull runs in here and needs to read
+      # it. Media in a volume or container needs no mount: it is read through
+      # the socket above.
+      # - /home/you/.docker/config.json:/root/.docker/config.json:ro
     ports:
       # Dashboard, bound to localhost only; put your reverse proxy in front.
       - "127.0.0.1:9090:9090"

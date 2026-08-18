@@ -28,6 +28,7 @@
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
+import { posix } from "node:path";
 import zlib from "node:zlib";
 import crypto from "node:crypto";
 import { spawn } from "node:child_process";
@@ -108,10 +109,24 @@ export function describeSource(src) {
 
 const PART_SUFFIX = ".part";
 
-/** Remove leftovers from a run that died mid-write. Never touches artifacts. */
-async function clearPartials(dir) {
+/**
+ * Remove leftovers from a run that died mid-write. Never touches artifacts.
+ *
+ * The in-process lock does not span processes: a manual `server-tools backup`
+ * can run while the agent is midway through a scheduled one. So this removes
+ * only this run's own partials (by stamp), or ones old enough that nothing
+ * can still be writing them. A live write keeps touching its file.
+ */
+async function clearPartials(dir, { stamp = null, staleMs = 60 * 60_000 } = {}) {
   for (const f of await fsp.readdir(dir).catch(() => [])) {
-    if (f.endsWith(PART_SUFFIX)) await fsp.rm(path.join(dir, f), { force: true });
+    if (!f.endsWith(PART_SUFFIX)) continue;
+    if (stamp && f.includes(stamp)) {
+      await fsp.rm(path.join(dir, f), { force: true });
+      continue;
+    }
+    if (stamp) continue;
+    const st = await fsp.stat(path.join(dir, f)).catch(() => null);
+    if (st && Date.now() - st.mtimeMs > staleMs) await fsp.rm(path.join(dir, f), { force: true });
   }
 }
 
@@ -132,11 +147,6 @@ async function markFailed(dir, target, stamp, message) {
 /* -------------------------------------------------------------------------
  * Runner
  * ---------------------------------------------------------------------- */
-
-/** True for targets this engine copies bytes for. */
-export function isBackable(target) {
-  return target?.type === "postgres" || target?.type === "files";
-}
 
 /** Run one backup target end to end. Returns the state patch it recorded. */
 export async function runBackup(target, { docker, store }) {
@@ -170,7 +180,9 @@ export async function runBackup(target, { docker, store }) {
       await prune(target, { store });
       return patch;
     } catch (e) {
-      await clearPartials(dir);
+      // Cleanup must never replace the error that caused it: the recorded
+      // reason is the only thing an operator has to go on.
+      await clearPartials(dir, { stamp }).catch(() => {});
       await markFailed(dir, target, stamp, e.message);
       const patch = { lastResult: "fail", lastDetail: e.message, lastAttempt: startedAt.toISOString() };
       recordResult(store, target, patch);
@@ -220,7 +232,7 @@ async function backupPostgres(target, stamp, { docker, store }) {
   let offsite = false;
   const s3 = s3For(target);
   if (s3) {
-    await s3.put(`${target.name}/${artifact}`, await fsp.readFile(localPath));
+    await s3.putFile(`${target.name}/${artifact}`, localPath);
     offsite = true;
   }
   return {
@@ -234,6 +246,29 @@ async function backupPostgres(target, stamp, { docker, store }) {
 /* -------------------------------------------------------------------------
  * files targets
  * ---------------------------------------------------------------------- */
+
+/**
+ * A run that copied nothing is a failure, not a small backup.
+ *
+ * The whole point of a media target is that "the app came up and every image
+ * 404s" must not be discoverable only at restore time. An unmounted bind
+ * mount, an empty volume destination, or a source path that is not a
+ * directory all produce an archive with nothing in it - and the drill would
+ * happily certify that archive against its equally empty manifest. Say no
+ * here, or allow it explicitly with "allowEmpty".
+ */
+function assertNotEmpty(target, manifest, src, { dropped = 0 } = {}) {
+  if (manifest.files.length > 0 || target.allowEmpty === true) return;
+  const where = describeSource(src);
+  if (dropped > 0) {
+    throw new Error(
+      `${where} is a file, not a directory; point "source.path" at the directory that holds the media`,
+    );
+  }
+  throw new Error(
+    `${where} holds no files; refusing to record an empty backup (set "allowEmpty": true if it really is empty)`,
+  );
+}
 
 async function backupFiles(target, stamp, { docker, store }) {
   const src = fileSource(target);
@@ -249,6 +284,7 @@ async function backupFiles(target, stamp, { docker, store }) {
 
   if (src.kind === "path") {
     manifest = await buildManifest(src.path, target.exclude ?? []);
+    assertNotEmpty(target, manifest, src);
     sizeBytes = manifest.totalBytes;
     if (archiving) {
       const tarPath = path.join(dir, tarName);
@@ -271,7 +307,7 @@ async function backupFiles(target, stamp, { docker, store }) {
   let offsite = false;
   const s3 = s3For(target);
   if (s3) {
-    if (archiving) await s3.put(`${target.name}/${artifact}`, await fsp.readFile(path.join(dir, artifact)));
+    if (archiving) await s3.putFile(`${target.name}/${artifact}`, path.join(dir, artifact));
     offsite = true;
   }
 
@@ -323,8 +359,8 @@ async function readThroughDocker(target, src, { docker, outPath, passphrase }) {
   const scan = new ScanThrough(scanner);
 
   let archiveBytes = 0;
-  if (outPath) {
-    const partPath = `${outPath}${PART_SUFFIX}`;
+  const partPath = outPath ? `${outPath}${PART_SUFFIX}` : null;
+  if (partPath) {
     const gzip = zlib.createGzip({ level: 6 });
     const file = fs.createWriteStream(partPath);
     if (passphrase) {
@@ -336,27 +372,28 @@ async function readThroughDocker(target, src, { docker, outPath, passphrase }) {
       await pipelineAsync(stream, scan, gzip, file);
     }
     archiveBytes = (await fsp.stat(partPath)).size;
-    await fsp.rename(partPath, outPath);
   } else {
     await pipelineAsync(stream, scan, new Writable({ write: (_c, _e, cb) => cb() }));
   }
 
+  // Everything that can disqualify this run is decided while the archive is
+  // still a .part file. Renaming first and checking after is how a truncated
+  // tarball ends up wearing a real artifact name.
   const result = scanner.finish();
   if (!result.complete) {
     throw new Error(`archive stream from ${describeSource(src)} ended mid-entry; refusing to record a partial backup`);
   }
-  const excluded = new Set(target.exclude ?? []);
-  const files = result.files.filter((f) => ![...excluded].some((p) => f.path === p || f.path.startsWith(`${p}/`)));
-  return {
-    manifest: {
-      root: null,
-      source: { ...src, container: containerName, containerPath },
-      generatedAt: new Date().toISOString(),
-      files,
-      totalBytes: files.reduce((sum, f) => sum + f.size, 0),
-    },
-    archiveBytes,
+  const manifest = {
+    root: null,
+    source: { ...src, container: containerName, containerPath },
+    generatedAt: new Date().toISOString(),
+    files: result.files,
+    totalBytes: result.files.reduce((sum, f) => sum + f.size, 0),
   };
+  assertNotEmpty(target, manifest, src, { dropped: result.dropped });
+
+  if (partPath) await fsp.rename(partPath, outPath);
+  return { manifest, archiveBytes };
 }
 
 /**
@@ -383,7 +420,11 @@ async function locateSource(docker, src, targetName) {
         : `files target "${targetName}": no volume named "${src.volume}" on this box`,
     );
   }
-  const containerPath = src.path ?? mount.destination;
+  // A volume's `path` names a subdirectory of the volume, so it resolves
+  // against where the volume is mounted. Sent to the Engine as-is it would
+  // resolve against the container's working directory instead, and archive
+  // something else entirely.
+  const containerPath = src.path ? posix.join(mount.destination, src.path) : mount.destination;
   return { containerId: mount.id, containerName: mount.name, containerPath };
 }
 
@@ -482,19 +523,43 @@ function tarGz(dir, outPath, passphrase, exclude = []) {
  * ---------------------------------------------------------------------- */
 
 const isPartial = (f) => f.endsWith(PART_SUFFIX);
+const isManifest = (f) => f.endsWith(".manifest.json");
+const isFailureMarker = (f) => f.endsWith(".failed.json");
 const stampOf = (f) => f.match(/\d{8}-\d{6}/)?.[0] ?? null;
+
+/**
+ * Whether the files left by one run add up to something restorable.
+ *
+ * This has to agree with the rule the writer follows, or retention will hand
+ * a slot to a run that cannot be restored and evict one that can. A files
+ * target writes its manifest last precisely so that its presence means "this
+ * finished": an archive without one is the wreckage of a run that died after
+ * renaming the tar into place. A postgres run has no manifest, so its dump is
+ * the whole artifact.
+ */
+export function runIsRestorable(files, type) {
+  if (type === "files") return files.some(isManifest);
+  return files.some((f) => !f.endsWith(".json") && !isFailureMarker(f));
+}
 
 /**
  * What a prune would remove from a target directory, as a pure function over
  * the file names.
  *
- * Retention applies per run, not per file. A run leaves an archive and a
- * manifest, or (for a manifest-only target) just a manifest, or (when it
- * failed) just a marker - and dropping one of those without the others leaves
- * the directory lying about what is in it. Files that are partial writes are
- * never runs, and a failure marker is never mistaken for a backup.
+ * Retention applies per run, not per file: a run leaves an archive and a
+ * manifest, or just a manifest, or (when it failed) just a marker, and
+ * dropping one of those without the others leaves the directory lying about
+ * what is in it.
+ *
+ * Only restorable runs get a retention slot. Anything else - a failure
+ * marker, an archive whose manifest never arrived - is kept while it is still
+ * recent enough to be telling you something, and dropped once everything
+ * retained is newer than it. Counting those as backups is how two bad nights
+ * in a row would delete the last good one.
  */
-export function planPrune(names, retention) {
+const MAX_FAILURE_MARKERS = 10;
+
+export function planPrune(names, retention, { type = "postgres" } = {}) {
   const partials = [];
   const runs = new Map();
   for (const name of names) {
@@ -504,11 +569,11 @@ export function planPrune(names, retention) {
     }
     const stamp = stampOf(name);
     if (!stamp) continue;
-    const run = runs.get(stamp) ?? { stamp, files: [], backup: false };
+    const run = runs.get(stamp) ?? { stamp, files: [] };
     run.files.push(name);
-    if (!name.endsWith(".failed.json")) run.backup = true;
     runs.set(stamp, run);
   }
+  for (const run of runs.values()) run.backup = runIsRestorable(run.files, type);
 
   const backups = [...runs.values()].filter((r) => r.backup);
   const plan = planRetention(
@@ -517,12 +582,21 @@ export function planPrune(names, retention) {
   );
   const oldestKept = [...plan.keep].sort()[0] ?? null;
 
+  // A target that has never succeeded has no retained run to measure its
+  // markers against, so cap them by count as well: an hourly schedule against
+  // a misconfigured source would otherwise write thousands of them a year.
+  const failedStamps = [...runs.values()]
+    .filter((r) => !r.backup)
+    .map((r) => r.stamp)
+    .sort();
+  const excessFailures = new Set(failedStamps.slice(0, Math.max(0, failedStamps.length - MAX_FAILURE_MARKERS)));
+
   const drop = [];
   let droppedRuns = 0;
   for (const run of [...runs.values()].sort((a, b) => a.stamp.localeCompare(b.stamp))) {
-    // A failure marker outlives the run it describes, but not the backups it
-    // sits beside: once everything retained is newer, it has nothing to say.
-    const stale = run.backup ? !plan.keep.has(run.stamp) : oldestKept !== null && run.stamp < oldestKept;
+    const stale = run.backup
+      ? !plan.keep.has(run.stamp)
+      : (oldestKept !== null && run.stamp < oldestKept) || excessFailures.has(run.stamp);
     if (!stale) continue;
     drop.push(...run.files);
     droppedRuns++;
@@ -533,14 +607,14 @@ export function planPrune(names, retention) {
 /** Apply GFS retention to local artifacts and (when configured) offsite. */
 export async function prune(target, { store }) {
   const dir = store.backupDir(target.name);
-  const plan = planPrune(await fsp.readdir(dir), target.retention);
+  const plan = planPrune(await fsp.readdir(dir), target.retention, { type: target.type });
   for (const key of plan.drop) {
     await fsp.rm(path.join(dir, key), { force: true });
   }
 
   const s3 = s3For(target);
   if (s3) {
-    const remotePlan = planPrune(await s3.list(`${target.name}/`), target.retention);
+    const remotePlan = planPrune(await s3.list(`${target.name}/`), target.retention, { type: target.type });
     for (const key of remotePlan.drop) await s3.delete(key);
     if (remotePlan.drop.length) log.info(`pruned ${remotePlan.droppedRuns} offsite runs for ${target.name}`);
   }

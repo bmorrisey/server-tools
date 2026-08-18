@@ -188,7 +188,7 @@ it is always stated rather than inferred:
 
 | `source` | Meaning |
 | --- | --- |
-| `{ "volume": "myapp_media" }` | A Docker volume. Read through a container that mounts it, so nothing needs bind-mounting into the agent. Optionally add `"path"` to copy a subdirectory of the mount. |
+| `{ "volume": "myapp_media" }` | A Docker volume. Read through a container that mounts it, so nothing needs bind-mounting into the agent. Add `"path"` to copy a subdirectory: it resolves against wherever the volume is mounted. |
 | `{ "container": "myapp-app-1", "path": "/app/storage" }` | A path inside a container, volume mounts included. |
 | `{ "path": "/apps/myapp/storage" }` | A directory the agent can see itself (bind-mount it in). Equivalent to the older top-level `"path"`, which still works. |
 
@@ -198,6 +198,17 @@ exactly when someone reaches for a backup. A source that cannot be resolved
 (no such volume, nothing mounting it, no such container) fails the run. It
 never falls back to "a directory, probably", because the backup that
 produces looks complete and is not.
+
+`exclude` applies to a `path` source only. The Engine hands back a volume or
+container subtree as one stream, so an exclusion there could only be applied
+to the manifest, leaving it describing something the archive does not
+contain and failing every restore drill from then on. Config validation
+refuses that combination; narrow `source.path` instead.
+
+A run that finds no files fails rather than recording an empty backup, since
+an unmounted bind mount and an empty directory look identical afterwards and
+the drill would certify either. Set `"allowEmpty": true` if a target really
+can be empty.
 
 Every run writes a manifest: the relative path, size, and sha256 of every
 file. `archive` adds a `.tar.gz` of the same bytes, encrypted like a database
@@ -232,8 +243,11 @@ freshness to have, and config validation says so.
 
 ### Coverage
 
-A deployment whose backup targets are all `postgres` is either fine or half
-covered, and only you know which. The dashboard, `server-tools validate`, and
+Give targets an optional `"app": "myapp"` and coverage is judged per
+application; without it the whole deployment is treated as one, which is the
+honest reading of a config that does not group itself. An application whose
+backup targets are all `postgres` is either fine or half covered, and only
+you know which. The dashboard, `server-tools validate`, and
 `server-tools status` all say so once rather than showing green: a database
 restored without its media is not a restore - the app comes up, the pages
 render, and every image 404s. Adding a `files` target or an `external` target
@@ -258,7 +272,9 @@ Common fields: `name`, `dir` (the compose project directory), `healthUrl`,
 | --- | --- | --- |
 | `source` | `"git"` | `"git"` builds on the box from a checkout; `"registry"` pulls an already-built image by tag. |
 | `project` | derived from `dir` | The `docker compose -p` project name. Required for `registry`; strongly recommended everywhere else (see below). |
-| `services` | none | Compose services that must end up running the new release. Required for `registry`. |
+| `services` | none | Compose services that must end up running the new release. Required for `registry`. A one-shot service that exits 0 (a migration job) will fail this check; leave it off the list. |
+| `image` | none | Registry repository, with no tag or digest. Required for `registry`. |
+| `imageEnvVar` | `"APP_IMAGE"` | The variable written into the target's `.env` and referenced from the compose file. |
 | `healthAttempts` | `20` | How many times to poll `healthUrl`. |
 | `healthDelay` | `"6s"` | Wait between polls. |
 
@@ -284,9 +300,10 @@ for that stack.
 writes `APP_IMAGE=ghcr.io/owner/myapp:v1.2.3` into `<dir>/.env`, runs
 `docker compose -p myapp up -d --no-build`, confirms every container of every
 listed service is `running` **and** on the image ID that was just pulled,
-then polls `healthUrl`. On any failure it re-points `APP_IMAGE` at the value
-that was in `.env` before, brings the stack back on that image, and reports
-the rollback.
+then polls `healthUrl`. On any failure after the pull it restores `.env` to the
+exact bytes it had before (comments and quoting included), brings the stack
+back on that image, and reports the rollback. A failure during the pull
+changes nothing at all and says so.
 
 Nothing compiles on the host, so a release cannot starve the other stacks
 sharing the box, and a rollback costs a pull rather than a second build. Two
@@ -301,6 +318,10 @@ consequences worth knowing:
   not want deployed.
 - Rollback needs a previous value in `.env`. On the very first registry
   deploy there is none, and the toolkit says so rather than guessing a tag.
+- Compose is run with a deliberately minimal environment (enough to reach
+  Docker, nothing more). Everything the application needs must come from its
+  own `.env`; the agent's environment holds the toolkit's own secrets, and a
+  name collision there would otherwise be handed to your containers.
 
 The app's compose file, `.env`, and directory must be visible to the agent
 (bind-mount it into the container at the same path you configure).

@@ -69,6 +69,28 @@ function findTarget(config, kind, name) {
 
 const ICONS = { ok: "OK  ", warn: "WARN", fail: "FAIL" };
 
+/**
+ * How to unpack an exported archive.
+ *
+ * An archive read out of a volume or container is rooted at the name of the
+ * directory that was copied; one built from a host path is not. Restoring the
+ * first without stripping that component puts every file one directory too
+ * deep, which looks like it worked and 404s every image.
+ */
+async function extractionHint(target, artifact, store) {
+  if (target.type !== "files" || artifact.endsWith(".json")) return null;
+  const stamp = artifact.match(/\d{8}-\d{6}/)?.[0];
+  if (!stamp) return null;
+  const manifestPath = path.join(store.backupDir(target.name), `${target.name}-${stamp}.manifest.json`);
+  const manifest = await fsp
+    .readFile(manifestPath, "utf8")
+    .then(JSON.parse)
+    .catch(() => null);
+  if (!manifest) return "no manifest for this run, so it was never verified as complete; check it before trusting it";
+  const strip = manifest.root ? "" : " --strip-components=1";
+  return `tar -xz${strip} -C <destination> -f <file>`;
+}
+
 async function main() {
   if (!command || command === "help" || command === "--help" || flags.has("--help")) {
     const header = (await import("node:fs")).readFileSync(new URL(import.meta.url), "utf8");
@@ -189,11 +211,31 @@ async function main() {
       const target = findTarget(config, "backups", positional[0] ?? fail("usage: export <target> [artifact] [--to <file>]"));
       if (target.type === "external") fail(`"${target.name}" is external (${target.note}); nothing is stored here to export`);
       const name = positional[1] ?? (await latestArtifact(target, { store }));
+      const extractHint = await extractionHint(target, name, store);
       const to = optionValue("--to");
       const dest = to ? path.resolve(to) : path.join(store.tmpDir(), name.replace(/\.enc$/, ""));
       const bytes = await loadArtifactBytes(target, name, { store });
-      await fsp.writeFile(dest, bytes, { mode: 0o600 });
-      process.stdout.write(`${dest}\n${formatBytes(bytes.length)}, decrypted - delete it when you are done\n`);
+      // Exclusive create: this writes plaintext application data, so it must
+      // never land on top of a file the operator was not shown, and never
+      // inherit that file's permissions ("mode" is ignored for an existing
+      // file, which is exactly the wrong moment to be relaxed about it).
+      let handle;
+      try {
+        handle = await fsp.open(dest, "wx", 0o600);
+      } catch (e) {
+        if (e.code === "EEXIST") fail(`${dest} already exists; pass a different --to rather than overwriting it`);
+        throw e;
+      }
+      try {
+        await handle.writeFile(bytes);
+      } finally {
+        await handle.close();
+      }
+      process.stdout.write(
+        `${dest}\n${formatBytes(bytes.length)}, decrypted - delete it when you are done` +
+          `${to ? "" : " (housekeeping clears the temp directory on its own schedule)"}\n`,
+      );
+      if (extractHint) process.stdout.write(`unpack with: ${extractHint}\n`);
       break;
     }
 

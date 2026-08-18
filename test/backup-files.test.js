@@ -203,16 +203,53 @@ test("a volume that exists but nothing mounts says so rather than producing an e
   }
 });
 
-test("excludes still apply to media read through docker", async () => {
-  const { root, tarPath, store } = fixture();
+test("a source that holds nothing is a failure, not a small backup", async () => {
+  const { root, store } = fixture();
   try {
-    const patch = await runBackup(target({ exclude: ["photos"] }), { docker: stubDocker(tarPath), store });
-    assert.match(patch.lastDetail, /^1 files/);
-    const dir = store.backupDir("media");
-    const manifest = JSON.parse(
-      fs.readFileSync(path.join(dir, fs.readdirSync(dir).find((f) => f.endsWith(".manifest.json"))), "utf8"),
+    const empty = path.join(root, "empty");
+    fs.mkdirSync(path.join(empty, "storage"), { recursive: true });
+    const emptyTar = path.join(root, "empty.tar");
+    assert.equal(spawnSync("tar", ["-cf", emptyTar, "-C", empty, "storage"]).status, 0);
+    await assert.rejects(
+      () => runBackup(target(), { docker: stubDocker(emptyTar), store }),
+      /holds no files/,
     );
-    assert.deepEqual(manifest.files.map((f) => f.path), ["notes.txt"]);
+    const files = fs.readdirSync(store.backupDir("media"));
+    assert.equal(files.filter((f) => f.endsWith(".tar.gz")).length, 0);
+    assert.equal(files.filter((f) => f.endsWith(".failed.json")).length, 1);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("an empty source can be accepted deliberately", async () => {
+  const { root, store } = fixture();
+  try {
+    const empty = path.join(root, "empty");
+    fs.mkdirSync(path.join(empty, "storage"), { recursive: true });
+    const emptyTar = path.join(root, "empty.tar");
+    spawnSync("tar", ["-cf", emptyTar, "-C", empty, "storage"]);
+    const patch = await runBackup(target({ allowEmpty: true }), { docker: stubDocker(emptyTar), store });
+    assert.equal(patch.lastResult, "ok");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a source pointing at a file rather than a directory says so", async () => {
+  const { root, store } = fixture();
+  try {
+    // The Engine roots a single-file archive at the file name, which the
+    // one-component strip removes; that must not read as "no files".
+    const single = path.join(root, "single");
+    fs.mkdirSync(single, { recursive: true });
+    fs.writeFileSync(path.join(single, "app.db"), "not a directory");
+    const singleTar = path.join(root, "single.tar");
+    assert.equal(spawnSync("tar", ["-cf", singleTar, "-C", single, "app.db"]).status, 0);
+    await assert.rejects(
+      () => runBackup(target(), { docker: stubDocker(singleTar), store }),
+      /is a file, not a directory/,
+    );
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

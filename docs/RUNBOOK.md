@@ -95,15 +95,29 @@ server-tools export app-media                       # newest artifact
 server-tools export app-media <artifact> --to /tmp/media.tar.gz
 ```
 
-`export` writes a decrypted `.tar.gz` and prints the path; it never writes
-back over live data, because where media belongs is your call. Unpack it into
-the volume through a container rather than writing to the volume's host path:
+`export` writes a decrypted `.tar.gz`, prints the path, refuses to overwrite
+an existing file, and prints the exact `tar` flags for that archive. Use them:
+an archive read out of a volume or container is rooted at the name of the
+directory that was copied, so unpacking it without `--strip-components=1`
+puts every file one level too deep. That looks like it worked and 404s every
+image, which is the failure this whole feature exists to prevent.
+
+Unpack into the volume through a container rather than writing to the
+volume's host path:
 
 ```bash
-docker run --rm -i -v myapp_media:/restore alpine tar -xz -C /restore < /tmp/media.tar.gz
+# volume or container source (archive rooted at the directory name)
+docker run --rm -i -v myapp_media:/restore alpine \
+  tar -xz --strip-components=1 -C /restore < /tmp/media.tar.gz
+
+# path source (already relative)
+docker run --rm -i -v myapp_media:/restore alpine \
+  tar -xz -C /restore < /tmp/media.tar.gz
 ```
 
-Delete the decrypted copy when you are done. A target marked `external` has
+Delete the decrypted copy when you are done; with no `--to` it lands in the
+data directory's temp folder, which housekeeping only clears on its own
+schedule (`tmpAge`, 2 days by default). A target marked `external` has
 nothing to restore from here; recover it from the provider.
 
 **Restore the database and the media together.** A database restored on its

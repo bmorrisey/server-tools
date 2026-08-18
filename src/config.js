@@ -77,6 +77,8 @@ export function validateConfig(cfg) {
     const where = `backups[${i}]`;
     need(typeof b.name === "string" && b.name, `${where}.name is required`);
     need(["postgres", "files", "external"].includes(b.type), `${where}.type must be "postgres", "files", or "external"`);
+    if (b.app !== undefined)
+      need(typeof b.app === "string" && b.app.trim(), `${where}.app must be a non-empty application name`);
     if (b.schedule !== undefined)
       need(parseSchedule(b.schedule) !== null, `${where}.schedule "${b.schedule}" is not a valid schedule`);
     if (b.type === "postgres") {
@@ -104,8 +106,23 @@ export function validateConfig(cfg) {
           );
           for (const k of named) need(typeof s[k] === "string" && s[k], `${where}.source.${k} must be a non-empty string`);
           if (s.container !== undefined) need(typeof s.path === "string" && s.path, `${where}.source.container needs source.path`);
+          // The Engine hands back the whole subtree in one stream, so an
+          // exclude could only be applied to the manifest, leaving it
+          // describing something the archive does not contain and failing
+          // every restore drill from then on. Narrow the source instead.
+          need(
+            !(b.exclude !== undefined && (s.volume !== undefined || s.container !== undefined)),
+            `${where}.exclude cannot be applied to a volume or container source; point source.path at a narrower directory instead`,
+          );
         }
       }
+      if (b.exclude !== undefined)
+        need(
+          Array.isArray(b.exclude) && b.exclude.every((x) => typeof x === "string" && x),
+          `${where}.exclude must be an array of relative paths`,
+        );
+      if (b.allowEmpty !== undefined)
+        need(typeof b.allowEmpty === "boolean", `${where}.allowEmpty must be true or false`);
     }
     if (b.type === "external") {
       // An external target exists to be honest about what is not covered, so
@@ -130,6 +147,14 @@ export function validateConfig(cfg) {
         if (b.retention[k] !== undefined)
           need(Number.isInteger(b.retention[k]) && b.retention[k] >= 0, `${where}.retention.${k} must be a non-negative integer`);
       }
+      // Every one of them zero means "delete the backup you just took". The
+      // dashboard offers pruning as a safe action on the promise that recent
+      // backups survive it, so a policy that keeps nothing is refused here.
+      const counts = ["daily", "weekly", "monthly"].map((k) => b.retention[k] ?? 0);
+      need(
+        counts.some((n) => Number.isInteger(n) && n > 0),
+        `${where}.retention must keep at least one backup; all-zero would delete every artifact including the newest`,
+      );
     }
   }
 
@@ -147,8 +172,10 @@ export function validateConfig(cfg) {
       );
     if (d.services !== undefined)
       need(
-        Array.isArray(d.services) && d.services.length > 0 && d.services.every((s) => typeof s === "string" && s),
-        `${where}.services must be a non-empty array of compose service names`,
+        Array.isArray(d.services) &&
+          d.services.length > 0 &&
+          d.services.every((s) => typeof s === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(s)),
+        `${where}.services must be a non-empty array of compose service names (a name starting with "-" would be read as a flag)`,
       );
     if (d.healthAttempts !== undefined)
       need(Number.isInteger(d.healthAttempts) && d.healthAttempts > 0, `${where}.healthAttempts must be a positive integer`);
@@ -159,6 +186,11 @@ export function validateConfig(cfg) {
       // derived from the directory, so the project name is stated, not guessed.
       need(typeof d.project === "string" && d.project, `${where}.project is required for registry deploys (the "docker compose -p" name)`);
       need(typeof d.image === "string" && d.image, `${where}.image is required for registry deploys (repository without a tag)`);
+      if (typeof d.image === "string" && d.image)
+        need(
+          /^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(d.image),
+          `${where}.image is not a valid image repository name`,
+        );
       if (typeof d.image === "string" && d.image)
         need(
           !d.image.split("/").pop().includes(":") && !d.image.includes("@"),
@@ -231,16 +263,33 @@ export function validateConfig(cfg) {
  * outside this toolkit, which is a recovery shape an operator can plan for.
  */
 export function coverageNotes(cfg) {
-  const notes = [];
   const backups = cfg?.backups ?? [];
-  const databases = backups.filter((b) => b.type === "postgres");
-  const media = backups.filter((b) => b.type === "files" || b.type === "external");
-  if (databases.length > 0 && media.length === 0) {
+  // Targets can name the application they belong to. When they do, coverage
+  // is judged per application, because "some app on this box backs up media"
+  // says nothing about the one being restored. Without that grouping the
+  // whole deployment is treated as one, which is the honest reading of a
+  // config that does not say otherwise.
+  const groups = new Map();
+  for (const b of backups) {
+    const key = typeof b.app === "string" && b.app ? b.app : "";
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(b);
+  }
+
+  const notes = [];
+  for (const [app, targets] of groups) {
+    const databases = targets.filter((b) => b.type === "postgres");
+    const media = targets.filter((b) => b.type === "files" || b.type === "external");
+    if (databases.length === 0 || media.length > 0) continue;
+    const which = app ? `"${app}"` : "this deployment";
     notes.push({
-      id: "media-not-declared",
-      title: "Databases are backed up; media is not declared",
+      id: app ? `media-not-declared:${app}` : "media-not-declared",
+      app: app || null,
+      title: app
+        ? `${app}: databases are backed up, media is not declared`
+        : "Databases are backed up; media is not declared",
       detail:
-        `All ${databases.length} backup target${databases.length > 1 ? "s are" : " is"} a database. ` +
+        `Every backup target for ${which} is a database (${databases.map((b) => b.name).join(", ")}). ` +
         "A database restored without its media is not a restore - the app comes up and every image 404s. " +
         'Add a "files" target for media this toolkit can copy, or an "external" target naming where it lives instead.',
     });

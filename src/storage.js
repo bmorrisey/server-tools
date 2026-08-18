@@ -378,6 +378,9 @@ async function dirSize(dir) {
 export async function backupUsage(config, store) {
   const rows = [];
   for (const target of config.backups ?? []) {
+    // An external target stores nothing here; asking for its directory would
+    // create an empty one and then report it as a row.
+    if (target.type === "external") continue;
     const dir = store.backupDir(target.name);
     const names = await fsp.readdir(dir).catch(() => []);
     const files = [];
@@ -390,7 +393,7 @@ export async function backupUsage(config, store) {
     }
     // Same plan the scheduler applies after every run, so the number shown is
     // exactly what the button would delete.
-    const plan = planPrune(files.map((f) => f.key), target.retention);
+    const plan = planPrune(files.map((f) => f.key), target.retention, { type: target.type });
     const dropping = new Set(plan.drop);
     const dropped = files.filter((f) => dropping.has(f.key));
     rows.push({
