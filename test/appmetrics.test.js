@@ -235,13 +235,28 @@ test("snapshots are stored by month and read back in order", () => {
   }
 });
 
-test("snapshots live outside history, where housekeeping cannot reach them", () => {
+test("a housekeeping pass cannot reach a metrics snapshot", async () => {
+  // pruneHistory matches any "-YYYY-MM-DD.jsonl" under history/ and deletes by
+  // date regardless of topic, and housekeep calls it with historyDays ?? 90. A
+  // series meant to last years must not be governed by a setting made for
+  // check samples, and the failure mode is data quietly going missing months
+  // later rather than anything breaking at the time - so this runs the real
+  // housekeeping entry point, not just the store method underneath it.
+  const { housekeep } = await import("../src/housekeep.js");
   const { dir, store } = tmpStore();
   try {
-    store.appendSnapshot("app", { collectedAt: new Date().toISOString(), metrics: {} });
-    // historyDays defaults to 90; a ten-year series must not be governed by it.
-    assert.equal(store.pruneHistory(0), 0);
-    assert.equal(store.readSnapshots("app").length, 1);
+    // An old day-file of the kind housekeeping exists to remove, and a metrics
+    // snapshot of the same age.
+    const old = new Date(Date.now() - 400 * 86_400_000);
+    const day = old.toISOString().slice(0, 10);
+    const historyFile = path.join(dir, "history", `checks-${day}.jsonl`);
+    fs.writeFileSync(historyFile, `${JSON.stringify({ ts: old.toISOString(), name: "demo" })}\n`);
+    store.appendSnapshot("app", { collectedAt: old.toISOString(), metrics: { a: { value: 1 } } });
+
+    const result = await housekeep({ dataDir: dir, housekeeping: { historyDays: 90 } }, store);
+    assert.equal(fs.existsSync(historyFile), false, "the history file it is meant to prune was pruned");
+    assert.match(result.summary.join(" "), /history: removed/);
+    assert.equal(store.readSnapshots("app").length, 1, "the metrics snapshot survived");
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

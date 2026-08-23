@@ -410,8 +410,10 @@ This is a deliberately slow channel. Per-second data wants a different tool.
 
 Snapshots are stored under `dataDir/metrics/` and pruned by `retentionDays`,
 **not** by `housekeeping.historyDays`. Keeping them out of the history
-directory is the point: 90 days is right for check samples and wrong for a
-record meant to last years.
+directory is the point: that pruner deletes by date regardless of topic, and 90
+days is right for check samples and wrong for a record meant to last years. See
+[docs/METRICS.md](METRICS.md) for why this is a separate directory rather than
+a retention override.
 
 ## Housekeeping
 
