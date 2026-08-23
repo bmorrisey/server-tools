@@ -387,7 +387,7 @@ contract in [docs/METRICS.md](METRICS.md).
 
 ```json
 { "name": "myapp", "label": "My application",
-  "source": { "url": "http://127.0.0.1:3000/internal/metrics", "token": "${MYAPP_METRICS_TOKEN}" },
+  "source": { "url": "http://127.0.0.1:3000/internal/metrics", "token": "${APP_METRICS_TOKEN}" },
   "schedule": "1h", "timeout": "10s", "retentionDays": 3650 }
 ```
 

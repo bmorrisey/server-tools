@@ -189,6 +189,17 @@ document.addEventListener("submit", function (e) {
     if (into) into.disabled = fig.hi - fig.lo <= floor;
   }
 
+  /* Buttons, because the wheel needs a modifier no phone has and the browser
+   * owns the pinch. They are also the only keyboard path in. Factors below 1
+   * narrow the window; above 1 widen it. */
+  function zoomBy(fig, factor) {
+    var mid = (fig.lo + fig.hi) / 2, half = ((fig.hi - fig.lo) * factor) / 2;
+    fig.lo = mid - half;
+    fig.hi = mid + half;
+    clamp(fig);
+    draw(fig);
+  }
+
   var figures = document.querySelectorAll("figure.chart[data-points]");
   for (var f = 0; f < figures.length; f++) {
     (function (el) {
@@ -223,7 +234,10 @@ document.addEventListener("submit", function (e) {
       }, { passive: false });
 
       el.addEventListener("pointerdown", function (e) {
-        if (e.target.closest(".reset")) return;
+        // Any control, not just reset: capturing the pointer on the figure
+        // retargets the click away from the button, so a press on + or - would
+        // pan the chart and might never zoom it at all.
+        if (e.target.closest("button")) return;
         drag = { x: e.clientX, lo: fig.lo, hi: fig.hi };
         el.setPointerCapture(e.pointerId);
       });
@@ -241,19 +255,10 @@ document.addEventListener("submit", function (e) {
       });
       el.addEventListener("pointercancel", function () { drag = null; });
 
-      /* Buttons, because the wheel needs a modifier no phone has and the
-       * browser owns the pinch. They are also the only keyboard path in. */
-      function zoomBy(factor) {
-        var mid = (fig.lo + fig.hi) / 2, half = ((fig.hi - fig.lo) * factor) / 2;
-        fig.lo = mid - half;
-        fig.hi = mid + half;
-        clamp(fig);
-        draw(fig);
-      }
       var zoomIn = el.querySelector(".zoom-in");
-      if (zoomIn) zoomIn.addEventListener("click", function () { zoomBy(0.5); });
+      if (zoomIn) zoomIn.addEventListener("click", function () { zoomBy(fig, 0.5); });
       var zoomOut = el.querySelector(".zoom-out");
-      if (zoomOut) zoomOut.addEventListener("click", function () { zoomBy(2); });
+      if (zoomOut) zoomOut.addEventListener("click", function () { zoomBy(fig, 2); });
       var reset = el.querySelector(".reset");
       if (reset) {
         reset.addEventListener("click", function () {
@@ -263,6 +268,7 @@ document.addEventListener("submit", function (e) {
           draw(fig);
         });
       }
+      clamp(fig);
       draw(fig);
     })(figures[f]);
   }
@@ -1402,17 +1408,26 @@ ${timeChart(points, { kind: metric.kind, label })}
   // Never collected is not the same as collected successfully, and a green
   // tick beside the words "never collected" is the wrong thing to tell someone
   // glancing at the page.
-  const status = state?.lastResult === "fail" ? statusPill("fail") : newest ? statusPill("ok") : statusPill("warn");
+  // capturedAt describes the values on the page, so it comes from the snapshot
+  // they came from rather than from whatever arrived most recently.
   const captured =
-    newest?.capturedAt && newest.capturedAt !== newest.collectedAt
-      ? ` The application reported capturing them at ${esc(newest.capturedAt.replace("T", " ").replace("Z", " UTC"))}.`
+    latest?.capturedAt && latest.capturedAt !== latest.collectedAt
+      ? ` The application reported capturing them at ${esc(latest.capturedAt.replace("T", " ").replace("Z", " UTC"))}.`
       : "";
+  // An endpoint that keeps answering 200 with no metrics would otherwise show
+  // frozen numbers under a fresh timestamp, indefinitely and in green.
+  const stale =
+    newest && latest && newest !== latest
+      ? ` - last publish was empty; values are from ${esc(formatDuration(Date.now() - Date.parse(latest.collectedAt)))} ago`
+      : "";
+  const status =
+    state?.lastResult === "fail" ? statusPill("fail") : newest && !stale ? statusPill("ok") : statusPill("warn");
 
   const body = `<h1>Metrics</h1>
 <p class="sub">Numbers your applications publish about themselves. Deltas are computed when this page is drawn, never stored.</p>
 ${apps.length > 1 ? `<div class="windows">${tabs}</div>` : ""}
 <div class="hero"><span class="headline">${esc(app.label ?? app.name)}</span>${status}
-  <span class="sub" style="margin:0">${collected ? `collected ${esc(collected)} ago` : "never collected"}${esc(
+  <span class="sub" style="margin:0">${collected ? `collected ${esc(collected)} ago` : "never collected"}${stale}${esc(
     state?.lastDetail ? ` - ${state.lastDetail}` : "",
   )}</span></div>
 ${captured ? `<p class="sub">${captured}</p>` : ""}

@@ -72,9 +72,7 @@ function parseMetric(key, raw) {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return bad("must be an object");
 
   const kind = raw.kind ?? "number";
-  // Sanitized before it is quoted back: this message reaches the terminal, the
-  // agent log and the alert body, none of which escape anything.
-  if (!KINDS.has(kind)) return bad(`kind "${sanitize(kind)}" is not one of ${[...KINDS].join(", ")}`);
+  if (!KINDS.has(kind)) return bad(`kind "${kind}" is not one of ${[...KINDS].join(", ")}`);
 
   if (raw.label !== undefined && (typeof raw.label !== "string" || raw.label.length > LIMITS.labelLength)) {
     return bad(`label must be a string of at most ${LIMITS.labelLength} characters`);

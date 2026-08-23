@@ -28,7 +28,7 @@ function browserHelpers() {
   return new Function(
     "document",
     `${body}
-    return { compact: compact, stamp: stamp, draw: draw, clamp: clamp, readout: readout, W: W, H: H, PL: PL, PR: PR };`,
+    return { compact: compact, stamp: stamp, draw: draw, clamp: clamp, readout: readout, zoomBy: zoomBy, W: W, H: H, PL: PL, PR: PR };`,
   )(fake);
 }
 
@@ -793,7 +793,7 @@ test("zooming is reachable without a wheel or a modifier key", () => {
   assert.match(html, /class="zoom-in"/);
   assert.match(html, /class="zoom-out"/);
   assert.match(html, /aria-label="Zoom in"/);
-  assert.match(uiModule.BROWSER_SCRIPT, /function zoomBy\(factor\)/);
+  assert.match(uiModule.BROWSER_SCRIPT, /function zoomBy\(fig, factor\)/);
 });
 
 test("zooming stops a few samples short of empty, not at a fraction of the range", () => {
@@ -852,4 +852,146 @@ test("the file reader measures what arrived, not what stat claimed", async () =>
   const text = await fetchDocument({ name: "a", source: { file: "/proc/self/status" } });
   assert.ok(text.length > 0, "content was read despite a zero stat size");
   assert.match(text, /^Name:/);
+});
+
+test("the zoom buttons zoom the right way and stop at the floor", () => {
+  // Asserting the markup contains a button says nothing about what it does.
+  const { zoomBy } = browserHelpers();
+  const hour = 3_600_000;
+  const pts = Array.from({ length: 400 }, (_, i) => [1_700_000_000_000 + i * hour, i]);
+  const fig = { el: { querySelector: () => null }, pts, gap: hour, lo: pts[0][0], hi: pts[pts.length - 1][0] };
+  const full = fig.hi - fig.lo;
+
+  // The shipped zoomBy, not a copy of it: a copy proves nothing about which
+  // way the buttons are wired.
+  zoomBy(fig, 0.5);
+  assert.ok(fig.hi - fig.lo < full, "zoom in narrows the window");
+  const narrowed = fig.hi - fig.lo;
+  zoomBy(fig, 2);
+  assert.ok(fig.hi - fig.lo > narrowed, "zoom out widens it again");
+
+  for (let i = 0; i < 40; i++) zoomBy(fig, 0.5);
+  assert.ok(fig.hi - fig.lo >= hour * 3, "zooming in stops short of an empty chart");
+  for (let i = 0; i < 40; i++) zoomBy(fig, 2);
+  assert.equal(fig.hi - fig.lo, full, "zooming out cannot escape the data");
+});
+
+test("a press on a chart control does not start a pan", () => {
+  // Capturing the pointer on the figure retargets the click away from the
+  // button, so the control can pan the chart and never fire at all.
+  const { BROWSER_SCRIPT } = uiModule;
+  assert.match(BROWSER_SCRIPT, /if \(e\.target\.closest\("button"\)\) return;/);
+  assert.doesNotMatch(BROWSER_SCRIPT, /closest\("\.reset"\)/);
+});
+
+test("frozen numbers under a fresh timestamp are called out, not shown as healthy", () => {
+  // An endpoint that keeps answering 200 with an empty metrics object would
+  // otherwise leave the last real values on the page forever, in green, under
+  // a collection time from a minute ago.
+  const day = 86_400_000;
+  const snapshots = [
+    { collectedAt: new Date(Date.now() - 9 * day).toISOString(), metrics: { rows: { value: 500, label: "Rows", kind: "count" } } },
+    { collectedAt: new Date(Date.now() - 60_000).toISOString(), metrics: {} },
+  ];
+  const html = metricsPage({
+    session: uiSession,
+    apps: [{ name: "demo" }],
+    app: { name: "demo" },
+    snapshots,
+    windowId: "90d",
+    state: { lastResult: "ok" },
+  });
+  assert.match(html, /last publish was empty/);
+  assert.match(html, /values are from 9d ago/);
+  assert.match(html, /status warn/);
+  assert.doesNotMatch(html, /status ok/);
+});
+
+/**
+ * Run the shipped chart script against a stub DOM and hand back the figure's
+ * live state plus a way to click its controls. This is the only way to test
+ * the wiring rather than the helpers: which handler is attached to which
+ * button is exactly where a chart silently does the wrong thing.
+ */
+function mountChart(points, kind = "count") {
+  const listeners = new Map();
+  const buttons = {};
+  const svg = {
+    innerHTML: "",
+    setAttribute() {},
+    getBoundingClientRect: () => ({ left: 0, width: 720 }),
+  };
+  const makeButton = (name) => {
+    const el = {
+      hidden: false,
+      disabled: false,
+      addEventListener(type, fn) {
+        if (type === "click") this._click = fn;
+      },
+      click() {
+        this._click?.({ target: this });
+      },
+      closest: () => el,
+    };
+    buttons[name] = el;
+    return el;
+  };
+  const figure = {
+    getAttribute: (name) =>
+      name === "data-points" ? JSON.stringify(points) : name === "data-kind" ? kind : null,
+    addEventListener(type, fn) {
+      listeners.set(type, fn);
+    },
+    querySelector(sel) {
+      if (sel === "svg") return svg;
+      if (sel === ".zoom-in") return buttons["zoom-in"] ?? makeButton("zoom-in");
+      if (sel === ".zoom-out") return buttons["zoom-out"] ?? makeButton("zoom-out");
+      if (sel === ".reset") return buttons.reset ?? makeButton("reset");
+      if (sel === ".readout") return { textContent: "" };
+      return null;
+    },
+    setPointerCapture() {},
+    releasePointerCapture() {},
+    hasPointerCapture: () => false,
+  };
+  const document = { addEventListener() {}, querySelectorAll: () => [figure] };
+  new Function("document", uiModule.BROWSER_SCRIPT)(document);
+  // The window the chart currently shows, read back off the rendered axis.
+  const span = () => {
+    const labels = [...svg.innerHTML.matchAll(/class="xlab"[^>]*>([^<]+)</g)].map((m) => m[1]);
+    return labels.length;
+  };
+  return { buttons, listeners, svg, span };
+}
+
+test("the zoom buttons are wired the right way round", () => {
+  const hour = 3_600_000;
+  const points = Array.from({ length: 400 }, (_, i) => [1_700_000_000_000 + i * hour, i]);
+  const chart = mountChart(points);
+  const plotted = () => (chart.svg.innerHTML.match(/<polyline class="line" points="([^"]+)"/)?.[1] ?? "").split(" ").length;
+
+  const whole = plotted();
+  chart.buttons["zoom-in"].click();
+  const narrowed = plotted();
+  assert.ok(narrowed < whole, `zoom in should show fewer samples (${narrowed} vs ${whole})`);
+
+  chart.buttons["zoom-out"].click();
+  assert.ok(plotted() > narrowed, "zoom out should show more again");
+
+  chart.buttons["zoom-in"].click();
+  chart.buttons.reset.click();
+  assert.equal(plotted(), whole, "reset returns the whole range");
+});
+
+test("a press on a control does not pan the chart", () => {
+  const hour = 3_600_000;
+  const points = Array.from({ length: 100 }, (_, i) => [1_700_000_000_000 + i * hour, i]);
+  const chart = mountChart(points);
+  chart.buttons["zoom-in"].click();
+  const afterZoom = chart.svg.innerHTML;
+
+  // pointerdown on a button, then a move: with the guard missing this drags.
+  chart.listeners.get("pointerdown")({ target: chart.buttons["zoom-in"], clientX: 100, pointerId: 1 });
+  chart.listeners.get("pointermove")({ clientX: 400, pointerId: 1 });
+  assert.equal(chart.svg.innerHTML, afterZoom, "the chart did not move");
 });

@@ -20,6 +20,7 @@ import {
   parseSnapshot,
 } from "../src/appmetrics/snapshot.js";
 import { buildAllSeries, computeDeltas, downsample, seriesKeys } from "../src/appmetrics/series.js";
+import { execFileSync } from "node:child_process";
 import { CollectorState, collect, describeSource, fetchDocument } from "../src/appmetrics/collect.js";
 
 const doc = (metrics, extra = {}) => JSON.stringify({ schema: SCHEMA_VERSION, metrics, ...extra });
@@ -285,10 +286,12 @@ test("retention drops whole months once they are entirely past the cutoff", () =
     store.appendSnapshot("app", { collectedAt: old, metrics: {} });
     store.appendSnapshot("app", { collectedAt: new Date().toISOString(), metrics: {} });
     assert.equal(store.readSnapshots("app").length, 2);
-    assert.equal(store.pruneSnapshots("app", 365), 1);
-    assert.equal(store.readSnapshots("app").length, 1);
-    // A retention of zero or nonsense removes nothing rather than everything.
+    // Zero or nonsense removes nothing rather than everything - checked while
+    // there is still an old month to delete, or the guard is never reached.
     assert.equal(store.pruneSnapshots("app", 0), 0);
+    assert.equal(store.pruneSnapshots("app", Number.NaN), 0);
+    assert.equal(store.readSnapshots("app").length, 2);
+    assert.equal(store.pruneSnapshots("app", 365), 1);
     assert.equal(store.readSnapshots("app").length, 1);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
@@ -436,32 +439,37 @@ test("an unbounded chunked response is cut off, not buffered whole", async () =>
   }
 });
 
-test("a source that is not a regular file is refused rather than blocking", async () => {
-  const { execFileSync } = await import("node:child_process");
+test("a source that is not a regular file is refused rather than blocking", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "st-fifo-"));
   try {
     const fifo = path.join(dir, "pipe");
     execFileSync("mkfifo", [fifo]);
 
-    // A FIFO reports size 0, so a size check waves it through, and the read
-    // then blocks forever - on a scheduled collector that is a stuck job
-    // rather than a failed one. The read must never be reached, so the stub
-    // records whether it was: asserting on a hang would only turn a
-    // regression into a test suite that never finishes.
-    // The shipped path, not a stub: opening a FIFO for reading blocks inside
-    // open() itself, before there is a descriptor to interrogate, so the
-    // non-blocking flag is what makes this answer at all.
-    const outcome = await Promise.race([
-      fetchDocument({ name: "app", source: { file: fifo } }).then(() => "resolved", (e) => e.message),
-      new Promise((r) => setTimeout(() => r("hung"), 4000)),
-    ]);
-    assert.match(outcome, /not a regular file/);
-    await assert.rejects(() => fetchDocument({ name: "app", source: { file: dir } }), /not a regular file/);
+    // In a child process, because the failure being guarded against is a
+    // read that never returns: awaiting it here would hang the runner rather
+    // than fail it, and a regression would surface as a CI timeout with no
+    // summary line rather than a named failure. A FIFO reports size 0 and
+    // then blocks inside open() itself, before there is a descriptor to ask
+    // what the file is.
+    const probe = (file) =>
+      execFileSync(
+        process.execPath,
+        [
+          "-e",
+          `import(${JSON.stringify(new URL("../src/appmetrics/collect.js", import.meta.url).href)})
+             .then((m) => m.fetchDocument({ name: "a", source: { file: ${JSON.stringify(file)} } }))
+             .then(() => { console.log("RESOLVED"); process.exit(0); },
+                   (e) => { console.log("REJECTED: " + e.message); process.exit(0); });`,
+        ],
+        { timeout: 8000, encoding: "utf8" },
+      );
+
+    assert.match(probe(fifo), /REJECTED: .*not a regular file/);
+    assert.match(probe(dir), /REJECTED: .*not a regular file/);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
-
 test("the byte cap counts bytes, not characters", () => {
   // A multi-byte document is bigger than its length suggests.
   const multibyte = "é".repeat(LIMITS.bytes - 10); // 2 bytes each
@@ -620,6 +628,14 @@ test("control characters are stripped from everything an application supplies", 
   assert.doesNotMatch(snapshot.metrics.a.label, control);
   assert.doesNotMatch(Object.keys(snapshot.metrics.b.value)[0], control);
   for (const problem of problems) assert.doesNotMatch(problem, control, problem);
+
+  // A control character in the metric KEY reaches the problem string by a
+  // different route: the key is rejected, and the rejection quotes it back.
+  const keyed = parseSnapshot(
+    JSON.stringify({ schema: 1, metrics: { [`rows${esc}[2K\rALL OK`]: { value: 1 }, ok: { value: 2 } } }),
+  );
+  assert.equal(keyed.problems.length, 1);
+  assert.doesNotMatch(keyed.problems[0], control, keyed.problems[0]);
 });
 
 test("a breakdown category longer than the cap is refused", () => {

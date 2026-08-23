@@ -109,7 +109,7 @@ the way every other secret here works:
 
 ```jsonc
 { "name": "myapp",
-  "source": { "url": "http://127.0.0.1:3000/internal/metrics", "token": "${MYAPP_METRICS_TOKEN}" } }
+  "source": { "url": "http://127.0.0.1:3000/internal/metrics", "token": "${APP_METRICS_TOKEN}" } }
 ```
 
 The token is sent as `Authorization: Bearer <token>` and appears in no log

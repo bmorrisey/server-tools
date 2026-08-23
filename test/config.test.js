@@ -377,3 +377,12 @@ test("a token only belongs on a url source", () => {
   );
   assert.ok(problems.some((p) => p.includes("only applies to a url source")));
 });
+
+test("a metrics url may not carry a credential", () => {
+  // fetch refuses these outright and quotes the whole URL back into the error,
+  // which becomes state, an event, a log line and an alert body.
+  const t = (url) => validateConfig(withDefaults({ ...minimal, appMetrics: [{ name: "a", source: { url } }] }));
+  assert.ok(t("http://user:pw@host/m").some((p) => p.includes("must not embed a username or password")));
+  assert.ok(t("https://user@host/m").some((p) => p.includes("must not embed a username or password")));
+  assert.deepEqual(t("http://127.0.0.1:3000/internal/metrics"), []);
+});
