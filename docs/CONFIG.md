@@ -395,7 +395,7 @@ contract in [docs/METRICS.md](METRICS.md).
 | --- | --- | --- |
 | `name` | none | Required, unique. Becomes a filename and a URL path segment, so: letters, digits, `_`, `.` or `-`, starting alphanumeric. |
 | `label` | the name | What the dashboard calls it. |
-| `source` | none | Exactly one of `{ "url": ... }` or `{ "file": ... }`. A `url` source may carry a `token`, sent as `Authorization: Bearer`. |
+| `source` | none | Exactly one of `{ "url": ... }` or `{ "file": ... }`. A `url` source may carry a `token`, sent as `Authorization: Bearer`. The URL itself must not embed a username or password: `fetch` refuses those and quotes the URL back into logs and alerts. |
 | `schedule` | `"1h"` | `"1h"`, `"03:00"` daily, `"sun 03:00"` weekly. Daily suits most numbers. |
 | `timeout` | `"10s"` | How long to wait for the source. |
 | `retentionDays` | `3650` | How long snapshots are kept. Ten years of daily samples is a few thousand lines. |

@@ -159,8 +159,12 @@ one thing that makes a years-long series worthless.
 
 The dashboard's **Metrics** page shows a block per published number: the
 current value formatted by its `kind`, the change since the previous sample and
-against roughly a week earlier, and the history as a chart you can drag to pan
-and scroll or pinch to zoom.
+against roughly a week earlier, and the history as a chart.
+
+Drag the chart to pan it, and use its `+` and `-` buttons to zoom. On a
+desktop, ctrl-scroll (or a trackpad pinch) zooms as well; a plain scroll is
+left to the page, because a chart covers most of every card and stealing the
+wheel would make the page unscrollable. Reset appears once you have zoomed.
 
 **Deltas are computed when the page is drawn and never stored.** A stored delta
 can disagree with the values it came from after a backfill, a clock correction,

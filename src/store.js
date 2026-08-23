@@ -168,7 +168,7 @@ export class Store {
     // after reading everything is not a limit: a decade of daily samples is
     // read in full to print one snapshot, in the same process that runs the
     // checks and the backups.
-    const out = [];
+    let out = [];
     for (let i = files.length - 1; i >= 0; i--) {
       const batch = [];
       for (const line of fs.readFileSync(path.join(dir, files[i]), "utf8").split("\n")) {
@@ -181,7 +181,11 @@ export class Store {
           // Skip a torn write rather than failing the whole read.
         }
       }
-      out.unshift(...batch);
+      // concat, not unshift(...batch): spreading a large array as arguments
+      // overflows the stack at around 127k elements, and a fast schedule
+      // reaches that inside a single month - defeating the very limit this
+      // loop exists to honour.
+      out = batch.concat(out);
       if (limit && out.length >= limit) break;
     }
     out.sort((a, b) => Date.parse(a.collectedAt) - Date.parse(b.collectedAt));

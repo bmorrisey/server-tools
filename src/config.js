@@ -198,8 +198,22 @@ export function validateConfig(cfg) {
       const named = ["url", "file"].filter((k) => source[k] !== undefined);
       need(named.length === 1, `${where}.source must name exactly one of "url" or "file"`);
       for (const k of named) need(typeof source[k] === "string" && source[k], `${where}.source.${k} must be a non-empty string`);
-      if (typeof source.url === "string")
+      if (typeof source.url === "string") {
         need(/^https?:\/\//.test(source.url), `${where}.source.url must be an http(s) URL`);
+        // A credential in the URL is refused outright by fetch, and the error
+        // it raises quotes the URL back into logs, state and alerts. Use
+        // source.token, which is sent as a header and never echoed.
+        let parsed = null;
+        try {
+          parsed = new URL(source.url);
+        } catch {
+          // The scheme check above already reported anything unparseable.
+        }
+        need(
+          !parsed || (!parsed.username && !parsed.password),
+          `${where}.source.url must not embed a username or password; use source.token instead`,
+        );
+      }
       if (source.token !== undefined) {
         need(typeof source.token === "string", `${where}.source.token must be a string`);
         // A file source has nowhere to send a bearer token, so configuring one

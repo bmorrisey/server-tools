@@ -17,6 +17,7 @@
  * shown, the threshold-crossing failure alerts once, and a later success
  * sends the recovery.
  */
+import fs from "node:fs";
 import fsp from "node:fs/promises";
 import { parseSnapshot, LIMITS } from "./snapshot.js";
 import { parseDuration } from "../util.js";
@@ -58,9 +59,9 @@ export function describeSource(source) {
  * The size cap is enforced on the way in rather than after parsing, because
  * the point of a cap is to not hold the thing in memory in the first place.
  */
-export async function fetchDocument(target, { timeoutMs = 10_000, fetchImpl = fetch, readFile = fsp.readFile } = {}) {
+export async function fetchDocument(target, { timeoutMs = 10_000, fetchImpl = fetch } = {}) {
   const source = target.source ?? {};
-  if (source.file) return readFileCapped(source.file, readFile);
+  if (source.file) return readFileCapped(source.file);
   if (!source.url) throw new Error("no source configured");
 
   const headers = { accept: "application/json", "user-agent": "server-tools-metrics" };
@@ -68,11 +69,19 @@ export async function fetchDocument(target, { timeoutMs = 10_000, fetchImpl = fe
   // line, an error message, or the recorded event detail.
   if (source.token) headers.authorization = `Bearer ${source.token}`;
 
-  const res = await fetchImpl(source.url, {
-    headers,
-    redirect: "manual",
-    signal: AbortSignal.timeout(timeoutMs),
-  });
+  let res;
+  try {
+    res = await fetchImpl(source.url, {
+      headers,
+      redirect: "manual",
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+  } catch (e) {
+    // The failure message can quote the URL back, and a URL can carry a
+    // credential. This message travels to state, the event log, the agent log
+    // and the alert body, so it leaves the box.
+    throw new Error(scrub(e.message, source));
+  }
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
 
   const declared = Number(res.headers?.get?.("content-length"));
@@ -80,6 +89,12 @@ export async function fetchDocument(target, { timeoutMs = 10_000, fetchImpl = fe
     throw new Error(`response declares ${declared} bytes; the limit is ${LIMITS.bytes}`);
   }
   return readCapped(res);
+}
+
+/** Replace any occurrence of the raw source URL with its scrubbed form. */
+function scrub(message, source) {
+  const text = String(message);
+  return source?.url ? text.split(source.url).join(describeSource(source)) : text;
 }
 
 /**
@@ -93,15 +108,14 @@ export async function fetchDocument(target, { timeoutMs = 10_000, fetchImpl = fe
  * descriptor. A FIFO also reports size 0 and then blocks forever, which on a
  * scheduled collector is a stuck job rather than a failed one.
  */
-async function readFileCapped(file, readFile) {
-  // An injected reader is a test seam; it has no descriptor to interrogate.
-  if (readFile !== fsp.readFile) {
-    const stat = await fsp.stat(file).catch(() => null);
-    if (stat && !stat.isFile()) throw new Error(`${file} is not a regular file`);
-    if (stat && stat.size > LIMITS.bytes) throw new Error(`${file} is ${stat.size} bytes; the limit is ${LIMITS.bytes}`);
-    return readFile(file, "utf8");
-  }
-  const handle = await fsp.open(file, "r");
+async function readFileCapped(file) {
+  // O_NONBLOCK matters more than it looks: opening a FIFO for reading blocks
+  // until a writer appears, and it blocks inside open() itself, before there
+  // is any descriptor to ask what this is. That stalls a libuv threadpool
+  // thread for the life of the process - four of them starve every other
+  // filesystem operation the agent makes - and the scheduler never re-arms a
+  // collection that has not returned. On a regular file the flag does nothing.
+  const handle = await fsp.open(file, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK);
   try {
     const stat = await handle.stat();
     if (!stat.isFile()) throw new Error(`${file} is not a regular file`);

@@ -28,7 +28,7 @@ function browserHelpers() {
   return new Function(
     "document",
     `${body}
-    return { compact: compact, stamp: stamp, draw: draw, W: W, H: H };`,
+    return { compact: compact, stamp: stamp, draw: draw, clamp: clamp, readout: readout, W: W, H: H, PL: PL, PR: PR };`,
   )(fake);
 }
 
@@ -705,6 +705,151 @@ test("charts shrink as the metric count grows, so page cost stays bounded", () =
   });
   const sizes = [...html.matchAll(/data-points="([^"]+)"/g)].map((m) => JSON.parse(m[1]).length);
   assert.equal(sizes.length, 120);
-  assert.ok(Math.max(...sizes) <= 300, "never more points than the plot has pixels");
+  // 18000/120 = 150, well under the 300 a single chart would get. Asserting
+  // against 300 would pass with the adaptive budget removed entirely.
+  assert.ok(Math.max(...sizes) <= 150, `largest chart shipped ${Math.max(...sizes)} points`);
   assert.ok(html.length < 1_500_000, `page was ${html.length} bytes`);
+});
+
+test("an empty publish does not take the whole page down", () => {
+  // The keys come from the newest snapshot that published something; reading
+  // the metric from the newest snapshot instead throws, and the route turns
+  // that into a 500 for every window, for as long as the app keeps sending {}.
+  const snapshots = [
+    { collectedAt: "2026-08-01T00:00:00Z", metrics: { rows: { value: 5, kind: "count" } } },
+    { collectedAt: "2026-08-02T00:00:00Z", metrics: { rows: { value: 9, kind: "count" } } },
+    { collectedAt: "2026-08-03T00:00:00Z", metrics: {} },
+  ];
+  const html = metricsPage({
+    session: uiSession,
+    apps: [{ name: "demo" }],
+    app: { name: "demo" },
+    snapshots,
+    windowId: "90d",
+    state: { lastResult: "ok" },
+  });
+  assert.match(html, /Rows|rows/);
+  assert.doesNotMatch(html, /No longer published/);
+});
+
+test("a breakdown's delta is a number, not a breakdown", () => {
+  const snapshots = [
+    { collectedAt: "2026-08-01T00:00:00Z", metrics: { tiers: { value: { a: 2, b: 3 }, kind: "breakdown" } } },
+    { collectedAt: "2026-08-02T00:00:00Z", metrics: { tiers: { value: { a: 4, b: 6 }, kind: "breakdown" } } },
+  ];
+  const html = metricsPage({
+    session: uiSession,
+    apps: [{ name: "demo" }],
+    app: { name: "demo" },
+    snapshots,
+    windowId: "90d",
+    state: {},
+  });
+  assert.match(html, /\+5/, "the change in the total");
+  assert.doesNotMatch(html, /\+-|--<\/span>/);
+});
+
+test("the truncation notice appears only when the read was truncated", () => {
+  const page = (count) =>
+    metricsPage({
+      session: uiSession,
+      apps: [{ name: "demo" }],
+      app: { name: "demo" },
+      snapshots: Array.from({ length: count }, (_, i) => ({
+        collectedAt: new Date(1_700_000_000_000 + i * 3_600_000).toISOString(),
+        metrics: { a: { value: i, kind: "count" } },
+      })),
+      windowId: "all",
+      state: {},
+    });
+  assert.doesNotMatch(page(50), /most recent/);
+  assert.match(page(uiModule.PAGE_SNAPSHOTS), /most recent/);
+});
+
+test("the browser drops a non-finite point rather than plotting it", () => {
+  // JSON writes Infinity as null and isFinite(null) is true, so without the
+  // guard the browser draws a confident flat line at mid-scale.
+  const { draw } = browserHelpers();
+  let markup = "";
+  const svg = { set innerHTML(v) { markup = v; }, get innerHTML() { return markup; }, setAttribute() {} };
+  draw({ el: { querySelector: () => svg }, pts: [[1, 10], [2, null], [3, 20]], lo: 1, hi: 3, kind: "count" });
+  const points = markup.match(/<polyline class="line" points="([^"]+)"/)[1].split(" ");
+  assert.equal(points.length, 2, "the null point is not plotted");
+});
+
+test("the readout follows the plot area, not the whole svg box", () => {
+  // The time axis spans PL..W-PR, so using the box width slides the grabbed
+  // sample out from under the pointer on a long drag.
+  const { BROWSER_SCRIPT } = uiModule;
+  assert.match(BROWSER_SCRIPT, /function plotFraction\(el, clientX\)/);
+  assert.match(BROWSER_SCRIPT, /\(px - PL\) \/ \(W - PL - PR\)/);
+  // Both the drag and the wheel go through it rather than doing their own maths.
+  assert.equal((BROWSER_SCRIPT.match(/plotFraction\(/g) ?? []).length >= 4, true);
+});
+
+test("zooming is reachable without a wheel or a modifier key", () => {
+  // A phone has neither, and the browser owns the pinch.
+  const html = timeChart([[1, 10], [2, 20], [3, 15]], { kind: "count" });
+  assert.match(html, /class="zoom-in"/);
+  assert.match(html, /class="zoom-out"/);
+  assert.match(html, /aria-label="Zoom in"/);
+  assert.match(uiModule.BROWSER_SCRIPT, /function zoomBy\(factor\)/);
+});
+
+test("zooming stops a few samples short of empty, not at a fraction of the range", () => {
+  // Tying the floor to the range means the last several notches land on a
+  // blank chart for any long series.
+  const { clamp } = browserHelpers();
+  const hour = 3_600_000;
+  const pts = Array.from({ length: 500 }, (_, i) => [1_700_000_000_000 + i * hour, i]);
+  const fig = {
+    el: { querySelector: () => null },
+    pts,
+    gap: hour,
+    lo: pts[10][0],
+    hi: pts[10][0] + 1000, // absurdly deep zoom
+  };
+  clamp(fig);
+  assert.ok(fig.hi - fig.lo >= hour * 3, `floor was ${(fig.hi - fig.lo) / hour} hours`);
+});
+
+test("the readout does not describe the viewport before last", () => {
+  const { draw, readout } = browserHelpers();
+  let markup = "";
+  let text = "";
+  const svg = {
+    set innerHTML(v) { markup = v; },
+    get innerHTML() { return markup; },
+    setAttribute() {},
+    getBoundingClientRect: () => ({ left: 0, width: 720 }),
+  };
+  const out = { set textContent(v) { text = v; }, get textContent() { return text; } };
+  const el = { querySelector: (sel) => (sel === ".readout" ? out : svg) };
+  const pts = [[1_700_000_000_000, 50], [1_700_003_600_000, 60]];
+
+  // One figure, panned: the stale state only exists because the same object
+  // is redrawn, so a fresh one would never reach the bug.
+  const fig = { el, pts, lo: pts[0][0], hi: pts[1][0], kind: "count" };
+  draw(fig);
+  readout(fig, 700);
+  assert.match(text, /50|60/);
+
+  text = "";
+  fig.lo = pts[1][0] + 10_000_000;
+  fig.hi = pts[1][0] + 20_000_000;
+  draw(fig);
+  assert.match(markup, /no samples in this range/);
+  readout(fig, 700);
+  assert.equal(text, "", "the previous viewport's reading must not persist");
+});
+
+test("the file reader measures what arrived, not what stat claimed", async () => {
+  // Some regular files report size 0 and still have content. Trusting the
+  // stat would read them as empty, and it is also the size a file can change
+  // between the check and the read.
+  const { fetchDocument } = await import("../src/appmetrics/collect.js");
+  assert.equal(fs.statSync("/proc/self/status").size, 0);
+  const text = await fetchDocument({ name: "a", source: { file: "/proc/self/status" } });
+  assert.ok(text.length > 0, "content was read despite a zero stat size");
+  assert.match(text, /^Name:/);
 });

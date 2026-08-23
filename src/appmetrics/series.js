@@ -54,26 +54,10 @@ export function seriesKeys(snapshots) {
       retired.push(key);
     }
   }
-  return { current, retired };
-}
-
-/**
- * The [time, value] points for one key. Snapshots that did not publish the key
- * are skipped rather than filled with zeroes: a gap in a chart is honest, a
- * zero is a claim the app never made.
- */
-export function buildSeries(snapshots, key, { numericValue }) {
-  const points = [];
-  for (const snapshot of snapshots) {
-    const t = timeOf(snapshot);
-    if (!Number.isFinite(t)) continue;
-    const metric = snapshot.metrics?.[key];
-    if (!metric) continue;
-    const v = numericValue(metric);
-    if (v === null) continue;
-    points.push([t, v]);
-  }
-  return sortByTime(points);
+  // The snapshot the keys came from travels with them. A caller that took the
+  // newest snapshot instead would look up a key that is not in it and get
+  // undefined, which is the same empty-publish case wearing a different hat.
+  return { current, retired, latest };
 }
 
 /**
@@ -174,15 +158,6 @@ export function downsample(points, max = 600) {
   }
   out.push(points[points.length - 1]);
   return out;
-}
-
-/** Snapshots newer than `sinceMs`, or all of them when it is null. */
-export function withinWindow(snapshots, sinceMs) {
-  if (sinceMs === null || sinceMs === undefined) return snapshots;
-  return snapshots.filter((s) => {
-    const t = timeOf(s);
-    return Number.isFinite(t) && t >= sinceMs;
-  });
 }
 
 /** Named windows offered on the page. `null` days means everything stored. */

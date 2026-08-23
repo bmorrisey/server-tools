@@ -19,7 +19,7 @@ import {
   numericValue,
   parseSnapshot,
 } from "../src/appmetrics/snapshot.js";
-import { buildSeries, computeDeltas, downsample, seriesKeys, withinWindow } from "../src/appmetrics/series.js";
+import { buildAllSeries, computeDeltas, downsample, seriesKeys } from "../src/appmetrics/series.js";
 import { CollectorState, collect, describeSource, fetchDocument } from "../src/appmetrics/collect.js";
 
 const doc = (metrics, extra = {}) => JSON.stringify({ schema: SCHEMA_VERSION, metrics, ...extra });
@@ -43,8 +43,6 @@ test("a well-formed document becomes a snapshot", () => {
   assert.equal(snapshot.capturedAt, "2026-08-22T03:00:00.000Z");
   assert.deepEqual(Object.keys(snapshot.metrics), ["records_total", "storage_used", "tier_distribution"]);
   assert.equal(snapshot.metrics.records_total.label, "Records");
-  // Null-prototype, so a category named "__proto__" is data rather than a
-  // silent no-op; the stored JSON is identical either way.
   assert.deepEqual({ ...snapshot.metrics.tier_distribution.value }, { free: 812, pro: 44 });
   assert.equal(JSON.stringify(snapshot.metrics.tier_distribution.value), '{"free":812,"pro":44}');
 });
@@ -154,7 +152,7 @@ test("a metric missing from a snapshot leaves a gap, not a zero", () => {
     at("2026-08-02T00:00:00Z", {}),
     at("2026-08-03T00:00:00Z", { a: { value: 3, kind: "count" } }),
   ];
-  const points = buildSeries(snapshots, "a", { numericValue });
+  const points = buildAllSeries(snapshots, ["a"], { numericValue }).get("a");
   assert.equal(points.length, 2);
   assert.deepEqual(points.map((p) => p[1]), [1, 3]);
 });
@@ -204,10 +202,22 @@ test("downsampling keeps the ends exactly and does not flatten a spike", () => {
   assert.equal(downsample(few, 600), few);
 });
 
-test("a window filters by the agent's clock", () => {
-  const snapshots = [at("2026-01-01T00:00:00Z", {}), at("2026-08-01T00:00:00Z", {})];
-  assert.equal(withinWindow(snapshots, Date.parse("2026-06-01T00:00:00Z")).length, 1);
-  assert.equal(withinWindow(snapshots, null).length, 2);
+test("a series is only sorted when it is not already in order", () => {
+  // The store returns snapshots ascending, so sorting again is the most
+  // expensive thing on a page with many metrics. Out-of-order input must
+  // still come back ordered.
+  const ordered = [at("2026-08-01T00:00:00Z", { a: { value: 1 } }), at("2026-08-02T00:00:00Z", { a: { value: 2 } })];
+  const values = (list) => buildAllSeries(list, ["a"], { numericValue }).get("a").map((p) => p[1]);
+  assert.deepEqual(values(ordered), [1, 2]);
+  assert.deepEqual(values([ordered[1], ordered[0]]), [1, 2], "out-of-order input is still returned in order");
+  const tied = [at("2026-08-01T00:00:00Z", { a: { value: 1 } }), at("2026-08-01T00:00:00Z", { a: { value: 9 } })];
+  assert.equal(values(tied).length, 2, "equal timestamps are kept, not collapsed");
+});
+
+test("only requested keys are collected", () => {
+  const snapshots = [at("2026-08-01T00:00:00Z", { a: { value: 1 }, b: { value: 2 } })];
+  const series = buildAllSeries(snapshots, ["a"], { numericValue });
+  assert.deepEqual([...series.keys()], ["a"]);
 });
 
 /* ------------------------------------------------------------------- store */
@@ -438,16 +448,15 @@ test("a source that is not a regular file is refused rather than blocking", asyn
     // rather than a failed one. The read must never be reached, so the stub
     // records whether it was: asserting on a hang would only turn a
     // regression into a test suite that never finishes.
-    let readAttempted = false;
-    const readFile = async () => {
-      readAttempted = true;
-      return "{}";
-    };
-    await assert.rejects(() => fetchDocument({ name: "app", source: { file: fifo } }, { readFile }), /not a regular file/);
-    assert.equal(readAttempted, false, "refused before the read that would block");
-
-    await assert.rejects(() => fetchDocument({ name: "app", source: { file: dir } }, { readFile }), /not a regular file/);
-    assert.equal(readAttempted, false);
+    // The shipped path, not a stub: opening a FIFO for reading blocks inside
+    // open() itself, before there is a descriptor to interrogate, so the
+    // non-blocking flag is what makes this answer at all.
+    const outcome = await Promise.race([
+      fetchDocument({ name: "app", source: { file: fifo } }).then(() => "resolved", (e) => e.message),
+      new Promise((r) => setTimeout(() => r("hung"), 4000)),
+    ]);
+    assert.match(outcome, /not a regular file/);
+    await assert.rejects(() => fetchDocument({ name: "app", source: { file: dir } }), /not a regular file/);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
@@ -577,4 +586,130 @@ test("an empty publish does not retire every metric", async () => {
   const { current, retired } = seriesKeys([full, empty]);
   assert.deepEqual(current, ["a", "b"]);
   assert.deepEqual(retired, []);
+});
+
+
+test("a breakdown category named __proto__ is data, not a silent no-op", () => {
+  // Assigned to a plain object it would invoke the setter and vanish, quietly
+  // changing the total. Raw JSON, because a JS object literal cannot carry
+  // the key at all.
+  const raw = '{"schema":1,"metrics":{"b":{"value":{"__proto__":5,"ok":7},"kind":"breakdown"}}}';
+  const { snapshot } = parseSnapshot(raw);
+  const value = snapshot.metrics.b.value;
+  assert.deepEqual(Object.keys(value), ["__proto__", "ok"]);
+  assert.equal(breakdownTotal(value), 12);
+  assert.equal(JSON.stringify(value), '{"__proto__":5,"ok":7}');
+  assert.equal(Object.getPrototypeOf({}), Object.prototype, "nothing was polluted");
+});
+
+test("control characters are stripped from everything an application supplies", () => {
+  // The dashboard escapes these; the terminal, the agent log and the alert
+  // body do not. An escape sequence can erase the line it prints on and a
+  // newline forges another.
+  const esc = String.fromCharCode(27);
+  const raw = JSON.stringify({
+    schema: 1,
+    metrics: {
+      a: { value: 1, label: "Rows" + esc + "[2K\rALL FINE" },
+      b: { value: { ["cat" + esc + "[2K"]: 1 }, kind: "breakdown" },
+      c: { value: 1, kind: esc + "[2Kbogus" },
+    },
+  });
+  const { snapshot, problems } = parseSnapshot(raw);
+  const control = /[\u0000-\u001f\u007f-\u009f]/;
+  assert.doesNotMatch(snapshot.metrics.a.label, control);
+  assert.doesNotMatch(Object.keys(snapshot.metrics.b.value)[0], control);
+  for (const problem of problems) assert.doesNotMatch(problem, control, problem);
+});
+
+test("a breakdown category longer than the cap is refused", () => {
+  const long = "c".repeat(LIMITS.keyLength + 1);
+  const { problems } = parseSnapshot(doc({ b: { value: { [long]: 1 }, kind: "breakdown" }, ok: { value: 1 } }));
+  assert.ok(problems.some((p) => p.includes("is too long")));
+});
+
+test("a limit takes the newest records, not the oldest", () => {
+  const { dir, store } = tmpStore();
+  try {
+    for (let i = 1; i <= 6; i++) {
+      store.appendSnapshot("app", { collectedAt: `2026-08-0${i}T00:00:00Z`, metrics: { a: { value: i } } });
+    }
+    assert.deepEqual(store.readSnapshots("app", { limit: 2 }).map((s) => s.metrics.a.value), [5, 6]);
+    const windowed = store.readSnapshots("app", { sinceMs: Date.parse("2026-08-03T00:00:00Z"), limit: 2 });
+    assert.deepEqual(windowed.map((s) => s.metrics.a.value), [5, 6]);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("records are returned in order even when a file was written out of order", () => {
+  const { dir, store } = tmpStore();
+  try {
+    const file = path.join(dir, "metrics", "app-2026-08.jsonl");
+    fs.writeFileSync(
+      file,
+      [
+        JSON.stringify({ collectedAt: "2026-08-09T00:00:00Z", metrics: { a: { value: 9 } } }),
+        JSON.stringify({ collectedAt: "2026-08-02T00:00:00Z", metrics: { a: { value: 2 } } }),
+      ].join("\n") + "\n",
+    );
+    assert.deepEqual(store.readSnapshots("app").map((s) => s.metrics.a.value), [2, 9]);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a month-file far larger than the argument-spread limit is still readable", () => {
+  // Spreading a big array as arguments overflows the stack at about 127k
+  // elements, which a fast schedule reaches inside one month - and it would
+  // break the very limit meant to bound the read.
+  const { dir, store } = tmpStore();
+  try {
+    const base = Date.parse("2026-08-01T00:00:00Z");
+    const lines = [];
+    for (let i = 0; i < 150_000; i++) {
+      lines.push(JSON.stringify({ collectedAt: new Date(base + i * 1000).toISOString(), metrics: { a: { value: i } } }));
+    }
+    fs.writeFileSync(path.join(dir, "metrics", "app-2026-08.jsonl"), `${lines.join("\n")}\n`);
+    assert.deepEqual(store.readSnapshots("app", { limit: 3 }).map((s) => s.metrics.a.value), [149_997, 149_998, 149_999]);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("downsampling keeps the extreme of each bucket, not just a sample of it", () => {
+  const points = Array.from({ length: 4000 }, (_, i) => [i, 10]);
+  points[1234] = [1234, -500];
+  points[3777] = [3777, 900];
+  const values = downsample(points, 100).map(([, v]) => v);
+  assert.ok(values.includes(-500), "a downward spike survives");
+  assert.ok(values.includes(900), "an upward spike survives");
+});
+
+test("the production file reader refuses what it should", async () => {
+  const { dir } = tmpStore();
+  try {
+    await assert.rejects(() => fetchDocument({ name: "a", source: { file: "/nonexistent/m.json" } }), /ENOENT/);
+    const big = path.join(dir, "big.json");
+    fs.writeFileSync(big, "x".repeat(LIMITS.bytes + 10));
+    await assert.rejects(() => fetchDocument({ name: "a", source: { file: big } }), /the limit is/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a credentialed url never reaches the recorded detail", async () => {
+  const { dir, store } = tmpStore();
+  try {
+    // Node's fetch refuses these outright and quotes the URL back, and that
+    // message becomes state, an event, a log line and an alert body.
+    const target = { name: "app", source: { url: "http://user:s3cr3t@127.0.0.1:1/m?token=TOPSECRET" } };
+    await assert.rejects(() => collect(target, { store }));
+    const detail = store.readState("metrics", {}).app.lastDetail;
+    assert.doesNotMatch(detail, /s3cr3t/);
+    assert.doesNotMatch(detail, /TOPSECRET/);
+    for (const e of store.recent("events")) assert.doesNotMatch(e.detail ?? "", /s3cr3t/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });

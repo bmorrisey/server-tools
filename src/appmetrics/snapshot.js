@@ -65,14 +65,16 @@ const isFiniteNumber = (v) => typeof v === "number" && Number.isFinite(v);
  * Problems name the key so an operator can tell the app's author what to fix.
  */
 function parseMetric(key, raw) {
-  const bad = (why) => ({ ok: false, problem: `${key}: ${why}` });
+  const bad = (why) => ({ ok: false, problem: sanitize(`${key}: ${why}`) });
 
   if (!KEY_RE.test(key)) return bad("key must start alphanumeric and use only letters, digits, _ . or -");
   if (key.length > LIMITS.keyLength) return bad(`key is longer than ${LIMITS.keyLength} characters`);
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return bad("must be an object");
 
   const kind = raw.kind ?? "number";
-  if (!KINDS.has(kind)) return bad(`kind "${kind}" is not one of ${[...KINDS].join(", ")}`);
+  // Sanitized before it is quoted back: this message reaches the terminal, the
+  // agent log and the alert body, none of which escape anything.
+  if (!KINDS.has(kind)) return bad(`kind "${sanitize(kind)}" is not one of ${[...KINDS].join(", ")}`);
 
   if (raw.label !== undefined && (typeof raw.label !== "string" || raw.label.length > LIMITS.labelLength)) {
     return bad(`label must be a string of at most ${LIMITS.labelLength} characters`);

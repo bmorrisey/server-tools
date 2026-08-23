@@ -180,8 +180,13 @@ document.addEventListener("submit", function (e) {
     if (fig.lo < min) { fig.hi += min - fig.lo; fig.lo = min; }
     if (fig.hi > max) { fig.lo -= fig.hi - max; fig.hi = max; }
     if (fig.lo < min) fig.lo = min;
+    var whole = fig.lo <= min && fig.hi >= max;
     var btn = fig.el.querySelector(".reset");
-    if (btn) btn.hidden = fig.lo <= min && fig.hi >= max;
+    if (btn) btn.hidden = whole;
+    var out = fig.el.querySelector(".zoom-out");
+    if (out) out.disabled = whole;
+    var into = fig.el.querySelector(".zoom-in");
+    if (into) into.disabled = fig.hi - fig.lo <= floor;
   }
 
   var figures = document.querySelectorAll("figure.chart[data-points]");
@@ -236,6 +241,19 @@ document.addEventListener("submit", function (e) {
       });
       el.addEventListener("pointercancel", function () { drag = null; });
 
+      /* Buttons, because the wheel needs a modifier no phone has and the
+       * browser owns the pinch. They are also the only keyboard path in. */
+      function zoomBy(factor) {
+        var mid = (fig.lo + fig.hi) / 2, half = ((fig.hi - fig.lo) * factor) / 2;
+        fig.lo = mid - half;
+        fig.hi = mid + half;
+        clamp(fig);
+        draw(fig);
+      }
+      var zoomIn = el.querySelector(".zoom-in");
+      if (zoomIn) zoomIn.addEventListener("click", function () { zoomBy(0.5); });
+      var zoomOut = el.querySelector(".zoom-out");
+      if (zoomOut) zoomOut.addEventListener("click", function () { zoomBy(2); });
       var reset = el.querySelector(".reset");
       if (reset) {
         reset.addEventListener("click", function () {
@@ -348,8 +366,10 @@ figure.chart .ylab, figure.chart .xlab, figure.chart .empty {
 figure.chart figcaption { display: flex; align-items: center; gap: 10px; justify-content: space-between;
   color: var(--muted); font-size: 12.5px; min-height: 24px; }
 figure.chart .readout { font-variant-numeric: tabular-nums; }
-figure.chart .reset { padding: 3px 9px; font-size: 12px; border: 1px solid var(--border);
-  border-radius: 7px; background: var(--surface); color: var(--ink-2); cursor: pointer; }
+figure.chart .chart-controls { display: flex; gap: 6px; flex-shrink: 0; }
+figure.chart .chart-controls button { padding: 3px 10px; font-size: 12px; border: 1px solid var(--border);
+  border-radius: 7px; background: var(--surface); color: var(--ink-2); cursor: pointer; min-width: 30px; }
+figure.chart .chart-controls button:disabled { opacity: 0.4; cursor: default; }
 /* The viewBox scales to about 0.43 on a phone, which would put 11px labels
    at under 5 CSS pixels. These units are inside the SVG, so this only costs
    the space it takes. */
@@ -1293,13 +1313,16 @@ export function timeChart(rawPoints, { kind = "number", label = "" } = {}) {
   const summary = `${label ? `${label}: ` : ""}${points.length} samples, ${compactValue(vmin, kind)} to ${compactValue(vmax, kind)}`;
   return `<figure class="chart" data-points="${esc(JSON.stringify(points))}" data-kind="${esc(kind)}">
 <svg viewBox="0 0 ${w} ${h}" role="img" aria-label="${esc(summary)}">${parts.join("")}</svg>
-<figcaption><span class="readout">${esc(summary)} (UTC)</span><button type="button" class="reset" hidden>Reset zoom</button></figcaption>
+<figcaption><span class="readout">${esc(summary)} (UTC)</span>
+<span class="chart-controls"><button type="button" class="zoom-out" aria-label="Zoom out">&minus;</button><button type="button" class="zoom-in" aria-label="Zoom in">+</button><button type="button" class="reset" hidden>Reset zoom</button></span></figcaption>
 </figure>`;
 }
 
 /** "+412 since yesterday" and the week-ago comparison, both read-time. */
 function deltaLine(deltas, metric) {
-  const opts = { kind: metric.kind, precision: metric.precision };
+  // The delta of a breakdown is the change in its total, which is a plain
+  // number; formatting it as a breakdown renders "-" and the sign alone.
+  const opts = { kind: metric.kind === "breakdown" ? "count" : metric.kind, precision: metric.precision };
   const bits = [];
   const render = (entry, when) => {
     if (!entry) return;
@@ -1332,8 +1355,11 @@ export function metricsPage({ session, apps, app, snapshots, windowId, state, fl
     return layout({ title: "Metrics", page: "/metrics", session, body, flash });
   }
 
-  const latest = snapshots[snapshots.length - 1];
-  const { current, retired } = seriesKeys(snapshots);
+  const newest = snapshots[snapshots.length - 1];
+  // `latest` is the newest snapshot that actually published something, which
+  // is not always the newest one: an empty document is legitimate, and reading
+  // a key from it would throw and take the whole page with it.
+  const { current, retired, latest } = seriesKeys(snapshots);
   const windowLinks = WINDOWS.map(
     (win) =>
       `<a href="/metrics/${encodeURIComponent(app.name)}?window=${win.id}"${win.id === windowId ? ' aria-current="true"' : ""}>${esc(win.label)}</a>`,
@@ -1371,14 +1397,15 @@ ${timeChart(points, { kind: metric.kind, label })}
     : "";
 
   const truncated = snapshots.length >= PAGE_SNAPSHOTS;
-  const collected = latest ? formatDuration(Date.now() - Date.parse(latest.collectedAt)) : null;
+  // When it was last collected is about the newest snapshot, empty or not.
+  const collected = newest ? formatDuration(Date.now() - Date.parse(newest.collectedAt)) : null;
   // Never collected is not the same as collected successfully, and a green
   // tick beside the words "never collected" is the wrong thing to tell someone
   // glancing at the page.
-  const status = state?.lastResult === "fail" ? statusPill("fail") : latest ? statusPill("ok") : statusPill("warn");
+  const status = state?.lastResult === "fail" ? statusPill("fail") : newest ? statusPill("ok") : statusPill("warn");
   const captured =
-    latest?.capturedAt && latest.capturedAt !== latest.collectedAt
-      ? ` The application reported capturing them at ${esc(latest.capturedAt.replace("T", " ").replace("Z", " UTC"))}.`
+    newest?.capturedAt && newest.capturedAt !== newest.collectedAt
+      ? ` The application reported capturing them at ${esc(newest.capturedAt.replace("T", " ").replace("Z", " UTC"))}.`
       : "";
 
   const body = `<h1>Metrics</h1>
