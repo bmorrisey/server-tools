@@ -139,6 +139,18 @@ pruned to `housekeeping.historyDays` (90 by default). That setting is right for
 check samples and events and wrong for a record meant to last years, and a
 long series should not quietly depend on a number set for something else.
 
+The alternative considered was per-topic retention inside the existing history
+pruner. A separate directory was chosen for two reasons. That pruner walks
+`history/`, matches any `-YYYY-MM-DD.jsonl`, and deletes by date regardless of
+topic, so a series it cannot reach is safe by construction rather than by an
+override staying correct through every later config edit and upgrade; and the
+failure mode here is data quietly going missing months later, which is worth
+removing the possibility of rather than guarding against. Month partitioning
+also keeps a decade to roughly 120 files rather than 3,650, which matters
+because charting a long window opens all of them. A test runs a real
+housekeeping pass and asserts it prunes the history file it is meant to and
+leaves the snapshot alone.
+
 A failed collection is recorded, shown on the page, and alerted on the same
 consecutive-failure rule as a check - loud, because a gap nobody noticed is the
 one thing that makes a years-long series worthless.

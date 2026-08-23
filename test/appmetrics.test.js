@@ -426,15 +426,22 @@ test("a source that is not a regular file is refused rather than blocking", asyn
   try {
     const fifo = path.join(dir, "pipe");
     execFileSync("mkfifo", [fifo]);
-    // A FIFO reports size 0 and then blocks forever on read.
-    await assert.rejects(
-      () => Promise.race([
-        fetchDocument({ name: "app", source: { file: fifo } }),
-        new Promise((_, reject) => setTimeout(() => reject(new Error("blocked forever")), 3000)),
-      ]),
-      /not a regular file/,
-    );
-    await assert.rejects(() => fetchDocument({ name: "app", source: { file: dir } }), /not a regular file/);
+
+    // A FIFO reports size 0, so a size check waves it through, and the read
+    // then blocks forever - on a scheduled collector that is a stuck job
+    // rather than a failed one. The read must never be reached, so the stub
+    // records whether it was: asserting on a hang would only turn a
+    // regression into a test suite that never finishes.
+    let readAttempted = false;
+    const readFile = async () => {
+      readAttempted = true;
+      return "{}";
+    };
+    await assert.rejects(() => fetchDocument({ name: "app", source: { file: fifo } }, { readFile }), /not a regular file/);
+    assert.equal(readAttempted, false, "refused before the read that would block");
+
+    await assert.rejects(() => fetchDocument({ name: "app", source: { file: dir } }, { readFile }), /not a regular file/);
+    assert.equal(readAttempted, false);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
