@@ -55,7 +55,7 @@ dashboard; `src/cli.js` runs any operation by hand.
 | `src/housekeep.js` | history pruning, temp expiry, configured dir cleanup |
 | `src/storage.js` | disk usage analysis + conservative, previewed reclamation |
 | `src/remediate.js` | plain-language incident diagnosis + validated one-click actions |
-| `src/web/` | dashboard: http server, magic-link auth, server-rendered UI, action routes |
+| `src/web/` | dashboard: http server, magic-link auth, server-rendered UI, action routes, read-only data connectors |
 | `deploy/` | Dockerfile, docker-compose.yml, config + env examples |
 | `test/` | node:test unit tests, no framework |
 

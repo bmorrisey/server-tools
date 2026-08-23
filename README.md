@@ -23,6 +23,7 @@ agent trusts is Node itself.
 | App metrics | Numbers an application knows about itself that the host cannot see - row counts, storage per tenant, queue depth. The app publishes a small versioned JSON document; the agent samples it on a schedule, keeps every snapshot for years, and charts it with pan and zoom. Deltas against the previous sample and a week earlier are computed on read, never stored |
 | Storage | A page that answers "what is eating my disk": images, container layers, volumes, build cache, and backups broken down by size and by Docker Compose project, plus previewed one-click cleanups. Volumes are reported but never deleted for you |
 | Incident cards | Every failing check becomes a plain-language card: what it means, the likely causes (with live detail like reclaimable disk space and recent container logs), and safe one-click fixes - restart a container, reclaim unused Docker space, run a backup now. No SSH, no jargon |
+| Dashboard compatibility | Runs alongside a charting stack instead of competing with it: register external dashboards (Grafana, Superset, Redash, anything with a URL) as linked tiles with live status, and serve the toolkit's own data to them through read-only Prometheus/JSON/CSV endpoints guarded by per-consumer bearer tokens |
 | Dashboard | Server-rendered admin portal: status tiles, host gauges, check history sparklines, backup/deploy/event views. Magic-link login (email or CLI-generated), long-lived device sessions |
 
 ## Screenshots
@@ -128,6 +129,8 @@ statuses - never application content.
 
 ## Documentation
 
+- [docs/DASHBOARDS.md](docs/DASHBOARDS.md) - linking external dashboards, and
+  feeding Grafana, Superset, or Redash from the data connectors
 - [docs/METRICS.md](docs/METRICS.md) - the application metrics contract: what
   your app publishes, the versioning rule, and the limits
 - [docs/DEPLOY.md](docs/DEPLOY.md) - step-by-step VPS deployment, reverse

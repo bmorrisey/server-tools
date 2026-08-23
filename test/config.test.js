@@ -386,3 +386,37 @@ test("a metrics url may not carry a credential", () => {
   assert.ok(t("https://user@host/m").some((p) => p.includes("must not embed a username or password")));
   assert.deepEqual(t("http://127.0.0.1:3000/internal/metrics"), []);
 });
+
+test("a dashboard entry needs a name and an http(s) url, and its check must exist", () => {
+  const t = (d, checks = []) => validateConfig(withDefaults({ ...minimal, checks, dashboards: [d] }));
+  assert.deepEqual(t({ name: "charts", url: "https://charts.example.com" }), []);
+  assert.ok(t({ name: "charts", url: "ftp://x" }).some((p) => p.includes("dashboards[0].url")));
+  assert.ok(t({ name: "../evil", url: "https://x" }).some((p) => p.includes("dashboards[0].name")));
+  assert.ok(t({ name: "c", url: "https://x", kind: "Not A Slug" }).some((p) => p.includes("dashboards[0].kind")));
+  // Status comes from an existing check, not a second prober, so the
+  // reference has to point at one.
+  assert.ok(t({ name: "c", url: "https://x", check: "ghost" }).some((p) => p.includes('check "ghost" is not a configured check')));
+  assert.deepEqual(
+    t({ name: "c", url: "https://x", check: "dash-http" }, [{ name: "dash-http", type: "http", url: "https://x/h" }]),
+    [],
+  );
+  const dupes = validateConfig(
+    withDefaults({ ...minimal, dashboards: [{ name: "a", url: "https://x" }, { name: "a", url: "https://y" }] }),
+  );
+  assert.ok(dupes.some((p) => p.includes('more than one entry named "a"')));
+});
+
+test("a connect token that resolved empty fails validation instead of authorizing nothing", () => {
+  // ${MISSING_VAR} interpolates to "", and an endpoint guarded by an empty
+  // token is an open endpoint that looks configured.
+  const t = (tokens) => validateConfig(withDefaults({ ...minimal, connect: { tokens } }));
+  assert.ok(t([{ name: "charting", token: "" }]).some((p) => p.includes("at least 16 characters")));
+  assert.ok(t([{ name: "charting", token: "short" }]).some((p) => p.includes("at least 16 characters")));
+  assert.ok(t([{ token: "x".repeat(32) }]).some((p) => p.includes("connect.tokens[0].name")));
+  assert.deepEqual(t([{ name: "charting", token: "x".repeat(32) }]), []);
+  assert.ok(
+    t([{ name: "a", token: "x".repeat(32) }, { name: "a", token: "y".repeat(32) }]).some((p) =>
+      p.includes('more than one token named "a"'),
+    ),
+  );
+});

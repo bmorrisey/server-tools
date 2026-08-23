@@ -14,7 +14,8 @@
     { "name": "memory", "type": "memory", "warnPct": 85, "failPct": 95, "interval": "2m" },
     { "name": "load", "type": "load", "warnPerCore": 1.5, "failPerCore": 3, "interval": "2m" },
     { "name": "db-backup-fresh", "type": "backup-freshness", "target": "app-db", "warnAfter": "26h", "failAfter": "50h", "interval": "30m" },
-    { "name": "media-backup-fresh", "type": "backup-freshness", "target": "app-media", "warnAfter": "26h", "failAfter": "50h", "interval": "30m" }
+    { "name": "media-backup-fresh", "type": "backup-freshness", "target": "app-media", "warnAfter": "26h", "failAfter": "50h", "interval": "30m" },
+    { "name": "charts-http", "type": "http", "url": "https://charts.example.com/api/health", "interval": "5m" }
   ],
 
   "backups": [
@@ -81,6 +82,22 @@
       "healthDelay": "6s"
     }
   ],
+
+  "dashboards": [
+    {
+      "name": "charts",
+      "label": "Team charts",
+      "url": "https://charts.example.com",
+      "kind": "grafana",
+      "check": "charts-http"
+    }
+  ],
+
+  "connect": {
+    "tokens": [
+      { "name": "charting", "token": "${CONNECT_TOKEN_CHARTING}" }
+    ]
+  },
 
   "appMetrics": [
     {
