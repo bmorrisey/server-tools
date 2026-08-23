@@ -328,3 +328,52 @@ test("exclude is refused on a source read through docker", () => {
     ).some((p) => p.includes("literal paths")),
   );
 });
+
+test("an application metrics target names exactly one source", () => {
+  const t = (m) => validateConfig(withDefaults({ ...minimal, appMetrics: [m] }));
+  assert.deepEqual(t({ name: "app", source: { url: "https://127.0.0.1/metrics" } }), []);
+  assert.deepEqual(t({ name: "app", source: { file: "/apps/app/metrics.json" } }), []);
+  assert.ok(t({ name: "app", source: {} }).some((p) => p.includes('exactly one of "url" or "file"')));
+  assert.ok(t({ name: "app", source: { url: "https://x/m", file: "/f" } }).some((p) => p.includes("exactly one")));
+  assert.ok(t({ name: "app", source: { url: "ftp://x/m" } }).some((p) => p.includes("http(s) URL")));
+  assert.ok(t({ name: "app" }).some((p) => p.includes("source must be an object")));
+});
+
+test("a metrics name that would escape the data directory is refused", () => {
+  // It becomes a filename and a URL path segment.
+  const t = (name) => validateConfig(withDefaults({ ...minimal, appMetrics: [{ name, source: { file: "/f" } }] }));
+  assert.ok(t("../../etc/passwd").some((p) => p.includes("appMetrics[0].name")));
+  assert.ok(t("has space").some((p) => p.includes("appMetrics[0].name")));
+  assert.deepEqual(t("app.one-two_3"), []);
+});
+
+test("two metrics targets cannot share a name", () => {
+  const problems = validateConfig(
+    withDefaults({
+      ...minimal,
+      appMetrics: [
+        { name: "app", source: { file: "/a" } },
+        { name: "app", source: { file: "/b" } },
+      ],
+    }),
+  );
+  // They share a directory and a URL space, so this would interleave two
+  // applications' history into one series.
+  assert.ok(problems.some((p) => p.includes('more than one target named "app"')));
+});
+
+test("metrics schedule, timeout and retention are validated", () => {
+  const t = (m) => validateConfig(withDefaults({ ...minimal, appMetrics: [{ name: "app", source: { file: "/f" }, ...m }] }));
+  assert.ok(t({ schedule: "whenever" }).some((p) => p.includes("is not a valid schedule")));
+  assert.ok(t({ timeout: "soon" }).some((p) => p.includes("is not a duration")));
+  assert.ok(t({ retentionDays: 0 }).some((p) => p.includes("positive integer")));
+  assert.ok(t({ retentionDays: 1.5 }).some((p) => p.includes("positive integer")));
+  assert.deepEqual(t({ schedule: "03:00", timeout: "30s", retentionDays: 3650 }), []);
+});
+
+test("a token only belongs on a url source", () => {
+  const problems = validateConfig(
+    withDefaults({ ...minimal, appMetrics: [{ name: "app", source: { file: "/f", token: "x" } }] }),
+  );
+  assert.ok(problems.some((p) => p.includes("only applies to a url source")));
+});

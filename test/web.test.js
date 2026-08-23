@@ -7,7 +7,7 @@ import { createHash } from "node:crypto";
 import { Store } from "../src/store.js";
 import { startWebServer } from "../src/web/server.js";
 import { createLoginToken } from "../src/web/auth.js";
-import { backupsPage, coverageBanners, deploysPage, sparkline, meter, statusPill } from "../src/web/ui.js";
+import { backupsPage, coverageBanners, deploysPage, metricsPage, sparkline, meter, statusPill, timeChart } from "../src/web/ui.js";
 
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), "st-web-"));
 const store = new Store(dir);
@@ -24,6 +24,7 @@ const config = {
     { name: "demo-db", type: "postgres", container: "db-1", user: "u", database: "d", passphrase: "x".repeat(16) },
   ],
   deploys: [{ name: "demo-app", dir: "/apps/demo", healthUrl: "http://127.0.0.1:1/health" }],
+  appMetrics: [{ name: "demo-metrics", label: "Demo application", source: { file: "/nonexistent/metrics.json" } }],
   alerts: {},
   web: { enabled: true, port: 0, bind: "127.0.0.1", baseUrl: "http://127.0.0.1", allowedEmails: ["op@example.com"], sessionDays: 1 },
 };
@@ -435,4 +436,118 @@ test("a deploy that succeeded with a caveat is not shown as a failure", () => {
   });
   assert.match(html, /status warn/);
   assert.doesNotMatch(html, /status fail/);
+});
+
+const day = 86_400_000;
+const seriesFixture = (n = 30) => {
+  const base = Date.parse("2026-08-23T03:00:00Z");
+  return Array.from({ length: n }, (_, i) => ({
+    collectedAt: new Date(base - (n - 1 - i) * day).toISOString(),
+    metrics: {
+      records_total: { value: 100_000 + i * 400, label: "Records", kind: "count" },
+      storage_used: { value: 8e9 + i * 1e7, label: "Storage used", kind: "bytes" },
+    },
+  }));
+};
+
+test("a metric chart ships its points so the browser can zoom without asking the server", () => {
+  // There is no fetch to make under default-src 'none', so the data has to
+  // arrive with the page or pan/zoom cannot work at all.
+  const points = [[1, 10], [2, 20], [3, 15]];
+  const html = timeChart(points, { kind: "count", label: "Records" });
+  assert.match(html, /<figure class="chart" data-points=/);
+  assert.match(html, /data-kind="count"/);
+  assert.match(html, /<polyline class="line" points="/);
+  assert.match(html, /class="reset" hidden/);
+  // Points are numbers by construction, so the data attribute carries no
+  // quotes to break out of. The label does come from the application, and it
+  // goes through the same escaping as every other untrusted string.
+  assert.deepEqual(JSON.parse(html.match(/data-points="([^"]+)"/)[1]), points);
+  const hostile = timeChart(points, { kind: "count", label: '"><script>alert(1)</script>' });
+  assert.doesNotMatch(hostile, /<script>/);
+  assert.match(hostile, /&lt;script&gt;/);
+});
+
+test("a chart with too little data says so instead of drawing a lie", () => {
+  assert.match(timeChart([], { kind: "count" }), /no samples yet/);
+  assert.match(timeChart([[1, 5]], { kind: "count" }), /one sample so far/);
+});
+
+test("the metrics page shows values, read-time deltas, and history", () => {
+  const html = metricsPage({
+    session: uiSession,
+    apps: [{ name: "demo", label: "Demo application" }],
+    app: { name: "demo", label: "Demo application" },
+    snapshots: seriesFixture(),
+    windowId: "90d",
+    state: { lastResult: "ok", lastDetail: "2 metrics" },
+  });
+  assert.match(html, /Demo application/);
+  assert.match(html, /Records/);
+  assert.match(html, /111,600/); // exact value, grouped
+  assert.match(html, /GiB/); // bytes formatted by kind
+  assert.match(html, /since the previous sample/);
+  assert.match(html, /vs a week earlier/);
+  assert.match(html, /window=1y/);
+  assert.equal((html.match(/<figure class="chart"/g) ?? []).length, 2);
+});
+
+test("a metric an app stopped publishing keeps its history and says it is gone", () => {
+  const snapshots = seriesFixture(3);
+  snapshots[0].metrics.retired_metric = { value: 1, label: "Retired", kind: "count" };
+  const html = metricsPage({
+    session: uiSession,
+    apps: [{ name: "demo" }],
+    app: { name: "demo" },
+    snapshots,
+    windowId: "90d",
+    state: {},
+  });
+  assert.match(html, /No longer published, history kept/);
+  assert.match(html, /retired_metric/);
+});
+
+test("a label from the application cannot inject markup into the dashboard", () => {
+  // The label is written by a separate application; it is untrusted input.
+  const snapshots = [
+    {
+      collectedAt: new Date().toISOString(),
+      metrics: { evil: { value: 1, label: '<img src=x onerror="alert(1)">', kind: "count" } },
+    },
+  ];
+  const html = metricsPage({
+    session: uiSession,
+    apps: [{ name: "demo" }],
+    app: { name: "demo" },
+    snapshots,
+    windowId: "90d",
+    state: {},
+  });
+  assert.doesNotMatch(html, /<img src=x/);
+  assert.match(html, /&lt;img src=x/);
+});
+
+test("with nothing configured the metrics page points at the setting", () => {
+  const html = metricsPage({ session: uiSession, apps: [], app: null, snapshots: [], windowId: "90d" });
+  assert.match(html, /No application metrics are configured/);
+  assert.match(html, /appMetrics/);
+});
+
+test("the metrics route renders and refuses an unknown application", async () => {
+  const url = createLoginToken({ config, store, email: "op@example.com" });
+  const res = await get(`/auth?token=${new URL(url).searchParams.get("token")}`);
+  const cookie = res.headers.get("set-cookie").split(";")[0];
+
+  const page = await get("/metrics", { cookie });
+  assert.equal(page.status, 200);
+  assert.match(await page.text(), /Demo application/);
+
+  const named = await get("/metrics/demo-metrics?window=1y", { cookie });
+  assert.equal(named.status, 200);
+
+  assert.equal((await get("/metrics/not-a-thing", { cookie })).status, 404);
+
+  // And the machine-readable snapshot carries collector state.
+  const api = await (await get("/api/status", { cookie })).json();
+  assert.ok("appMetrics" in api);
 });

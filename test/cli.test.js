@@ -97,3 +97,78 @@ test("export prints the strip flag that matches the archive's shape", () => {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("metrics and collect report clearly when nothing is configured", () => {
+  const { dir, file } = withConfig([]);
+  try {
+    for (const args of [["metrics"], ["collect"]]) {
+      const r = run(file, args);
+      assert.equal(r.code, 1, args[0]);
+      assert.match(r.out, /no application metrics are configured/);
+    }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("collect reads a published file and metrics prints it back", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "st-cli-"));
+  try {
+    const published = path.join(dir, "published.json");
+    fs.writeFileSync(
+      published,
+      JSON.stringify({
+        schema: 1,
+        metrics: {
+          records_total: { value: 128394, label: "Records", kind: "count" },
+          storage_used: { value: 8.42e9, label: "Storage used", kind: "bytes" },
+        },
+      }),
+    );
+    const config = {
+      dataDir: path.join(dir, "data"),
+      web: { enabled: false },
+      appMetrics: [{ name: "example", label: "Example application", source: { file: published } }],
+    };
+    const file = path.join(dir, "config.json");
+    fs.writeFileSync(file, JSON.stringify(config));
+
+    const collected = run(file, ["collect"]);
+    assert.equal(collected.code, 0, collected.out);
+    assert.match(collected.out, /OK {3}example: 2 metrics/);
+
+    const shown = run(file, ["metrics"]);
+    assert.equal(shown.code, 0);
+    assert.match(shown.out, /Example application \(example\)/);
+    assert.match(shown.out, /Records {2,}128,394/);
+    assert.match(shown.out, /Storage used {2,}7\.8 GiB/);
+
+    // An unknown application names the ones that exist rather than guessing.
+    const missing = run(file, ["metrics", "nope"]);
+    assert.equal(missing.code, 1);
+    assert.match(missing.out, /application metrics target "nope" not found; configured: example/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a failed collection exits non-zero and says why", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "st-cli-"));
+  try {
+    const config = {
+      dataDir: path.join(dir, "data"),
+      web: { enabled: false },
+      appMetrics: [{ name: "example", source: { file: path.join(dir, "missing.json") } }],
+    };
+    const file = path.join(dir, "config.json");
+    fs.writeFileSync(file, JSON.stringify(config));
+    const r = run(file, ["collect"]);
+    assert.equal(r.code, 1);
+    assert.match(r.out, /FAIL example:/);
+    // A gap nobody noticed is what makes a long series worthless.
+    const shown = run(file, ["metrics"]);
+    assert.match(shown.out, /never collected/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

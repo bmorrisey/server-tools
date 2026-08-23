@@ -7,6 +7,8 @@
  */
 import crypto from "node:crypto";
 import { escapeHtml as esc, formatBytes, formatDuration } from "../util.js";
+import { compactTime, compactValue, formatDelta, formatValue, numericValue } from "../appmetrics/snapshot.js";
+import { WINDOWS, buildSeries, computeDeltas, downsample, seriesKeys } from "../appmetrics/series.js";
 
 /**
  * The only script the dashboard ships. It confirms destructive actions and,
@@ -36,6 +38,186 @@ document.addEventListener("submit", function (e) {
     for (var i = 0; i < buttons.length; i++) buttons[i].disabled = true;
   }, 0);
 });
+
+/* Pan and zoom for application metric charts.
+ *
+ * The server draws the full range; this only redraws it for a narrower
+ * viewport. It has to repeat the geometry and the label formatting because the
+ * page cannot ask the server for either: the CSP is default-src 'none', so
+ * there is no fetch to make. renderChart() in ui.js is the other half, and the
+ * two must agree. */
+(function () {
+  var W = 720, H = 200, PL = 52, PR = 14, PT = 12, PB = 26;
+  var MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+
+  function trim(n) { return String(Math.round(n * 10) / 10); }
+
+  function bytes(n) {
+    var units = ["B","KiB","MiB","GiB","TiB"], i = 0, v = n;
+    while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+    return (v >= 100 || i === 0 ? Math.round(v) : v.toFixed(1)) + " " + units[i];
+  }
+
+  function duration(ms) {
+    if (ms < 1000) return Math.round(ms) + "ms";
+    var s = Math.floor(ms / 1000);
+    if (s < 60) return s + "s";
+    var m = Math.floor(s / 60);
+    if (m < 60) return (m + "m " + (s % 60 ? (s % 60) + "s" : "")).trim();
+    var h = Math.floor(m / 60);
+    if (h < 48) return (h + "h " + (m % 60 ? (m % 60) + "m" : "")).trim();
+    var d = Math.floor(h / 24);
+    return (d + "d " + (h % 24 ? (h % 24) + "h" : "")).trim();
+  }
+
+  function compact(v, kind) {
+    if (!isFinite(v)) return "-";
+    if (kind === "bytes") return bytes(v);
+    if (kind === "duration") return duration(v);
+    var suffix = kind === "percent" ? "%" : "", abs = Math.abs(v);
+    if (abs >= 1e9) return trim(v / 1e9) + "G" + suffix;
+    if (abs >= 1e6) return trim(v / 1e6) + "M" + suffix;
+    if (abs >= 1e4) return trim(v / 1e3) + "k" + suffix;
+    if (abs >= 100 || v === Math.round(v)) return Math.round(v) + suffix;
+    return trim(v) + suffix;
+  }
+
+  function stamp(ms, span) {
+    var d = new Date(ms), p = function (n) { return n < 10 ? "0" + n : "" + n; };
+    if (span <= 2 * 86400000) return p(d.getUTCHours()) + ":" + p(d.getUTCMinutes());
+    if (span <= 400 * 86400000) return d.getUTCDate() + " " + MONTHS[d.getUTCMonth()];
+    return MONTHS[d.getUTCMonth()] + " " + d.getUTCFullYear();
+  }
+
+  function esc(t) {
+    return String(t).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  }
+
+  function visible(pts, lo, hi) {
+    var out = [];
+    for (var i = 0; i < pts.length; i++) if (pts[i][0] >= lo && pts[i][0] <= hi) out.push(pts[i]);
+    return out;
+  }
+
+  function draw(fig) {
+    var pts = fig.pts, lo = fig.lo, hi = fig.hi, kind = fig.kind;
+    var svg = fig.el.querySelector("svg");
+    if (!svg) return;
+    var vis = visible(pts, lo, hi);
+    if (vis.length === 0) { svg.innerHTML = '<text class="empty" x="' + (W / 2) + '" y="' + (H / 2) + '" text-anchor="middle">no samples in this range</text>'; return; }
+
+    var vmin = vis[0][1], vmax = vis[0][1], i;
+    for (i = 1; i < vis.length; i++) {
+      if (vis[i][1] < vmin) vmin = vis[i][1];
+      if (vis[i][1] > vmax) vmax = vis[i][1];
+    }
+    if (vmax === vmin) { vmax = vmin + 1; vmin = vmin - 1; }
+    var span = hi - lo || 1;
+    var x = function (t) { return PL + ((t - lo) / span) * (W - PL - PR); };
+    var y = function (v) { return PT + (1 - (v - vmin) / (vmax - vmin)) * (H - PT - PB); };
+
+    var parts = [], ticks = [vmax, (vmax + vmin) / 2, vmin];
+    for (i = 0; i < ticks.length; i++) {
+      var ty = y(ticks[i]);
+      parts.push('<line class="grid" x1="' + PL + '" y1="' + ty.toFixed(1) + '" x2="' + (W - PR) + '" y2="' + ty.toFixed(1) + '"/>');
+      parts.push('<text class="ylab" x="' + (PL - 6) + '" y="' + (ty + 3.5).toFixed(1) + '" text-anchor="end">' + esc(compact(ticks[i], kind)) + "</text>");
+    }
+    for (i = 0; i < 3; i++) {
+      var t = lo + (span * i) / 2, anchor = i === 0 ? "start" : i === 2 ? "end" : "middle";
+      parts.push('<text class="xlab" x="' + x(t).toFixed(1) + '" y="' + (H - 8) + '" text-anchor="' + anchor + '">' + esc(stamp(t, span)) + "</text>");
+    }
+    var line = [];
+    for (i = 0; i < vis.length; i++) line.push(x(vis[i][0]).toFixed(1) + "," + y(vis[i][1]).toFixed(1));
+    parts.push('<polyline class="line" points="' + line.join(" ") + '"/>');
+    var last = vis[vis.length - 1];
+    parts.push('<circle class="dot" cx="' + x(last[0]).toFixed(1) + '" cy="' + y(last[1]).toFixed(1) + '" r="3.5"/>');
+    svg.innerHTML = parts.join("");
+    fig.vis = vis;
+  }
+
+  function readout(fig, clientX) {
+    var svg = fig.el.querySelector("svg");
+    if (!svg || !fig.vis || !fig.vis.length) return;
+    var box = svg.getBoundingClientRect();
+    var frac = (clientX - box.left) / box.width;
+    var px = frac * W;
+    var t = fig.lo + ((px - PL) / (W - PL - PR)) * (fig.hi - fig.lo);
+    var best = fig.vis[0];
+    for (var i = 1; i < fig.vis.length; i++) {
+      if (Math.abs(fig.vis[i][0] - t) < Math.abs(best[0] - t)) best = fig.vis[i];
+    }
+    var out = fig.el.querySelector(".readout");
+    if (out) out.textContent = stamp(best[0], fig.hi - fig.lo) + " UTC - " + compact(best[1], fig.kind);
+  }
+
+  function clamp(fig) {
+    var min = fig.pts[0][0], max = fig.pts[fig.pts.length - 1][0];
+    var floor = Math.max(60000, (max - min) / 5000);
+    if (fig.hi - fig.lo < floor) fig.hi = fig.lo + floor;
+    if (fig.lo < min) { fig.hi += min - fig.lo; fig.lo = min; }
+    if (fig.hi > max) { fig.lo -= fig.hi - max; fig.hi = max; }
+    if (fig.lo < min) fig.lo = min;
+    var btn = fig.el.querySelector(".reset");
+    if (btn) btn.hidden = fig.lo <= min && fig.hi >= max;
+  }
+
+  var figures = document.querySelectorAll("figure.chart[data-points]");
+  for (var f = 0; f < figures.length; f++) {
+    (function (el) {
+      var pts;
+      try { pts = JSON.parse(el.getAttribute("data-points")); } catch (e) { return; }
+      if (!pts || pts.length < 2) return;
+      var fig = { el: el, pts: pts, kind: el.getAttribute("data-kind") || "number", lo: pts[0][0], hi: pts[pts.length - 1][0] };
+      var full = { lo: fig.lo, hi: fig.hi };
+      var drag = null;
+
+      el.addEventListener("wheel", function (e) {
+        e.preventDefault();
+        var svg = el.querySelector("svg");
+        var box = svg.getBoundingClientRect();
+        var frac = Math.max(0, Math.min(1, (e.clientX - box.left) / box.width));
+        var focus = fig.lo + (fig.hi - fig.lo) * frac;
+        var factor = e.deltaY > 0 ? 1.25 : 0.8;
+        fig.lo = focus - (focus - fig.lo) * factor;
+        fig.hi = focus + (fig.hi - focus) * factor;
+        clamp(fig);
+        draw(fig);
+      }, { passive: false });
+
+      el.addEventListener("pointerdown", function (e) {
+        if (e.target.closest(".reset")) return;
+        drag = { x: e.clientX, lo: fig.lo, hi: fig.hi };
+        el.setPointerCapture(e.pointerId);
+      });
+      el.addEventListener("pointermove", function (e) {
+        if (!drag) { readout(fig, e.clientX); return; }
+        var svg = el.querySelector("svg");
+        var box = svg.getBoundingClientRect();
+        var shift = ((e.clientX - drag.x) / box.width) * (drag.hi - drag.lo);
+        fig.lo = drag.lo - shift;
+        fig.hi = drag.hi - shift;
+        clamp(fig);
+        draw(fig);
+      });
+      el.addEventListener("pointerup", function (e) {
+        drag = null;
+        if (el.hasPointerCapture(e.pointerId)) el.releasePointerCapture(e.pointerId);
+      });
+      el.addEventListener("pointercancel", function () { drag = null; });
+
+      var reset = el.querySelector(".reset");
+      if (reset) {
+        reset.addEventListener("click", function () {
+          fig.lo = full.lo;
+          fig.hi = full.hi;
+          clamp(fig);
+          draw(fig);
+        });
+      }
+      draw(fig);
+    })(figures[f]);
+  }
+})();
 `;
 
 /** CSP source expression that allows exactly the script above. */
@@ -116,6 +298,30 @@ td .detail { color: var(--muted); font-size: 13px; }
 .meter.warn > i { background: #fab219; }
 .meter.fail > i { background: var(--crit); }
 .spark { display: block; margin-top: 8px; }
+figure.chart { margin: 0; touch-action: pan-y; }
+figure.chart svg { display: block; width: 100%; height: auto; cursor: grab; }
+figure.chart svg:active { cursor: grabbing; }
+figure.chart .line { fill: none; stroke: var(--series); stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+figure.chart .dot { fill: var(--series); stroke: var(--surface); stroke-width: 2; }
+figure.chart .grid { stroke: var(--grid); stroke-width: 1; }
+figure.chart .ylab, figure.chart .xlab, figure.chart .empty {
+  fill: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+figure.chart figcaption { display: flex; align-items: center; gap: 10px; justify-content: space-between;
+  color: var(--muted); font-size: 12.5px; min-height: 24px; }
+figure.chart .readout { font-variant-numeric: tabular-nums; }
+figure.chart .reset { padding: 3px 9px; font-size: 12px; border: 1px solid var(--border);
+  border-radius: 7px; background: var(--surface); color: var(--ink-2); cursor: pointer; }
+.metric-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; margin: 0 0 2px; }
+.metric-head h3 { margin: 0; font-size: 15px; }
+.metric-head .key { color: var(--muted); font-size: 12.5px; font-family: ui-monospace, monospace; }
+.metric-value { font-size: 26px; font-weight: 600; letter-spacing: -0.01em; }
+.deltas { display: flex; gap: 14px; flex-wrap: wrap; color: var(--muted); font-size: 13px; margin-top: 2px; }
+.deltas .up { color: var(--good); }
+.deltas .down { color: var(--crit); }
+.windows { display: flex; gap: 6px; flex-wrap: wrap; margin: 0 0 16px; }
+.windows a { text-decoration: none; color: var(--ink-2); font-size: 13px; padding: 4px 11px;
+  border: 1px solid var(--border); border-radius: 999px; }
+.windows a[aria-current="true"] { background: var(--surface); color: var(--ink); font-weight: 600; }
 .spark polyline { fill: none; stroke: var(--series); stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
 .spark .wash { fill: var(--series); opacity: 0.1; stroke: none; }
 .spark .dot { fill: var(--series); stroke: var(--surface); stroke-width: 2; }
@@ -298,6 +504,7 @@ export function layout({ title, page, session, body, flash }) {
     ["/storage", "Storage"],
     ["/checks", "Checks"],
     ["/backups", "Backups"],
+    ["/metrics", "Metrics"],
     ["/deploys", "Deploys"],
     ["/events", "Events"],
   ]
@@ -962,4 +1169,154 @@ export function eventsPage({ session, events, flash }) {
 <tbody>${rows || '<tr><td colspan="5" class="detail">Nothing recorded yet.</td></tr>'}</tbody>
 </table>`;
   return layout({ title: "Events", page: "/events", session, body, flash });
+}
+
+/* -------------------------------------------------------------------------
+ * Application metrics
+ * ---------------------------------------------------------------------- */
+
+// Chart geometry. Mirrored by the pan/zoom handler in SCRIPT above; the two
+// have to agree, because the browser redraws what this renders.
+const CHART = { w: 720, h: 200, padL: 52, padR: 14, padT: 12, padB: 26 };
+
+/**
+ * A time series as inline SVG, drawn server-side over its full range.
+ *
+ * The points ride along in a data attribute so the hashed script can redraw a
+ * narrower viewport without a request. Without JavaScript the chart is still
+ * the whole series, which is the useful default.
+ */
+export function timeChart(points, { kind = "number", label = "" } = {}) {
+  if (points.length < 2) {
+    return `<figure class="chart"><figcaption>${esc(points.length ? "one sample so far" : "no samples yet")}</figcaption></figure>`;
+  }
+  const { w, h, padL, padR, padT, padB } = CHART;
+  const lo = points[0][0];
+  const hi = points[points.length - 1][0];
+  const span = hi - lo || 1;
+  let vmin = points[0][1];
+  let vmax = points[0][1];
+  for (const [, v] of points) {
+    if (v < vmin) vmin = v;
+    if (v > vmax) vmax = v;
+  }
+  if (vmax === vmin) {
+    vmax = vmin + 1;
+    vmin -= 1;
+  }
+  const x = (t) => padL + ((t - lo) / span) * (w - padL - padR);
+  const y = (v) => padT + (1 - (v - vmin) / (vmax - vmin)) * (h - padT - padB);
+
+  const parts = [];
+  for (const tick of [vmax, (vmax + vmin) / 2, vmin]) {
+    const ty = y(tick);
+    parts.push(`<line class="grid" x1="${padL}" y1="${ty.toFixed(1)}" x2="${w - padR}" y2="${ty.toFixed(1)}"/>`);
+    parts.push(
+      `<text class="ylab" x="${padL - 6}" y="${(ty + 3.5).toFixed(1)}" text-anchor="end">${esc(compactValue(tick, kind))}</text>`,
+    );
+  }
+  for (let i = 0; i < 3; i++) {
+    const t = lo + (span * i) / 2;
+    const anchor = i === 0 ? "start" : i === 2 ? "end" : "middle";
+    parts.push(
+      `<text class="xlab" x="${x(t).toFixed(1)}" y="${h - 8}" text-anchor="${anchor}">${esc(compactTime(t, span))}</text>`,
+    );
+  }
+  const line = points.map(([t, v]) => `${x(t).toFixed(1)},${y(v).toFixed(1)}`).join(" ");
+  parts.push(`<polyline class="line" points="${line}"/>`);
+  const [lt, lv] = points[points.length - 1];
+  parts.push(`<circle class="dot" cx="${x(lt).toFixed(1)}" cy="${y(lv).toFixed(1)}" r="3.5"/>`);
+
+  const summary = `${label ? `${label}: ` : ""}${points.length} samples, ${compactValue(vmin, kind)} to ${compactValue(vmax, kind)}`;
+  return `<figure class="chart" data-points="${esc(JSON.stringify(points))}" data-kind="${esc(kind)}">
+<svg viewBox="0 0 ${w} ${h}" role="img" aria-label="${esc(summary)}">${parts.join("")}</svg>
+<figcaption><span class="readout">${esc(summary)} (UTC)</span><button type="button" class="reset" hidden>Reset zoom</button></figcaption>
+</figure>`;
+}
+
+/** "+412 since yesterday" and the week-ago comparison, both read-time. */
+function deltaLine(deltas, metric) {
+  const opts = { kind: metric.kind, precision: metric.precision };
+  const bits = [];
+  const render = (entry, when) => {
+    if (!entry) return;
+    const text = formatDelta(entry.delta, opts);
+    if (text === null) return;
+    const cls = entry.delta > 0 ? "up" : entry.delta < 0 ? "down" : "";
+    bits.push(`<span class="${cls}">${esc(text)}</span> <span>${esc(when)}</span>`);
+  };
+  render(deltas.previous, "since the previous sample");
+  render(deltas.weekAgo, "vs a week earlier");
+  return bits.length ? `<div class="deltas">${bits.join("")}</div>` : "";
+}
+
+/**
+ * One app's metrics: a block per published number, each with the current
+ * value, its read-time deltas, and its history.
+ */
+export function metricsPage({ session, apps, app, snapshots, windowId, state, flash }) {
+  const tabs = apps
+    .map(
+      (a) =>
+        `<a href="/metrics/${encodeURIComponent(a.name)}"${a.name === app?.name ? ' aria-current="page"' : ""}>${esc(a.label ?? a.name)}</a>`,
+    )
+    .join("");
+
+  if (!app) {
+    const body = `<h1>Metrics</h1>
+<p class="sub">Numbers your applications publish about themselves, sampled on a schedule and kept for the long view.</p>
+<p class="sub">No application metrics are configured. See <code>appMetrics</code> in docs/CONFIG.md.</p>`;
+    return layout({ title: "Metrics", page: "/metrics", session, body, flash });
+  }
+
+  const latest = snapshots[snapshots.length - 1];
+  const { current, retired } = seriesKeys(snapshots);
+  const windowLinks = WINDOWS.map(
+    (win) =>
+      `<a href="/metrics/${encodeURIComponent(app.name)}?window=${win.id}"${win.id === windowId ? ' aria-current="true"' : ""}>${esc(win.label)}</a>`,
+  ).join("");
+
+  const blocks = current
+    .map((key) => {
+      const metric = latest.metrics[key];
+      const points = downsample(buildSeries(snapshots, key, { numericValue }));
+      const deltas = computeDeltas(buildSeries(snapshots, key, { numericValue }));
+      const label = metric.label ?? key;
+      const breakdown =
+        metric.kind === "breakdown"
+          ? `<div class="detail">${esc(formatValue(metric.value, { kind: "breakdown" }))}</div>`
+          : "";
+      return `<div class="card" style="margin-bottom:14px">
+<div class="metric-head"><h3>${esc(label)}</h3><span class="key">${esc(key)}</span></div>
+<div class="metric-value">${esc(formatValue(metric.value, { kind: metric.kind, precision: metric.precision }))}</div>
+${breakdown}
+${deltaLine(deltas, metric)}
+${timeChart(points, { kind: metric.kind, label })}
+</div>`;
+    })
+    .join("");
+
+  const retiredNote = retired.length
+    ? `<p class="sub">No longer published, history kept: ${retired.map((k) => `<code>${esc(k)}</code>`).join(", ")}</p>`
+    : "";
+
+  const collected = latest ? formatDuration(Date.now() - Date.parse(latest.collectedAt)) : null;
+  const status = state?.lastResult === "fail" ? statusPill("fail") : statusPill("ok");
+  const captured =
+    latest?.capturedAt && latest.capturedAt !== latest.collectedAt
+      ? ` The application reported capturing them at ${esc(latest.capturedAt.replace("T", " ").replace("Z", " UTC"))}.`
+      : "";
+
+  const body = `<h1>Metrics</h1>
+<p class="sub">Numbers your applications publish about themselves. Deltas are computed when this page is drawn, never stored.</p>
+${apps.length > 1 ? `<div class="windows">${tabs}</div>` : ""}
+<div class="hero"><span class="headline">${esc(app.label ?? app.name)}</span>${status}
+  <span class="sub" style="margin:0">${collected ? `collected ${esc(collected)} ago` : "never collected"}${esc(
+    state?.lastDetail ? ` - ${state.lastDetail}` : "",
+  )}</span></div>
+${captured ? `<p class="sub">${captured}</p>` : ""}
+<div class="windows">${windowLinks}</div>
+${retiredNote}
+${blocks || '<p class="sub">This application has not published any metrics yet.</p>'}`;
+  return layout({ title: `Metrics: ${app.label ?? app.name}`, page: "/metrics", session, body, flash });
 }

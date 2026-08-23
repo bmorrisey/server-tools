@@ -13,6 +13,7 @@
  *   GET  /storage          disk breakdown + safe cleanup options }
  *   GET  /checks[/name]    checks + history  }
  *   GET  /backups          backup targets    }
+ *   GET  /metrics[/app]    application metrics }
  *   GET  /deploys          deploy history    }
  *   GET  /events           event log         }
  *   POST /action           run one validated remediation (CSRF protected)
@@ -27,6 +28,7 @@ import * as metrics from "../metrics.js";
 import * as storage from "../storage.js";
 import { sendMail } from "../smtp.js";
 import { coverageNotes } from "../config.js";
+import { WINDOWS, windowById } from "../appmetrics/series.js";
 import { diagnose, gatherContext, runAction, ACTION_IDS } from "../remediate.js";
 import { logger } from "../log.js";
 
@@ -308,6 +310,28 @@ export function startWebServer({ config, store, docker, alerter }) {
     if (path === "/deploys") {
       return send(res, 200, ui.deploysPage({ session, deploys, targets: config.deploys, events, flash }));
     }
+    if (path === "/metrics" || path.startsWith("/metrics/")) {
+      const apps = config.appMetrics ?? [];
+      const wanted = path.startsWith("/metrics/") ? decodeURIComponent(path.slice("/metrics/".length)) : null;
+      const app = wanted ? apps.find((a) => a.name === wanted) : apps[0];
+      if (wanted && !app) return send(res, 404, "<h1>No such application</h1>");
+      const win = windowById(url.searchParams.get("window") ?? "90d");
+      const sinceMs = win.days === null ? null : Date.now() - win.days * 86_400_000;
+      const snapshots = app ? store.readSnapshots(app.name, { sinceMs }) : [];
+      return send(
+        res,
+        200,
+        ui.metricsPage({
+          session,
+          apps,
+          app: app ?? null,
+          snapshots,
+          windowId: win.id,
+          state: store.readState("metrics", {})[app?.name],
+          flash,
+        }),
+      );
+    }
     if (path === "/events") {
       return send(res, 200, ui.eventsPage({ session, events, flash }));
     }
@@ -325,6 +349,7 @@ export function startWebServer({ config, store, docker, alerter }) {
         },
         checks,
         backups,
+        appMetrics: store.readState("metrics", {}),
         externalTargets: (config.backups ?? [])
           .filter((b) => b.type === "external")
           .map((b) => ({ name: b.name, note: b.note })),

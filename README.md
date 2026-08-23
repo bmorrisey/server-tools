@@ -20,6 +20,7 @@ agent trusts is Node itself.
 | Restore | One-command restore, plus a `drill` command that proves an artifact before you need it: a database is restored into a scratch database and validated, a media archive is read back and checked file by file against its manifest |
 | Deploys | `server-tools deploy <app> <tag>`: pull a prebuilt image from a registry (nothing compiles on the box), re-point the stack, prove the named services are running that exact image, health-verify, and roll back to the previous tag automatically if it does not come up. Building from a git checkout on the box is still supported for single-app hosts |
 | Housekeeping | Prunes its own history, expires temp files, age-based cleanup of directories you configure |
+| App metrics | Numbers an application knows about itself that the host cannot see - row counts, storage per tenant, queue depth. The app publishes a small versioned JSON document; the agent samples it on a schedule, keeps every snapshot for years, and charts it with pan and zoom. Deltas against the previous sample and a week earlier are computed on read, never stored |
 | Storage | A page that answers "what is eating my disk": images, container layers, volumes, build cache, and backups broken down by size and by Docker Compose project, plus previewed one-click cleanups. Volumes are reported but never deleted for you |
 | Incident cards | Every failing check becomes a plain-language card: what it means, the likely causes (with live detail like reclaimable disk space and recent container logs), and safe one-click fixes - restart a container, reclaim unused Docker space, run a backup now. No SSH, no jargon |
 | Dashboard | Server-rendered admin portal: status tiles, host gauges, check history sparklines, backup/deploy/event views. Magic-link login (email or CLI-generated), long-lived device sessions |
@@ -91,6 +92,8 @@ src/
   smtp.js         minimal SMTP client (STARTTLS/implicit TLS, AUTH)
   docker.js       Docker Engine API over the unix socket (no docker CLI needed)
   metrics.js      host cpu/mem/load/disk from /proc and statfs
+  appmetrics/     application metrics: the published contract, the collector,
+                  and the read-time series and deltas
   store.js        JSON state + JSONL history under dataDir (cat/jq friendly)
   backup/         pg_dump + media backup, encryption, S3 SigV4, retention,
                   restore, drill
@@ -125,6 +128,8 @@ statuses - never application content.
 
 ## Documentation
 
+- [docs/METRICS.md](docs/METRICS.md) - the application metrics contract: what
+  your app publishes, the versioning rule, and the limits
 - [docs/DEPLOY.md](docs/DEPLOY.md) - step-by-step VPS deployment, reverse
   proxy wiring, first login
 - [docs/CONFIG.md](docs/CONFIG.md) - every config field, with examples
