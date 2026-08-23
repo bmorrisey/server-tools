@@ -12,6 +12,7 @@ import { Store } from "../src/store.js";
 import { startWebServer } from "../src/web/server.js";
 import { createLoginToken } from "../src/web/auth.js";
 import {
+  COLUMNS,
   MAX_DAYS,
   MAX_ROWS,
   authorize,
@@ -20,6 +21,8 @@ import {
   csvField,
   endpointIndex,
   eventRows,
+  historyRows,
+  hostRows,
   metricRows,
   parseDays,
   prometheusText,
@@ -288,4 +291,41 @@ test("bad parameters and unknown series answer clearly", async () => {
   // The index names what exists, so a consumer can discover rather than guess.
   const index = await (await hit("/connect", auth)).json();
   assert.ok(index.endpoints.some((e) => e.path === "/connect/metrics/demo-app.json"));
+});
+
+test("an empty series still carries its header, because a schema is not data", () => {
+  // A consumer pointed at a fresh install infers its columns from the
+  // header; a headerless empty CSV breaks it at exactly the moment the
+  // operator is setting it up.
+  const csv = toCsv([], COLUMNS.checks);
+  assert.equal(csv, "name,type,status,value,unit,detail,at\r\n");
+  for (const columns of Object.values(COLUMNS)) {
+    assert.ok(toCsv([], columns).length > 2, "every series has a declared schema");
+  }
+});
+
+test("one oversized snapshot cannot exceed the row cap", () => {
+  // The per-snapshot break only fires between snapshots, so a single
+  // snapshot larger than the cap is what the final slice exists for.
+  const value = Object.fromEntries(Array.from({ length: MAX_ROWS + 100 }, (_, i) => [`c${i}`, i]));
+  const rows = metricRows([{ collectedAt: "2026-08-24T00:00:00Z", metrics: { big: { value, kind: "breakdown" } } }]);
+  assert.equal(rows.length, MAX_ROWS);
+});
+
+test("host and history rows keep their shape and drop nothing silently", () => {
+  const [h] = hostRows([{ ts: "t", cpuPct: 12, memPct: 40, load1: 0.5 }]);
+  assert.deepEqual(h, { at: "t", cpuPct: 12, memPct: 40, load1: 0.5 });
+  const [gap] = hostRows([{ ts: "t", cpuPct: null }]);
+  assert.equal(gap.cpuPct, null, "a missing sample is null, not zero");
+  const [row] = historyRows([{ ts: "t", name: "demo", status: "ok", value: 9, detail: "d" }]);
+  assert.deepEqual(row, { at: "t", name: "demo", status: "ok", value: 9, detail: "d" });
+});
+
+test("a fresh series over the wire is an empty table, not an empty file", async () => {
+  const auth = { authorization: "Bearer a-live-test-token-long-enough" };
+  const res = await hit("/connect/host.csv", auth);
+  assert.equal(res.status, 200);
+  assert.equal(await res.text(), "at,cpuPct,memPct,load1\r\n");
+  const json = await (await hit("/connect/host.json", auth)).json();
+  assert.deepEqual(json, []);
 });

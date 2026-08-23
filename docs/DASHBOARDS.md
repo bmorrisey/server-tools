@@ -35,7 +35,7 @@ product. The per-tool sections below are setup recipes, not integrations.
 | `name` | yes | Unique slug. |
 | `url` | yes | Where the dashboard lives. The tile links straight to it. |
 | `label` | no | What the tile says. Defaults to the name. |
-| `kind` | no | A badge on the tile (`grafana`, `superset`, `redash`, anything). A label, not behaviour. |
+| `kind` | no | Shown on the tile beside the URL (`grafana`, `superset`, `redash`, anything). A label, not behaviour. |
 | `check` | no | The name of a configured check; its state becomes the tile's status pill. |
 
 Status reuses the check machinery rather than adding a second prober: the
@@ -90,11 +90,11 @@ setting up a consumer for you, point it there instead of at this prose.
 | --- | --- |
 | `/connect/prometheus` | Current state of everything, as gauges in the Prometheus text format. |
 | `/connect/checks.{json,csv}` | Latest state of every check. |
-| `/connect/check-history.{json,csv}?check=&days=` | Check samples over time. |
-| `/connect/host.{json,csv}?days=` | Host cpu/memory/load samples, one per minute while the agent runs. |
-| `/connect/events.{json,csv}?days=` | Everything the toolkit did or noticed. |
+| `/connect/check-history.{json,csv}?check=&days=` | Check samples over time. `days` defaults to 7. |
+| `/connect/host.{json,csv}?days=` | Host cpu/memory/load samples, one per minute while the agent runs. `days` defaults to 7. |
+| `/connect/events.{json,csv}?days=` | Everything the toolkit did or noticed. `days` defaults to 7. |
 | `/connect/backups.{json,csv}` | Latest state of every backup target. |
-| `/connect/metrics/<app>.{json,csv}?days=` | Application metric snapshots, one row per value. |
+| `/connect/metrics/<app>.{json,csv}?days=` | Application metric snapshots, one row per value. `days` defaults to 90. |
 
 JSON endpoints return an array of flat objects; CSV endpoints return the same
 rows with a header line. Flat rows on purpose: the consumers are SQL engines
@@ -225,17 +225,25 @@ The agent already sits behind your reverse proxy with TLS
 nothing new to expose. A consumer on the same box can use
 `http://127.0.0.1:9090/connect/...` and skip the proxy entirely.
 
-Add one line per consumer to the `.env` file next to your compose file (see
-[`deploy/.env.example`](../deploy/.env.example)):
+Each consumer needs three lines: one in `.env`, one in the compose file, and
+one in `config.json`.
 
 ```bash
+# .env, next to your compose file (see deploy/.env.example)
 CONNECT_TOKEN_CHARTING=   # openssl rand -hex 32
-CONNECT_TOKEN_REPORTS=
 ```
 
-reference them from `config.json` as shown above, and restart the agent.
-`server-tools validate` will refuse a token whose variable is missing rather
-than let an empty token stand guard.
+```yaml
+# docker-compose.yml, in the agent's environment block - compose only
+# forwards variables named here, so a token missing from this list reaches
+# the agent as an empty string
+CONNECT_TOKEN_CHARTING: ${CONNECT_TOKEN_CHARTING:-}
+```
+
+reference it from `config.json` as shown above, and restart the agent.
+`server-tools validate` refuses a token that resolved empty rather than let
+it stand guard - so a forgotten line fails loudly at startup instead of
+quietly exposing nothing.
 
 ## What this is not
 
@@ -244,3 +252,9 @@ chose to publish - the same things the dashboard shows, never application
 content. There is no query language, no write path, and no per-panel API:
 the tool on the other end is the query engine, and this stays the small,
 auditable data source underneath it.
+
+CSV values are quoted per RFC 4180 and otherwise passed through untouched -
+including a value that begins with a formula character, since mangling data
+to defend a spreadsheet would corrupt it for the query engines these
+endpoints exist for. Treat the CSV as machine input; if you hand one to a
+spreadsheet, use its text-import path.

@@ -220,8 +220,8 @@ export function startWebServer({ config, store, docker, alerter }) {
       return redirect(res, "/", { "set-cookie": auth.sessionCookie(config, sessionId) });
     }
 
-    // Data connectors: bearer-token consumers (Grafana, Superset, Redash and
-    // friends) cannot do magic-link cookies, so this namespace authenticates
+    // Data connectors: bearer-token consumers (external charting stacks)
+    // cannot do magic-link cookies, so this namespace authenticates
     // itself. A signed-in browser also works, so an operator can eyeball an
     // endpoint. Placed before the session gate on purpose; everything in it is
     // read-only and GET-only.
@@ -396,8 +396,10 @@ export function startWebServer({ config, store, docker, alerter }) {
   /** One /connect route. Auth has already happened. */
   async function serveConnect(path, url, res) {
     const appNames = (config.appMetrics ?? []).map((a) => a.name);
-    const sendRows = (rows, format) => {
-      if (format === "csv") return send(res, 200, connect.toCsv(rows), { "content-type": "text/csv; charset=utf-8" });
+    const sendRows = (rows, format, columns) => {
+      if (format === "csv") {
+        return send(res, 200, connect.toCsv(rows, columns), { "content-type": "text/csv; charset=utf-8" });
+      }
       return send(res, 200, rows);
     };
     const days = (fallback) => {
@@ -423,25 +425,26 @@ export function startWebServer({ config, store, docker, alerter }) {
     if (!match) return send(res, 404, { error: "unknown connect endpoint; GET /connect lists them" });
     const [, series, format] = match;
 
-    if (series === "checks") return sendRows(connect.checkRows(store.readState("checks", {})), format);
-    if (series === "backups") return sendRows(connect.backupRows(store.readState("backups", {})), format);
+    if (series === "checks") return sendRows(connect.checkRows(store.readState("checks", {})), format, connect.COLUMNS.checks);
+    if (series === "backups")
+      return sendRows(connect.backupRows(store.readState("backups", {})), format, connect.COLUMNS.backups);
     if (series === "check-history") {
       const maxDays = days(7);
       if (maxDays === null) return;
       let samples = store.recent("checks", { limit: connect.MAX_ROWS, maxDays });
       const only = url.searchParams.get("check");
       if (only) samples = samples.filter((s) => s.name === only);
-      return sendRows(connect.historyRows(samples), format);
+      return sendRows(connect.historyRows(samples), format, connect.COLUMNS["check-history"]);
     }
     if (series === "host") {
       const maxDays = days(7);
       if (maxDays === null) return;
-      return sendRows(connect.hostRows(store.recent("host", { limit: connect.MAX_ROWS, maxDays })), format);
+      return sendRows(connect.hostRows(store.recent("host", { limit: connect.MAX_ROWS, maxDays })), format, connect.COLUMNS.host);
     }
     if (series === "events") {
       const maxDays = days(7);
       if (maxDays === null) return;
-      return sendRows(connect.eventRows(store.recent("events", { limit: connect.MAX_ROWS, maxDays })), format);
+      return sendRows(connect.eventRows(store.recent("events", { limit: connect.MAX_ROWS, maxDays })), format, connect.COLUMNS.events);
     }
     // metrics/<app>
     const app = decodeURIComponent(series.slice("metrics/".length));
@@ -452,7 +455,7 @@ export function startWebServer({ config, store, docker, alerter }) {
       sinceMs: Date.now() - maxDays * 86_400_000,
       limit: ui.PAGE_SNAPSHOTS,
     });
-    return sendRows(connect.metricRows(snapshots), format);
+    return sendRows(connect.metricRows(snapshots), format, connect.COLUMNS.metrics);
   }
 
   const { port, bind } = config.web;

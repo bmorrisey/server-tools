@@ -8,7 +8,7 @@
  * to get these numbers into it. Three formats cover the common consumers:
  *
  *   /connect/prometheus       text exposition, for anything that scrapes -
- *                             which is how Grafana is usually fed
+ *                             which is how the common charting stacks are fed
  *   /connect/<series>.json    flat rows, for JSON-speaking query runners
  *   /connect/<series>.csv     the same rows, for SQL tools that can query a
  *                             CSV URL
@@ -209,6 +209,21 @@ function age(now, iso) {
   return Number.isFinite(t) ? Math.max(0, Math.round((now - t) / 1000)) : null;
 }
 
+/**
+ * The columns of each series, in order. Declared rather than derived from the
+ * first row, because an empty series still has a schema: a consumer pointed
+ * at a fresh install infers its columns from the header, and a headerless
+ * empty CSV breaks it at exactly the moment the operator is setting it up.
+ */
+export const COLUMNS = {
+  checks: ["name", "type", "status", "value", "unit", "detail", "at"],
+  "check-history": ["at", "name", "status", "value", "detail"],
+  host: ["at", "cpuPct", "memPct", "load1"],
+  events: ["at", "topic", "kind", "name", "detail"],
+  backups: ["target", "lastResult", "lastSuccess", "sizeBytes", "offsite", "lastDrill", "lastDrillResult"],
+  metrics: ["collectedAt", "key", "label", "kind", "category", "value"],
+};
+
 /* -------------------------------------------------------------------------
  * Row builders
  *
@@ -361,13 +376,18 @@ export function endpointIndex({ apps = [] } = {}) {
         description: "Current state of checks, backups, host, and application metrics, as gauges.",
       },
       ...series("checks", "Latest state of every configured check."),
-      ...series("check-history", "Check samples over time.", { check: "optional check name", days: `1..${MAX_DAYS}` }),
-      ...series("host", "Host cpu/memory/load samples (one per minute while the agent runs).", { days: `1..${MAX_DAYS}` }),
-      ...series("events", "Everything the toolkit did or noticed.", { days: `1..${MAX_DAYS}` }),
+      ...series("check-history", "Check samples over time.", {
+        check: "optional check name",
+        days: `1..${MAX_DAYS}, default 7`,
+      }),
+      ...series("host", "Host cpu/memory/load samples (one per minute while the agent runs).", {
+        days: `1..${MAX_DAYS}, default 7`,
+      }),
+      ...series("events", "Everything the toolkit did or noticed.", { days: `1..${MAX_DAYS}, default 7` }),
       ...series("backups", "Latest state of every backup target."),
       ...apps.flatMap((app) =>
         series(`metrics/${app}`, `Application metric snapshots for "${app}", one row per value.`, {
-          days: `1..${MAX_DAYS}`,
+          days: `1..${MAX_DAYS}, default 90`,
         }),
       ),
     ],
