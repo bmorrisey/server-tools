@@ -7,7 +7,48 @@ import { createHash } from "node:crypto";
 import { Store } from "../src/store.js";
 import { startWebServer } from "../src/web/server.js";
 import { createLoginToken } from "../src/web/auth.js";
+import * as uiModule from "../src/web/ui.js";
 import { backupsPage, coverageBanners, deploysPage, metricsPage, sparkline, meter, statusPill, timeChart } from "../src/web/ui.js";
+import { compactTime, compactValue } from "../src/appmetrics/snapshot.js";
+
+/**
+ * Reach into the shipped browser script and run its functions here. Copying
+ * them into the test would defeat the point: what needs checking is the code
+ * that actually reaches the operator.
+ */
+function browserHelpers() {
+  // The chart code is an IIFE, so its functions are not reachable from the end
+  // of the script. Take its body and evaluate that instead, which keeps the
+  // production script free of test hooks.
+  const script = uiModule.BROWSER_SCRIPT;
+  const start = script.indexOf("(function () {", script.indexOf("Pan and zoom for application metric charts"));
+  assert.ok(start > 0, "the chart block moved; this harness needs updating");
+  const body = script.slice(start + "(function () {".length, script.lastIndexOf("})();"));
+  const fake = { addEventListener() {}, querySelectorAll: () => [], querySelector: () => null };
+  return new Function(
+    "document",
+    `${body}
+    return { compact: compact, stamp: stamp, draw: draw, W: W, H: H };`,
+  )(fake);
+}
+
+/** Render one chart with the browser's draw() and return the SVG innards. */
+function browserDraw(points, kind) {
+  const { draw } = browserHelpers();
+  let markup = "";
+  const svg = {
+    set innerHTML(v) {
+      markup = v;
+    },
+    get innerHTML() {
+      return markup;
+    },
+    setAttribute() {},
+  };
+  const el = { querySelector: () => svg };
+  draw({ el, pts: points, lo: points[0][0], hi: points[points.length - 1][0], kind });
+  return markup;
+}
 
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), "st-web-"));
 const store = new Store(dir);
@@ -550,4 +591,120 @@ test("the metrics route renders and refuses an unknown application", async () =>
   // And the machine-readable snapshot carries collector state.
   const api = await (await get("/api/status", { cookie })).json();
   assert.ok("appMetrics" in api);
+});
+
+/* -------------------------------------------------------------------------
+ * The browser half of the chart.
+ *
+ * It is duplicated on purpose - under default-src 'none' the page has no
+ * request to make - so what matters is that it parses and that it agrees with
+ * the server. Without these, the entire client half is unexercised: it lives
+ * in a template literal, so a stray backtick corrupts it silently.
+ * ---------------------------------------------------------------------- */
+
+test("the script that ships to every operator parses", () => {
+  const { BROWSER_SCRIPT } = uiModule;
+  assert.doesNotThrow(() => new Function(BROWSER_SCRIPT));
+  // A second script element would be blocked by the CSP, which allows exactly
+  // one hash.
+  assert.doesNotMatch(BROWSER_SCRIPT, /<script/i);
+});
+
+test("the axis formatters agree between the server and the browser", () => {
+  // They cannot call each other, so the only thing keeping them honest is
+  // this table. Negative bytes and durations are the case that diverged.
+  const { compact, stamp } = browserHelpers();
+  const values = [0, 1, -1, 999, 1024, -2048, 12345, -12345, 1.5e6, 2.3e9, 0.25, -0.25, 8.42e9, 90_000, 1e12];
+  for (const kind of ["count", "bytes", "number", "percent", "duration"]) {
+    for (const v of values) {
+      assert.equal(compact(v, kind), compactValue(v, kind), `compact(${v}, ${kind})`);
+    }
+  }
+  const t = Date.parse("2026-08-22T03:04:00Z");
+  for (const span of [3600e3, 2 * 86400e3, 30 * 86400e3, 400 * 86400e3, 800 * 86400e3]) {
+    assert.equal(stamp(t, span), compactTime(t, span), `stamp(span=${span})`);
+  }
+});
+
+test("the server and the browser draw the same chart", () => {
+  // The server draws the full range and the browser redraws it. If the
+  // geometry disagrees the chart jumps the moment anyone touches it.
+  const cases = {
+    ramp: Array.from({ length: 40 }, (_, i) => [1_700_000_000_000 + i * 86_400_000, i * 3]),
+    flat: Array.from({ length: 10 }, (_, i) => [1_700_000_000_000 + i * 86_400_000, 5]),
+    zeroes: Array.from({ length: 10 }, (_, i) => [1_700_000_000_000 + i * 86_400_000, 0]),
+    negative: Array.from({ length: 10 }, (_, i) => [1_700_000_000_000 + i * 86_400_000, -1024 * (i + 1)]),
+    huge: Array.from({ length: 10 }, (_, i) => [1_700_000_000_000 + i * 86_400_000, 1e18 + i]),
+  };
+  for (const [name, points] of Object.entries(cases)) {
+    for (const kind of ["count", "bytes", "duration"]) {
+      const server = timeChart(points, { kind }).match(/<svg[^>]*>([\s\S]*)<\/svg>/)[1];
+      const client = browserDraw(points, kind);
+      assert.equal(client, server, `${name} / ${kind}`);
+    }
+  }
+});
+
+test("a wheel gesture without a modifier is left to the page", () => {
+  // The page is a tall stack of cards and a chart covers most of each one, so
+  // swallowing plain wheel events would turn scrolling into zoom.
+  const { BROWSER_SCRIPT } = uiModule;
+  assert.match(BROWSER_SCRIPT, /if \(!e\.ctrlKey && !e\.metaKey\) return;/);
+  const wheelBlock = BROWSER_SCRIPT.slice(BROWSER_SCRIPT.indexOf('addEventListener("wheel"'));
+  assert.ok(
+    wheelBlock.indexOf("ctrlKey") < wheelBlock.indexOf("preventDefault"),
+    "the modifier is checked before the page's scroll is cancelled",
+  );
+});
+
+test("pinch to zoom is not disabled over a chart", async () => {
+  // touch-action: pan-y on its own removes pinch-zoom, and the chart renders
+  // small enough on a phone that pinching is how the labels get read.
+  const source = await fs.promises.readFile(new URL("../src/web/ui.js", import.meta.url), "utf8");
+  assert.match(source, /touch-action: pan-y pinch-zoom;/);
+  assert.match(source, /@media \(max-width: 700px\)/);
+});
+
+test("a non-finite value draws nothing rather than a confident flat line", () => {
+  // JSON turns Infinity into null and isFinite(null) is true, so the browser
+  // would otherwise plot it at mid-scale.
+  const points = [[1, 10], [2, Number.POSITIVE_INFINITY], [3, 20], [4, 30]];
+  const html = timeChart(points, { kind: "count" });
+  assert.doesNotMatch(html, /NaN/);
+  const shipped = JSON.parse(html.match(/data-points="([^"]+)"/)[1]);
+  assert.deepEqual(shipped, [[1, 10], [3, 20], [4, 30]]);
+});
+
+test("an application with no collection yet is not shown as healthy", () => {
+  const html = metricsPage({
+    session: uiSession,
+    apps: [{ name: "demo" }],
+    app: { name: "demo" },
+    snapshots: [],
+    windowId: "90d",
+    state: {},
+  });
+  assert.match(html, /never collected/);
+  assert.doesNotMatch(html, /status ok/);
+});
+
+test("charts shrink as the metric count grows, so page cost stays bounded", () => {
+  // The metric count is set by the application, not the operator.
+  const many = Array.from({ length: 120 }, (_, k) => `metric_${k}`);
+  const snapshots = Array.from({ length: 900 }, (_, i) => ({
+    collectedAt: new Date(1_700_000_000_000 + i * 3_600_000).toISOString(),
+    metrics: Object.fromEntries(many.map((key) => [key, { value: i, kind: "count" }])),
+  }));
+  const html = metricsPage({
+    session: uiSession,
+    apps: [{ name: "demo" }],
+    app: { name: "demo" },
+    snapshots,
+    windowId: "all",
+    state: { lastResult: "ok" },
+  });
+  const sizes = [...html.matchAll(/data-points="([^"]+)"/g)].map((m) => JSON.parse(m[1]).length);
+  assert.equal(sizes.length, 120);
+  assert.ok(Math.max(...sizes) <= 300, "never more points than the plot has pixels");
+  assert.ok(html.length < 1_500_000, `page was ${html.length} bytes`);
 });

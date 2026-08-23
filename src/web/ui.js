@@ -8,7 +8,7 @@
 import crypto from "node:crypto";
 import { escapeHtml as esc, formatBytes, formatDuration } from "../util.js";
 import { compactTime, compactValue, formatDelta, formatValue, numericValue } from "../appmetrics/snapshot.js";
-import { WINDOWS, buildSeries, computeDeltas, downsample, seriesKeys } from "../appmetrics/series.js";
+import { WINDOWS, buildAllSeries, computeDeltas, downsample, seriesKeys } from "../appmetrics/series.js";
 
 /**
  * The only script the dashboard ships. It confirms destructive actions and,
@@ -52,6 +52,10 @@ document.addEventListener("submit", function (e) {
 
   function trim(n) { return String(Math.round(n * 10) / 10); }
 
+  /* Sign handled outside the magnitude, matching compactValue on the server:
+   * a size is never negative, but an axis tick on a negative series is. */
+  function signed(v, format) { return v < 0 ? "-" + format(-v) : format(v); }
+
   function bytes(n) {
     var units = ["B","KiB","MiB","GiB","TiB"], i = 0, v = n;
     while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
@@ -72,8 +76,8 @@ document.addEventListener("submit", function (e) {
 
   function compact(v, kind) {
     if (!isFinite(v)) return "-";
-    if (kind === "bytes") return bytes(v);
-    if (kind === "duration") return duration(v);
+    if (kind === "bytes") return signed(v, bytes);
+    if (kind === "duration") return signed(v, duration);
     var suffix = kind === "percent" ? "%" : "", abs = Math.abs(v);
     if (abs >= 1e9) return trim(v / 1e9) + "G" + suffix;
     if (abs >= 1e6) return trim(v / 1e6) + "M" + suffix;
@@ -95,7 +99,12 @@ document.addEventListener("submit", function (e) {
 
   function visible(pts, lo, hi) {
     var out = [];
-    for (var i = 0; i < pts.length; i++) if (pts[i][0] >= lo && pts[i][0] <= hi) out.push(pts[i]);
+    for (var i = 0; i < pts.length; i++) {
+      // JSON turns a non-finite number into null, and isFinite(null) is true:
+      // left alone it would draw a confident flat line at mid-scale.
+      if (typeof pts[i][1] !== "number" || !isFinite(pts[i][1])) continue;
+      if (pts[i][0] >= lo && pts[i][0] <= hi) out.push(pts[i]);
+    }
     return out;
   }
 
@@ -104,7 +113,11 @@ document.addEventListener("submit", function (e) {
     var svg = fig.el.querySelector("svg");
     if (!svg) return;
     var vis = visible(pts, lo, hi);
-    if (vis.length === 0) { svg.innerHTML = '<text class="empty" x="' + (W / 2) + '" y="' + (H / 2) + '" text-anchor="middle">no samples in this range</text>'; return; }
+    fig.vis = vis;
+    if (vis.length === 0) {
+      svg.innerHTML = '<text class="empty" x="' + ((PL + W - PR) / 2) + '" y="' + (H / 2) + '" text-anchor="middle">no samples in this range</text>';
+      return;
+    }
 
     var vmin = vis[0][1], vmax = vis[0][1], i;
     for (i = 1; i < vis.length; i++) {
@@ -132,16 +145,24 @@ document.addEventListener("submit", function (e) {
     var last = vis[vis.length - 1];
     parts.push('<circle class="dot" cx="' + x(last[0]).toFixed(1) + '" cy="' + y(last[1]).toFixed(1) + '" r="3.5"/>');
     svg.innerHTML = parts.join("");
-    fig.vis = vis;
+    var summary = vis.length + " samples, " + compact(vmin, kind) + " to " + compact(vmax, kind);
+    svg.setAttribute("aria-label", summary);
+  }
+
+  /* Where a client x falls along the time axis, 0 to 1. The axis spans the
+   * plot area, not the whole SVG box, so using the box width slides the
+   * grabbed sample out from under the pointer on a long drag. */
+  function plotFraction(el, clientX) {
+    var svg = el.querySelector("svg");
+    if (!svg) return 0;
+    var box = svg.getBoundingClientRect();
+    var px = ((clientX - box.left) / box.width) * W;
+    return (px - PL) / (W - PL - PR);
   }
 
   function readout(fig, clientX) {
-    var svg = fig.el.querySelector("svg");
-    if (!svg || !fig.vis || !fig.vis.length) return;
-    var box = svg.getBoundingClientRect();
-    var frac = (clientX - box.left) / box.width;
-    var px = frac * W;
-    var t = fig.lo + ((px - PL) / (W - PL - PR)) * (fig.hi - fig.lo);
+    if (!fig.vis || !fig.vis.length) return;
+    var t = fig.lo + plotFraction(fig.el, clientX) * (fig.hi - fig.lo);
     var best = fig.vis[0];
     for (var i = 1; i < fig.vis.length; i++) {
       if (Math.abs(fig.vis[i][0] - t) < Math.abs(best[0] - t)) best = fig.vis[i];
@@ -152,7 +173,9 @@ document.addEventListener("submit", function (e) {
 
   function clamp(fig) {
     var min = fig.pts[0][0], max = fig.pts[fig.pts.length - 1][0];
-    var floor = Math.max(60000, (max - min) / 5000);
+    // Stop zooming a few samples short of empty rather than at an arbitrary
+    // fraction of the range, which on a long series lands on nothing.
+    var floor = Math.max(60000, fig.gap * 3);
     if (fig.hi - fig.lo < floor) fig.hi = fig.lo + floor;
     if (fig.lo < min) { fig.hi += min - fig.lo; fig.lo = min; }
     if (fig.hi > max) { fig.lo -= fig.hi - max; fig.hi = max; }
@@ -167,15 +190,25 @@ document.addEventListener("submit", function (e) {
       var pts;
       try { pts = JSON.parse(el.getAttribute("data-points")); } catch (e) { return; }
       if (!pts || pts.length < 2) return;
-      var fig = { el: el, pts: pts, kind: el.getAttribute("data-kind") || "number", lo: pts[0][0], hi: pts[pts.length - 1][0] };
+      var gaps = [];
+      for (var g = 1; g < pts.length; g++) gaps.push(pts[g][0] - pts[g - 1][0]);
+      gaps.sort(function (a, b) { return a - b; });
+      var fig = {
+        el: el, pts: pts, kind: el.getAttribute("data-kind") || "number",
+        lo: pts[0][0], hi: pts[pts.length - 1][0],
+        gap: gaps[Math.floor(gaps.length / 2)] || 60000,
+      };
       var full = { lo: fig.lo, hi: fig.hi };
       var drag = null;
 
       el.addEventListener("wheel", function (e) {
+        // The page is a tall stack of cards and a chart covers most of each
+        // one, so swallowing every wheel event would convert ordinary
+        // scrolling into zoom whenever the pointer crossed a chart. Requiring
+        // the modifier is also what a trackpad pinch already sends.
+        if (!e.ctrlKey && !e.metaKey) return;
         e.preventDefault();
-        var svg = el.querySelector("svg");
-        var box = svg.getBoundingClientRect();
-        var frac = Math.max(0, Math.min(1, (e.clientX - box.left) / box.width));
+        var frac = Math.max(0, Math.min(1, plotFraction(el, e.clientX)));
         var focus = fig.lo + (fig.hi - fig.lo) * frac;
         var factor = e.deltaY > 0 ? 1.25 : 0.8;
         fig.lo = focus - (focus - fig.lo) * factor;
@@ -191,9 +224,7 @@ document.addEventListener("submit", function (e) {
       });
       el.addEventListener("pointermove", function (e) {
         if (!drag) { readout(fig, e.clientX); return; }
-        var svg = el.querySelector("svg");
-        var box = svg.getBoundingClientRect();
-        var shift = ((e.clientX - drag.x) / box.width) * (drag.hi - drag.lo);
+        var shift = (plotFraction(el, e.clientX) - plotFraction(el, drag.x)) * (drag.hi - drag.lo);
         fig.lo = drag.lo - shift;
         fig.hi = drag.hi - shift;
         clamp(fig);
@@ -219,6 +250,14 @@ document.addEventListener("submit", function (e) {
   }
 })();
 `;
+
+/**
+ * Exported so tests can prove the thing that actually ships parses, and can
+ * drive its geometry against the server's. It is written inside a template
+ * literal, so a stray backtick would corrupt it silently and the page would
+ * simply stop responding to drags.
+ */
+export const BROWSER_SCRIPT = SCRIPT;
 
 /** CSP source expression that allows exactly the script above. */
 export const SCRIPT_HASH = `'sha256-${crypto.createHash("sha256").update(SCRIPT).digest("base64")}'`;
@@ -298,7 +337,7 @@ td .detail { color: var(--muted); font-size: 13px; }
 .meter.warn > i { background: #fab219; }
 .meter.fail > i { background: var(--crit); }
 .spark { display: block; margin-top: 8px; }
-figure.chart { margin: 0; touch-action: pan-y; }
+figure.chart { margin: 0; touch-action: pan-y pinch-zoom; }
 figure.chart svg { display: block; width: 100%; height: auto; cursor: grab; }
 figure.chart svg:active { cursor: grabbing; }
 figure.chart .line { fill: none; stroke: var(--series); stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
@@ -311,6 +350,13 @@ figure.chart figcaption { display: flex; align-items: center; gap: 10px; justify
 figure.chart .readout { font-variant-numeric: tabular-nums; }
 figure.chart .reset { padding: 3px 9px; font-size: 12px; border: 1px solid var(--border);
   border-radius: 7px; background: var(--surface); color: var(--ink-2); cursor: pointer; }
+/* The viewBox scales to about 0.43 on a phone, which would put 11px labels
+   at under 5 CSS pixels. These units are inside the SVG, so this only costs
+   the space it takes. */
+@media (max-width: 700px) {
+  figure.chart .ylab, figure.chart .xlab, figure.chart .empty { font-size: 20px; }
+  figure.chart .line { stroke-width: 4; }
+}
 .metric-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; margin: 0 0 2px; }
 .metric-head h3 { margin: 0; font-size: 15px; }
 .metric-head .key { color: var(--muted); font-size: 12.5px; font-family: ui-monospace, monospace; }
@@ -1180,13 +1226,30 @@ export function eventsPage({ session, events, flash }) {
 const CHART = { w: 720, h: 200, padL: 52, padR: 14, padT: 12, padB: 26 };
 
 /**
+ * Points shipped per chart. The plot is 654 units wide, so beyond roughly this
+ * many the extra points are sub-pixel and cost only page weight. Zooming
+ * re-reads the same array rather than asking for more, which is the trade this
+ * makes: a very deep zoom shows the downsampled series, not every sample.
+ */
+const CHART_POINTS = 300;
+
+/**
+ * The most snapshots one page request will read. Reached only by a fast
+ * schedule over a long window; the documented advice is hourly or daily,
+ * where a decade fits well inside it. When it bites, the page says so rather
+ * than quietly drawing a partial series labelled with the full range.
+ */
+export const PAGE_SNAPSHOTS = 20_000;
+
+/**
  * A time series as inline SVG, drawn server-side over its full range.
  *
  * The points ride along in a data attribute so the hashed script can redraw a
  * narrower viewport without a request. Without JavaScript the chart is still
  * the whole series, which is the useful default.
  */
-export function timeChart(points, { kind = "number", label = "" } = {}) {
+export function timeChart(rawPoints, { kind = "number", label = "" } = {}) {
+  const points = rawPoints.filter(([t, v]) => Number.isFinite(t) && Number.isFinite(v));
   if (points.length < 2) {
     return `<figure class="chart"><figcaption>${esc(points.length ? "one sample so far" : "no samples yet")}</figcaption></figure>`;
   }
@@ -1276,11 +1339,18 @@ export function metricsPage({ session, apps, app, snapshots, windowId, state, fl
       `<a href="/metrics/${encodeURIComponent(app.name)}?window=${win.id}"${win.id === windowId ? ' aria-current="true"' : ""}>${esc(win.label)}</a>`,
   ).join("");
 
+  // One pass over the history for every key, and fewer points per chart when
+  // there are many of them: the metric count comes from the application, so
+  // the page's cost must not scale freely with it.
+  const allSeries = buildAllSeries(snapshots, current, { numericValue });
+  const perChart = Math.max(80, Math.min(CHART_POINTS, Math.floor(18_000 / Math.max(current.length, 1))));
+
   const blocks = current
     .map((key) => {
       const metric = latest.metrics[key];
-      const points = downsample(buildSeries(snapshots, key, { numericValue }));
-      const deltas = computeDeltas(buildSeries(snapshots, key, { numericValue }));
+      const series = allSeries.get(key) ?? [];
+      const points = downsample(series, perChart);
+      const deltas = computeDeltas(series);
       const label = metric.label ?? key;
       const breakdown =
         metric.kind === "breakdown"
@@ -1300,8 +1370,12 @@ ${timeChart(points, { kind: metric.kind, label })}
     ? `<p class="sub">No longer published, history kept: ${retired.map((k) => `<code>${esc(k)}</code>`).join(", ")}</p>`
     : "";
 
+  const truncated = snapshots.length >= PAGE_SNAPSHOTS;
   const collected = latest ? formatDuration(Date.now() - Date.parse(latest.collectedAt)) : null;
-  const status = state?.lastResult === "fail" ? statusPill("fail") : statusPill("ok");
+  // Never collected is not the same as collected successfully, and a green
+  // tick beside the words "never collected" is the wrong thing to tell someone
+  // glancing at the page.
+  const status = state?.lastResult === "fail" ? statusPill("fail") : latest ? statusPill("ok") : statusPill("warn");
   const captured =
     latest?.capturedAt && latest.capturedAt !== latest.collectedAt
       ? ` The application reported capturing them at ${esc(latest.capturedAt.replace("T", " ").replace("Z", " UTC"))}.`
@@ -1316,6 +1390,7 @@ ${apps.length > 1 ? `<div class="windows">${tabs}</div>` : ""}
   )}</span></div>
 ${captured ? `<p class="sub">${captured}</p>` : ""}
 <div class="windows">${windowLinks}</div>
+${truncated ? `<p class="sub">Showing the most recent ${PAGE_SNAPSHOTS.toLocaleString("en-US")} samples in this window. Collect less often, or pick a shorter window, to see the whole of it.</p>` : ""}
 ${retiredNote}
 ${blocks || '<p class="sub">This application has not published any metrics yet.</p>'}`;
   return layout({ title: `Metrics: ${app.label ?? app.name}`, page: "/metrics", session, body, flash });

@@ -317,7 +317,11 @@ export function startWebServer({ config, store, docker, alerter }) {
       if (wanted && !app) return send(res, 404, "<h1>No such application</h1>");
       const win = windowById(url.searchParams.get("window") ?? "90d");
       const sinceMs = win.days === null ? null : Date.now() - win.days * 86_400_000;
-      const snapshots = app ? store.readSnapshots(app.name, { sinceMs }) : [];
+      // A ceiling on what one page request reads. The metric count comes from
+      // the application and the interval from the operator, so without this
+      // the cost of drawing a page has no upper bound - in the single process
+      // that also runs the checks, the backups and the alerting.
+      const snapshots = app ? store.readSnapshots(app.name, { sinceMs, limit: ui.PAGE_SNAPSHOTS }) : [];
       return send(
         res,
         200,

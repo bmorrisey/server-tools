@@ -148,9 +148,13 @@ export class Store {
     const prefix = `${app}-`;
     let files;
     try {
+      // The month suffix is what identifies the file, not the prefix alone.
+      // A bare startsWith would make "api" read "api-staging"'s history, since
+      // both are valid names and "api-staging-2026-08.jsonl" starts with
+      // "api-".
       files = fs
         .readdirSync(dir)
-        .filter((f) => f.startsWith(prefix) && f.endsWith(".jsonl"))
+        .filter((f) => f.startsWith(prefix) && monthOf(f, prefix) !== null)
         .sort();
     } catch {
       return [];
@@ -160,18 +164,25 @@ export class Store {
       const cutoff = `${since.getFullYear()}-${String(since.getMonth() + 1).padStart(2, "0")}`;
       files = files.filter((f) => monthOf(f, prefix) >= cutoff);
     }
+    // Newest file first, stopping once `limit` records are in hand. Slicing
+    // after reading everything is not a limit: a decade of daily samples is
+    // read in full to print one snapshot, in the same process that runs the
+    // checks and the backups.
     const out = [];
-    for (const f of files) {
-      for (const line of fs.readFileSync(path.join(dir, f), "utf8").split("\n")) {
+    for (let i = files.length - 1; i >= 0; i--) {
+      const batch = [];
+      for (const line of fs.readFileSync(path.join(dir, files[i]), "utf8").split("\n")) {
         if (!line.trim()) continue;
         try {
           const record = JSON.parse(line);
           if (sinceMs !== null && Date.parse(record.collectedAt) < sinceMs) continue;
-          out.push(record);
+          batch.push(record);
         } catch {
           // Skip a torn write rather than failing the whole read.
         }
       }
+      out.unshift(...batch);
+      if (limit && out.length >= limit) break;
     }
     out.sort((a, b) => Date.parse(a.collectedAt) - Date.parse(b.collectedAt));
     return limit ? out.slice(-limit) : out;
@@ -194,7 +205,7 @@ export class Store {
       return 0;
     }
     for (const f of files) {
-      if (!f.startsWith(prefix) || !f.endsWith(".jsonl")) continue;
+      if (!f.startsWith(prefix)) continue;
       const month = monthOf(f, prefix);
       if (month && month < cutoff) {
         fs.unlinkSync(path.join(dir, f));

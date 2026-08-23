@@ -27,9 +27,27 @@ const log = logger("appmetrics");
 export const DEFAULT_RETENTION_DAYS = 3650;
 export const DEFAULT_INTERVAL = "1h";
 
-/** How the source is described in logs and on the page. Never the token. */
+/**
+ * How the source is described in logs, state, events and on the page.
+ *
+ * The configured token never appears here, but a URL can carry a credential of
+ * its own in userinfo or a query parameter, and this string is written to all
+ * four of those places. Nothing stops an operator putting "?token=${VAR}" in
+ * the config, so the identifying part is kept and the rest dropped.
+ */
 export function describeSource(source) {
-  if (source?.url) return source.url;
+  if (source?.url) {
+    try {
+      const url = new URL(source.url);
+      url.username = "";
+      url.password = "";
+      url.search = "";
+      url.hash = "";
+      return url.toString();
+    } catch {
+      return "configured url";
+    }
+  }
   if (source?.file) return source.file;
   return "unconfigured";
 }
@@ -42,16 +60,7 @@ export function describeSource(source) {
  */
 export async function fetchDocument(target, { timeoutMs = 10_000, fetchImpl = fetch, readFile = fsp.readFile } = {}) {
   const source = target.source ?? {};
-  if (source.file) {
-    const stat = await fsp.stat(source.file).catch(() => null);
-    // A FIFO reports size 0 and then blocks forever, and a directory or a
-    // device is not a document. Only a regular file is a source.
-    if (stat && !stat.isFile()) throw new Error(`${source.file} is not a regular file`);
-    if (stat && stat.size > LIMITS.bytes) {
-      throw new Error(`${source.file} is ${stat.size} bytes; the limit is ${LIMITS.bytes}`);
-    }
-    return readFile(source.file, "utf8");
-  }
+  if (source.file) return readFileCapped(source.file, readFile);
   if (!source.url) throw new Error("no source configured");
 
   const headers = { accept: "application/json", "user-agent": "server-tools-metrics" };
@@ -71,6 +80,39 @@ export async function fetchDocument(target, { timeoutMs = 10_000, fetchImpl = fe
     throw new Error(`response declares ${declared} bytes; the limit is ${LIMITS.bytes}`);
   }
   return readCapped(res);
+}
+
+/**
+ * Read a published file, checking what it is and how big it is against the
+ * handle rather than the path.
+ *
+ * Checking with stat and then opening the path again leaves a gap: the
+ * application owning that file is part of the threat model, and it can pass a
+ * small regular file to the check and swap in a symlink to something enormous
+ * before the read. One open, and every question answered about that
+ * descriptor. A FIFO also reports size 0 and then blocks forever, which on a
+ * scheduled collector is a stuck job rather than a failed one.
+ */
+async function readFileCapped(file, readFile) {
+  // An injected reader is a test seam; it has no descriptor to interrogate.
+  if (readFile !== fsp.readFile) {
+    const stat = await fsp.stat(file).catch(() => null);
+    if (stat && !stat.isFile()) throw new Error(`${file} is not a regular file`);
+    if (stat && stat.size > LIMITS.bytes) throw new Error(`${file} is ${stat.size} bytes; the limit is ${LIMITS.bytes}`);
+    return readFile(file, "utf8");
+  }
+  const handle = await fsp.open(file, "r");
+  try {
+    const stat = await handle.stat();
+    if (!stat.isFile()) throw new Error(`${file} is not a regular file`);
+    if (stat.size > LIMITS.bytes) throw new Error(`${file} is ${stat.size} bytes; the limit is ${LIMITS.bytes}`);
+    const buffer = Buffer.alloc(LIMITS.bytes + 1);
+    const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+    if (bytesRead > LIMITS.bytes) throw new Error(`${file} is larger than ${LIMITS.bytes} bytes`);
+    return buffer.subarray(0, bytesRead).toString("utf8");
+  } finally {
+    await handle.close().catch(() => {});
+  }
 }
 
 /**

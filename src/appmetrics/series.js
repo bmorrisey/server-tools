@@ -13,12 +13,37 @@
 const timeOf = (snapshot) => Date.parse(snapshot?.collectedAt ?? "");
 
 /**
+ * Sort only when the points are not already in order.
+ *
+ * Snapshots come out of the store ascending, so every series built from them
+ * already is. Sorting anyway is the single most expensive thing on a page with
+ * many metrics: comparing sorted data still costs n log n, once per metric.
+ */
+function sortByTime(points) {
+  for (let i = 1; i < points.length; i++) {
+    if (points[i][0] < points[i - 1][0]) return points.sort((a, b) => a[0] - b[0]);
+  }
+  return points;
+}
+
+/**
  * Every metric key seen across the snapshots, with the ones still being
  * published first. Metrics legitimately appear and disappear, and the history
  * of a key that is gone is still worth having.
  */
 export function seriesKeys(snapshots) {
-  const latest = snapshots[snapshots.length - 1];
+  // The newest snapshot that actually published something, not simply the
+  // newest. An empty document is legitimate - an app mid-deploy, or one whose
+  // query failed - and reading the latest blindly would report every metric as
+  // retired and the application as having published nothing, on a collection
+  // recorded as ok. That looks exactly like losing the data.
+  let latest = null;
+  for (let i = snapshots.length - 1; i >= 0; i--) {
+    if (Object.keys(snapshots[i].metrics ?? {}).length > 0) {
+      latest = snapshots[i];
+      break;
+    }
+  }
   const current = Object.keys(latest?.metrics ?? {});
   const seen = new Set(current);
   const retired = [];
@@ -48,8 +73,37 @@ export function buildSeries(snapshots, key, { numericValue }) {
     if (v === null) continue;
     points.push([t, v]);
   }
-  points.sort((a, b) => a[0] - b[0]);
-  return points;
+  return sortByTime(points);
+}
+
+/**
+ * Every key's points in one pass over the snapshots.
+ *
+ * buildSeries per key means re-walking the whole history once per metric, and
+ * the metric count is set by the application rather than by the operator. At
+ * the documented ceiling that is millions of iterations in the process that
+ * also runs the checks and the backups.
+ */
+export function buildAllSeries(snapshots, keys, { numericValue }) {
+  const series = new Map(keys.map((key) => [key, []]));
+  for (const snapshot of snapshots) {
+    const t = timeOf(snapshot);
+    if (!Number.isFinite(t)) continue;
+    // Walk what the snapshot actually holds rather than probing it for every
+    // requested key: a metric that came and went costs nothing on the
+    // snapshots that never carried it.
+    const metrics = snapshot.metrics;
+    if (!metrics) continue;
+    for (const key in metrics) {
+      const points = series.get(key);
+      if (points === undefined) continue;
+      const v = numericValue(metrics[key]);
+      if (v === null) continue;
+      points.push([t, v]);
+    }
+  }
+  for (const points of series.values()) sortByTime(points);
+  return series;
 }
 
 /**

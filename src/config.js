@@ -202,12 +202,10 @@ export function validateConfig(cfg) {
         need(/^https?:\/\//.test(source.url), `${where}.source.url must be an http(s) URL`);
       if (source.token !== undefined) {
         need(typeof source.token === "string", `${where}.source.token must be a string`);
-        // A literal token in the config file is the one thing worth refusing
-        // here: every other secret in this file arrives as "${ENV_VAR}".
-        need(
-          source.file === undefined,
-          `${where}.source.token only applies to a url source`,
-        );
+        // A file source has nowhere to send a bearer token, so configuring one
+        // there means the operator expected an authenticated request that is
+        // not happening.
+        need(source.file === undefined, `${where}.source.token only applies to a url source`);
       }
     }
     if (m.schedule !== undefined)

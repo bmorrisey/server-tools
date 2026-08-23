@@ -20,7 +20,7 @@ import {
   parseSnapshot,
 } from "../src/appmetrics/snapshot.js";
 import { buildSeries, computeDeltas, downsample, seriesKeys, withinWindow } from "../src/appmetrics/series.js";
-import { CollectorState, collect, fetchDocument } from "../src/appmetrics/collect.js";
+import { CollectorState, collect, describeSource, fetchDocument } from "../src/appmetrics/collect.js";
 
 const doc = (metrics, extra = {}) => JSON.stringify({ schema: SCHEMA_VERSION, metrics, ...extra });
 
@@ -43,7 +43,10 @@ test("a well-formed document becomes a snapshot", () => {
   assert.equal(snapshot.capturedAt, "2026-08-22T03:00:00.000Z");
   assert.deepEqual(Object.keys(snapshot.metrics), ["records_total", "storage_used", "tier_distribution"]);
   assert.equal(snapshot.metrics.records_total.label, "Records");
-  assert.deepEqual(snapshot.metrics.tier_distribution.value, { free: 812, pro: 44 });
+  // Null-prototype, so a category named "__proto__" is data rather than a
+  // silent no-op; the stored JSON is identical either way.
+  assert.deepEqual({ ...snapshot.metrics.tier_distribution.value }, { free: 812, pro: 44 });
+  assert.equal(JSON.stringify(snapshot.metrics.tier_distribution.value), '{"free":812,"pro":44}');
 });
 
 test("an unknown schema is refused rather than guessed at", () => {
@@ -221,13 +224,16 @@ test("snapshots are stored by month and read back in order", () => {
   try {
     store.appendSnapshot("app", { collectedAt: "2026-07-31T12:00:00Z", metrics: { a: { value: 1 } } });
     store.appendSnapshot("app", { collectedAt: "2026-08-01T12:00:00Z", metrics: { a: { value: 2 } } });
-    store.appendSnapshot("other", { collectedAt: "2026-08-01T12:00:00Z", metrics: { a: { value: 99 } } });
+    // A name that is a prefix of another is the case that matters: "app" must
+    // not read "app-staging", and both are legal names.
+    store.appendSnapshot("app-staging", { collectedAt: "2026-08-01T12:00:00Z", metrics: { a: { value: 99 } } });
 
     const files = fs.readdirSync(path.join(dir, "metrics")).sort();
-    assert.deepEqual(files, ["app-2026-07.jsonl", "app-2026-08.jsonl", "other-2026-08.jsonl"]);
+    assert.deepEqual(files, ["app-2026-07.jsonl", "app-2026-08.jsonl", "app-staging-2026-08.jsonl"]);
 
     const all = store.readSnapshots("app");
     assert.deepEqual(all.map((s) => s.metrics.a.value), [1, 2], "one app never picks up another's history");
+    assert.deepEqual(store.readSnapshots("app-staging").map((s) => s.metrics.a.value), [99]);
     const recent = store.readSnapshots("app", { sinceMs: Date.parse("2026-08-01T00:00:00Z") });
     assert.deepEqual(recent.map((s) => s.metrics.a.value), [2]);
   } finally {
@@ -452,4 +458,123 @@ test("the byte cap counts bytes, not characters", () => {
   const multibyte = "é".repeat(LIMITS.bytes - 10); // 2 bytes each
   assert.ok(multibyte.length < LIMITS.bytes);
   assert.throws(() => parseSnapshot(multibyte), /larger than/);
+});
+
+test("retention keeps the cutoff month whole", () => {
+  // The boundary of a deletion, which the 400-days-vs-365 case never reaches.
+  // Getting "<" wrong here destroys data the operator asked to keep.
+  const { dir, store } = tmpStore();
+  try {
+    const now = new Date();
+    const thisMonth = new Date(now.getFullYear(), now.getMonth(), 15).toISOString();
+    const lastMonth = new Date(now.getFullYear(), now.getMonth() - 1, 15).toISOString();
+    store.appendSnapshot("app", { collectedAt: lastMonth, metrics: {} });
+    store.appendSnapshot("app", { collectedAt: thisMonth, metrics: {} });
+    // A retention that reaches back into last month must keep last month.
+    assert.equal(store.pruneSnapshots("app", 45), 0);
+    assert.equal(store.readSnapshots("app").length, 2);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a window skips whole months without dropping a record inside one", () => {
+  const { dir, store } = tmpStore();
+  try {
+    store.appendSnapshot("app", { collectedAt: "2026-06-15T00:00:00Z", metrics: { a: { value: 1 } } });
+    store.appendSnapshot("app", { collectedAt: "2026-08-05T00:00:00Z", metrics: { a: { value: 2 } } });
+    store.appendSnapshot("app", { collectedAt: "2026-08-25T00:00:00Z", metrics: { a: { value: 3 } } });
+    // Mid-month cutoff: the month file is read, and the record before the
+    // cutoff inside it is still excluded.
+    const got = store.readSnapshots("app", { sinceMs: Date.parse("2026-08-10T00:00:00Z") });
+    assert.deepEqual(got.map((s) => s.metrics.a.value), [3]);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a metric key cannot start with an underscore", () => {
+  // "__proto__" as a metric key assigns the object's own prototype, so the
+  // metric silently disappears rather than being reported.
+  // Raw JSON text: a JS object literal would set the prototype instead of
+  // creating the key, so the payload has to be written out.
+  const { problems } = parseSnapshot('{"schema":1,"metrics":{"__proto__":{"value":1},"ok":{"value":2}}}');
+  assert.ok(problems.some((p) => p.startsWith("__proto__:")));
+  const { problems: leading } = parseSnapshot(doc({ _private: { value: 1 }, ok: { value: 2 } }));
+  assert.ok(leading.some((p) => p.startsWith("_private:")));
+});
+
+test("a JSON value that parses to Infinity is dropped, not stored as null", () => {
+  // 1e999 is legal JSON text and becomes Infinity, which JSON.stringify would
+  // then write back as null.
+  const { snapshot, problems } = parseSnapshot('{"schema":1,"metrics":{"big":{"value":1e999},"ok":{"value":1}}}');
+  assert.deepEqual(Object.keys(snapshot.metrics), ["ok"]);
+  assert.ok(problems.some((p) => p.includes("big: value must be a finite number")));
+});
+
+test("a slow source is abandoned rather than wedging the collector", async () => {
+  // agent.js awaits the collection before re-arming the job, so a source that
+  // never finishes stops that job permanently and alerts nobody.
+  const http = await import("node:http");
+  const server = http.createServer((req, res) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.write('{"schema":1,');
+    // and then nothing, forever
+  });
+  await new Promise((r) => server.listen(0, r));
+  try {
+    const target = { name: "app", source: { url: `http://127.0.0.1:${server.address().port}/m` } };
+    // Racing rather than awaiting: without the timeout this never settles, and
+    // a test that hangs reports a regression as a CI timeout rather than a
+    // named failure.
+    const outcome = await Promise.race([
+      fetchDocument(target, { timeoutMs: 300 }).then(() => "resolved", () => "abandoned"),
+      new Promise((r) => setTimeout(() => r("hung"), 4000)),
+    ]);
+    assert.equal(outcome, "abandoned", "a source that never finishes must be given up on");
+  } finally {
+    server.closeAllConnections?.();
+    server.close();
+  }
+});
+
+test("a redirect is not followed", async () => {
+  // Following one would send the bearer token somewhere the operator did not
+  // configure.
+  const http = await import("node:http");
+  let secondHop = false;
+  const server = http.createServer((req, res) => {
+    if (req.url === "/m") {
+      res.writeHead(302, { location: "/elsewhere" });
+      return res.end();
+    }
+    secondHop = true;
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(doc({ a: { value: 1 } }));
+  });
+  await new Promise((r) => server.listen(0, r));
+  try {
+    const target = { name: "app", source: { url: `http://127.0.0.1:${server.address().port}/m`, token: "tok" } };
+    await assert.rejects(() => fetchDocument(target), /HTTP 302/);
+    assert.equal(secondHop, false);
+  } finally {
+    server.close();
+  }
+});
+
+test("a url with a credential in it is not written to state, events, or logs", () => {
+  assert.equal(describeSource({ url: "https://u:pw@host:3000/m?token=SECRET#f" }), "https://host:3000/m");
+  assert.equal(describeSource({ url: "not a url" }), "configured url");
+  assert.equal(describeSource({ file: "/apps/app/metrics.json" }), "/apps/app/metrics.json");
+});
+
+test("an empty publish does not retire every metric", async () => {
+  // An app mid-deploy, or one whose query failed, publishes {}. Reading the
+  // latest snapshot blindly would report the whole history as retired while
+  // recording the collection as ok.
+  const full = { collectedAt: "2026-08-01T00:00:00Z", metrics: { a: { value: 1 }, b: { value: 2 } } };
+  const empty = { collectedAt: "2026-08-02T00:00:00Z", metrics: {} };
+  const { current, retired } = seriesKeys([full, empty]);
+  assert.deepEqual(current, ["a", "b"]);
+  assert.deepEqual(retired, []);
 });

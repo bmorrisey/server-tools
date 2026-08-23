@@ -44,6 +44,20 @@ export const LIMITS = {
 
 const KEY_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]*$/;
 
+/**
+ * Control characters, from a document written by a separate application.
+ *
+ * The dashboard escapes these strings as HTML, but the CLI and the agent log
+ * do not: a label carrying an escape sequence can erase the line it is printed
+ * on and write something else there, and a newline in a breakdown category
+ * forges whole extra lines of output. An operator reading the terminal during
+ * an incident is a stated goal of this project, so these are cleaned where
+ * they enter rather than at each of the places they leave.
+ */
+const CONTROL_RE = /[\u0000-\u001f\u007f-\u009f\u200e\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069]/g;
+
+const sanitize = (text) => String(text).replace(CONTROL_RE, " ");
+
 const isFiniteNumber = (v) => typeof v === "number" && Number.isFinite(v);
 
 /**
@@ -79,8 +93,12 @@ function parseMetric(key, raw) {
     if (entries.length > LIMITS.breakdownEntries) {
       return bad(`a breakdown may have at most ${LIMITS.breakdownEntries} categories`);
     }
-    value = {};
-    for (const [category, n] of entries) {
+    // A null prototype, so a category literally named "__proto__" is stored as
+    // an ordinary key instead of invoking the setter and vanishing, which
+    // would quietly change the total rather than reporting anything.
+    value = Object.create(null);
+    for (const [rawCategory, n] of entries) {
+      const category = sanitize(rawCategory);
       if (category.length > LIMITS.keyLength) return bad(`breakdown category "${category.slice(0, 20)}..." is too long`);
       if (!isFiniteNumber(n)) return bad(`breakdown category "${category}" is not a finite number`);
       value[category] = n;
@@ -91,7 +109,7 @@ function parseMetric(key, raw) {
   }
 
   const metric = { value, kind };
-  if (raw.label !== undefined) metric.label = raw.label;
+  if (raw.label !== undefined) metric.label = sanitize(raw.label);
   if (raw.precision !== undefined) metric.precision = raw.precision;
   if (raw.cumulative !== undefined) metric.cumulative = raw.cumulative;
   return { ok: true, metric };
@@ -207,7 +225,10 @@ export function formatDelta(delta, { kind = "number", precision } = {}) {
 
 function round(n, places) {
   const factor = 10 ** places;
-  return Math.round(n * factor) / factor;
+  const scaled = n * factor;
+  // A legal JSON value near the top of the double range overflows when scaled,
+  // and the tile would then read "Infinity" for a number that stored fine.
+  return Number.isFinite(scaled) ? Math.round(scaled) / factor : n;
 }
 
 /** The total a breakdown represents, for charting it as one series. */
@@ -231,8 +252,11 @@ export function numericValue(metric) {
  */
 export function compactValue(value, kind = "number") {
   if (!Number.isFinite(value)) return "-";
-  if (kind === "bytes") return formatBytes(value);
-  if (kind === "duration") return formatDuration(value);
+  // formatBytes and formatDuration answer "?" below zero, which is right for a
+  // size and useless for an axis tick: a chart of a negative or zero-padded
+  // series would lose its labels entirely.
+  if (kind === "bytes") return signed(value, formatBytes);
+  if (kind === "duration") return signed(value, formatDuration);
   const suffix = kind === "percent" ? "%" : "";
   const abs = Math.abs(value);
   if (abs >= 1e9) return `${trim(value / 1e9)}G${suffix}`;
@@ -244,6 +268,10 @@ export function compactValue(value, kind = "number") {
 
 function trim(n) {
   return String(Math.round(n * 10) / 10);
+}
+
+function signed(value, format) {
+  return value < 0 ? `-${format(-value)}` : format(value);
 }
 
 /**
