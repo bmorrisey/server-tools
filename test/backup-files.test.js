@@ -545,10 +545,19 @@ test("a failed drill does not leak the file descriptor it was reading", async ()
 
     const baseline = openArtifacts();
     for (let i = 0; i < 6; i++) await verifyArchive(t, { store }).catch(() => {});
-    await new Promise((r) => setTimeout(r, 200));
+
+    // Poll rather than sleep a fixed time: teardown takes longer when the
+    // suite is running in parallel, and a fixed wait makes this fail
+    // occasionally on a machine that is merely busy. A real leak never comes
+    // back to the baseline, so the deadline still catches it.
+    let open = openArtifacts();
+    for (let waited = 0; open > baseline && waited < 5000; waited += 50) {
+      await new Promise((r) => setTimeout(r, 50));
+      open = openArtifacts();
+    }
     // One descriptor per attempt, held for the life of the agent, on exactly
     // the corrupt archive an operator retries.
-    assert.equal(openArtifacts(), baseline);
+    assert.equal(open, baseline);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

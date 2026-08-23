@@ -48,6 +48,7 @@ dashboard; `src/cli.js` runs any operation by hand.
 | `src/alerts.js`, `src/smtp.js` | alert routing; minimal SMTP client |
 | `src/docker.js` | Docker Engine API over the unix socket (list/inspect/stats/exec) |
 | `src/metrics.js` | host metrics from /proc + statfs |
+| `src/appmetrics/` | application metrics: published-document contract, collector, read-time series/deltas |
 | `src/store.js` | JSON state + day-partitioned JSONL history under dataDir |
 | `src/backup/` | backup engine, AES-256-GCM streaming crypto, S3 SigV4 client, GFS retention, restore + drill |
 | `src/deploy.js` | git checkout + compose build + health gate + rollback |

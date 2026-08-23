@@ -182,6 +182,68 @@ export function validateConfig(cfg) {
     }
   }
 
+  for (const [i, m] of (cfg.appMetrics ?? []).entries()) {
+    const where = `appMetrics[${i}]`;
+    // The name becomes a filename and a URL path segment, so it is held to a
+    // stricter pattern than a display label would need.
+    need(
+      typeof m.name === "string" && /^[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(m.name),
+      `${where}.name is required (letters, digits, "_", "." or "-", starting alphanumeric)`,
+    );
+    if (m.label !== undefined) need(typeof m.label === "string" && m.label, `${where}.label must be a non-empty string`);
+
+    const source = m.source;
+    need(source && typeof source === "object" && !Array.isArray(source), `${where}.source must be an object`);
+    if (source && typeof source === "object" && !Array.isArray(source)) {
+      const named = ["url", "file"].filter((k) => source[k] !== undefined);
+      need(named.length === 1, `${where}.source must name exactly one of "url" or "file"`);
+      for (const k of named) need(typeof source[k] === "string" && source[k], `${where}.source.${k} must be a non-empty string`);
+      if (typeof source.url === "string") {
+        need(/^https?:\/\//.test(source.url), `${where}.source.url must be an http(s) URL`);
+        // A credential in the URL is refused outright by fetch, and the error
+        // it raises quotes the URL back into logs, state and alerts. Use
+        // source.token, which is sent as a header and never echoed.
+        let parsed = null;
+        try {
+          parsed = new URL(source.url);
+        } catch {
+          // The scheme check above already reported anything unparseable.
+        }
+        need(
+          !parsed || (!parsed.username && !parsed.password),
+          `${where}.source.url must not embed a username or password; use source.token instead`,
+        );
+      }
+      if (source.token !== undefined) {
+        need(typeof source.token === "string", `${where}.source.token must be a string`);
+        // A file source has nowhere to send a bearer token, so configuring one
+        // there means the operator expected an authenticated request that is
+        // not happening.
+        need(source.file === undefined, `${where}.source.token only applies to a url source`);
+      }
+    }
+    if (m.schedule !== undefined)
+      need(parseSchedule(m.schedule) !== null, `${where}.schedule "${m.schedule}" is not a valid schedule`);
+    if (m.timeout !== undefined) need(parseDuration(m.timeout) !== null, `${where}.timeout "${m.timeout}" is not a duration`);
+    if (m.retentionDays !== undefined)
+      need(
+        Number.isInteger(m.retentionDays) && m.retentionDays > 0,
+        `${where}.retentionDays must be a positive integer (days of history to keep)`,
+      );
+    if (m.failuresBeforeAlert !== undefined)
+      need(
+        Number.isInteger(m.failuresBeforeAlert) && m.failuresBeforeAlert > 0,
+        `${where}.failuresBeforeAlert must be a positive integer`,
+      );
+  }
+  {
+    const names = (cfg.appMetrics ?? []).map((m) => m.name);
+    const duplicate = names.find((n, i) => names.indexOf(n) !== i);
+    // They share a directory and a URL space, so a duplicate would interleave
+    // two apps' history into one series.
+    need(!duplicate, `appMetrics has more than one target named "${duplicate}"`);
+  }
+
   for (const [i, d] of (cfg.deploys ?? []).entries()) {
     const where = `deploys[${i}]`;
     need(typeof d.name === "string" && d.name, `${where}.name is required`);
@@ -355,6 +417,7 @@ export function withDefaults(cfg) {
     checks: [],
     backups: [],
     deploys: [],
+    appMetrics: [],
     housekeeping: {},
     alerts: {},
     web: { enabled: true, port: 9090, bind: "127.0.0.1", sessionDays: 30 },

@@ -10,6 +10,7 @@ import { Docker } from "./docker.js";
 import { CheckEngine } from "./checks.js";
 import { Alerter } from "./alerts.js";
 import { runBackup } from "./backup/backup.js";
+import { CollectorState, DEFAULT_INTERVAL, collect } from "./appmetrics/collect.js";
 import { housekeep } from "./housekeep.js";
 import { parseDuration, parseSchedule, msUntilNext, formatDuration } from "./util.js";
 import { logger } from "./log.js";
@@ -101,6 +102,35 @@ export async function startAgent({ configPath, withWeb = true } = {}) {
   }
   log.info(`scheduled ${config.backups.filter((b) => b.schedule && b.type !== "external").length} backup targets`);
   for (const note of coverageNotes(config)) log.warn(`${note.title}: ${note.detail}`);
+
+  // Application metrics. A deliberately slow channel: the default is hourly
+  // and the documentation recommends daily. A failed collection alerts on the
+  // same consecutive-failure rule as a check, because a gap nobody noticed is
+  // what makes a years-long series worthless.
+  const collectors = new CollectorState();
+  for (const target of config.appMetrics) {
+    schedule(target.schedule ?? DEFAULT_INTERVAL, `metrics:${target.name}`, async () => {
+      let failure = null;
+      try {
+        await collect(target, { store });
+      } catch (e) {
+        failure = e;
+      }
+      const transition = collectors.evaluate(
+        target.name,
+        failure === null,
+        target.failuresBeforeAlert ?? config.checkDefaults.failuresBeforeAlert,
+      );
+      if (!transition) return;
+      await alerter.send({
+        title: `metrics ${target.name}: ${transition === "fail" ? "COLLECTION FAILING" : "collection recovered"}`,
+        body: failure ? failure.message : "collection succeeded again",
+        level: transition === "fail" ? "fail" : "recover",
+        source: `metrics:${target.name}`,
+      });
+    });
+  }
+  log.info(`scheduled ${config.appMetrics.length} application metric collectors`);
 
   // Housekeeping.
   schedule(config.housekeeping.schedule ?? "04:30", "housekeep", () => housekeep(config, store));

@@ -14,6 +14,8 @@
  *   server-tools housekeep [--dry-run]
  *   server-tools storage [--json]        what is using the disk, and what is reclaimable
  *   server-tools reclaim <action>        run one storage cleanup (see storage output)
+ *   server-tools metrics [app]           show the latest application metrics snapshot
+ *   server-tools collect [app]           collect application metrics now (all apps if omitted)
  *   server-tools status                  print latest check/backup state
  *   server-tools diagnose <check>        explain a failing check in plain words
  *   server-tools fix <check> [actionId]  run a suggested one-click remediation
@@ -31,6 +33,8 @@ import { restore, drill, drillFiles, exportArtifact, latestArtifact, loadRunMani
 import { S3 } from "./backup/s3.js";
 import { deploy } from "./deploy.js";
 import { housekeep } from "./housekeep.js";
+import { collect } from "./appmetrics/collect.js";
+import { formatValue } from "./appmetrics/snapshot.js";
 import { formatBytes } from "./util.js";
 
 const [, , command, ...args] = process.argv;
@@ -62,10 +66,15 @@ function fail(msg) {
   process.exit(1);
 }
 
+const TARGET_NOUN = { checks: "check", backups: "backup", deploys: "deploy", appMetrics: "application metrics" };
+
 function findTarget(config, kind, name) {
   const list = config[kind] ?? [];
   const hit = list.find((t) => t.name === name);
-  if (!hit) fail(`${kind.slice(0, -1)} target "${name}" not found; configured: ${list.map((t) => t.name).join(", ") || "(none)"}`);
+  if (!hit) {
+    const noun = TARGET_NOUN[kind] ?? kind;
+    fail(`${noun} target "${name}" not found; configured: ${list.map((t) => t.name).join(", ") || "(none)"}`);
+  }
   return hit;
 }
 
@@ -322,6 +331,54 @@ async function main() {
       const result = await runAction(chosen.id, { target: chosen.target }, { docker, store, config });
       process.stdout.write(`${result.ok ? "OK" : "FAILED"}: ${result.message}\n`);
       process.exit(result.ok ? 0 : 1);
+      break;
+    }
+
+    case "metrics": {
+      const apps = positional[0]
+        ? [findTarget(config, "appMetrics", positional[0])]
+        : config.appMetrics;
+      if (!apps.length) fail("no application metrics are configured (see appMetrics in docs/CONFIG.md)");
+      const state = store.readState("metrics", {});
+      for (const app of apps) {
+        const snapshots = store.readSnapshots(app.name, { limit: 1 });
+        const latest = snapshots[snapshots.length - 1];
+        const s = state[app.name];
+        process.stdout.write(`${app.label ?? app.name} (${app.name})\n`);
+        if (!latest) {
+          process.stdout.write(`  never collected${s?.lastDetail ? `; last attempt: ${s.lastDetail}` : ""}\n\n`);
+          continue;
+        }
+        process.stdout.write(`  collected ${latest.collectedAt}${latest.capturedAt ? ` (captured ${latest.capturedAt})` : ""}\n`);
+        if (s?.lastResult === "fail") process.stdout.write(`  LAST ATTEMPT FAILED: ${s.lastDetail}\n`);
+        for (const [key, metric] of Object.entries(latest.metrics)) {
+          const label = metric.label ?? key;
+          process.stdout.write(
+            `  ${label.padEnd(28)} ${formatValue(metric.value, { kind: metric.kind, precision: metric.precision })}\n`,
+          );
+        }
+        if (latest.dropped) process.stdout.write(`  (${latest.dropped} metric(s) dropped as malformed)\n`);
+        process.stdout.write("\n");
+      }
+      break;
+    }
+
+    case "collect": {
+      const apps = positional[0]
+        ? [findTarget(config, "appMetrics", positional[0])]
+        : config.appMetrics;
+      if (!apps.length) fail("no application metrics are configured (see appMetrics in docs/CONFIG.md)");
+      let failed = 0;
+      for (const app of apps) {
+        try {
+          const patch = await collect(app, { store });
+          process.stdout.write(`OK   ${app.name}: ${patch.lastDetail}\n`);
+        } catch (e) {
+          failed++;
+          process.stdout.write(`FAIL ${app.name}: ${e.message}\n`);
+        }
+      }
+      process.exit(failed ? 1 : 0);
       break;
     }
 

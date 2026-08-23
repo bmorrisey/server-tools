@@ -27,6 +27,7 @@ feature will report clearly rather than half-work with.
 | `checks` | `[]` | Health checks (below). |
 | `backups` | `[]` | Backup targets (below). |
 | `deploys` | `[]` | Deployable applications (below). |
+| `appMetrics` | `[]` | Application metric sources (below). |
 | `housekeeping` | `{}` | Cleanup settings (below). |
 | `alerts` | `{}` | Alert channels (below). |
 | `web` | enabled | Dashboard settings (below). |
@@ -378,6 +379,41 @@ into double digits for minutes, and the unrelated stacks feel it. Health
 polling is also weaker here than it looks, because the previous containers
 stay up and healthy for the whole build - so a poll can pass against the old
 release. Listing `services` closes part of that gap.
+
+## Application metrics
+
+Numbers an application knows about itself, which the host cannot see. Full
+contract in [docs/METRICS.md](METRICS.md).
+
+```json
+{ "name": "myapp", "label": "My application",
+  "source": { "url": "http://127.0.0.1:3000/internal/metrics", "token": "${APP_METRICS_TOKEN}" },
+  "schedule": "1h", "timeout": "10s", "retentionDays": 3650 }
+```
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `name` | none | Required, unique. Becomes a filename and a URL path segment, so: letters, digits, `_`, `.` or `-`, starting alphanumeric. |
+| `label` | the name | What the dashboard calls it. |
+| `source` | none | Exactly one of `{ "url": ... }` or `{ "file": ... }`. A `url` source may carry a `token`, sent as `Authorization: Bearer`. The URL itself must not embed a username or password: `fetch` refuses those and quotes the URL back into logs and alerts. |
+| `schedule` | `"1h"` | `"1h"`, `"03:00"` daily, `"sun 03:00"` weekly. Daily suits most numbers. |
+| `timeout` | `"10s"` | How long to wait for the source. |
+| `retentionDays` | `3650` | How long snapshots are kept. Ten years of daily samples is a few thousand lines. |
+| `failuresBeforeAlert` | `checkDefaults` | Consecutive failed collections before one alert fires. |
+
+The application publishes a versioned JSON document; the agent samples it,
+stores each snapshot whole, and charts it. The agent holds no vocabulary for
+any particular application - your app supplies the keys, the labels and the
+units, and `kind` is only a rendering hint.
+
+This is a deliberately slow channel. Per-second data wants a different tool.
+
+Snapshots are stored under `dataDir/metrics/` and pruned by `retentionDays`,
+**not** by `housekeeping.historyDays`. Keeping them out of the history
+directory is the point: that pruner deletes by date regardless of topic, and 90
+days is right for check samples and wrong for a record meant to last years. See
+[docs/METRICS.md](METRICS.md) for why this is a separate directory rather than
+a retention override.
 
 ## Housekeeping
 

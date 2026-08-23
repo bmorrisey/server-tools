@@ -7,7 +7,48 @@ import { createHash } from "node:crypto";
 import { Store } from "../src/store.js";
 import { startWebServer } from "../src/web/server.js";
 import { createLoginToken } from "../src/web/auth.js";
-import { backupsPage, coverageBanners, deploysPage, sparkline, meter, statusPill } from "../src/web/ui.js";
+import * as uiModule from "../src/web/ui.js";
+import { backupsPage, coverageBanners, deploysPage, metricsPage, sparkline, meter, statusPill, timeChart } from "../src/web/ui.js";
+import { compactTime, compactValue } from "../src/appmetrics/snapshot.js";
+
+/**
+ * Reach into the shipped browser script and run its functions here. Copying
+ * them into the test would defeat the point: what needs checking is the code
+ * that actually reaches the operator.
+ */
+function browserHelpers() {
+  // The chart code is an IIFE, so its functions are not reachable from the end
+  // of the script. Take its body and evaluate that instead, which keeps the
+  // production script free of test hooks.
+  const script = uiModule.BROWSER_SCRIPT;
+  const start = script.indexOf("(function () {", script.indexOf("Pan and zoom for application metric charts"));
+  assert.ok(start > 0, "the chart block moved; this harness needs updating");
+  const body = script.slice(start + "(function () {".length, script.lastIndexOf("})();"));
+  const fake = { addEventListener() {}, querySelectorAll: () => [], querySelector: () => null };
+  return new Function(
+    "document",
+    `${body}
+    return { compact: compact, stamp: stamp, draw: draw, clamp: clamp, readout: readout, zoomBy: zoomBy, W: W, H: H, PL: PL, PR: PR };`,
+  )(fake);
+}
+
+/** Render one chart with the browser's draw() and return the SVG innards. */
+function browserDraw(points, kind) {
+  const { draw } = browserHelpers();
+  let markup = "";
+  const svg = {
+    set innerHTML(v) {
+      markup = v;
+    },
+    get innerHTML() {
+      return markup;
+    },
+    setAttribute() {},
+  };
+  const el = { querySelector: () => svg };
+  draw({ el, pts: points, lo: points[0][0], hi: points[points.length - 1][0], kind });
+  return markup;
+}
 
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), "st-web-"));
 const store = new Store(dir);
@@ -24,6 +65,7 @@ const config = {
     { name: "demo-db", type: "postgres", container: "db-1", user: "u", database: "d", passphrase: "x".repeat(16) },
   ],
   deploys: [{ name: "demo-app", dir: "/apps/demo", healthUrl: "http://127.0.0.1:1/health" }],
+  appMetrics: [{ name: "demo-metrics", label: "Demo application", source: { file: "/nonexistent/metrics.json" } }],
   alerts: {},
   web: { enabled: true, port: 0, bind: "127.0.0.1", baseUrl: "http://127.0.0.1", allowedEmails: ["op@example.com"], sessionDays: 1 },
 };
@@ -435,4 +477,521 @@ test("a deploy that succeeded with a caveat is not shown as a failure", () => {
   });
   assert.match(html, /status warn/);
   assert.doesNotMatch(html, /status fail/);
+});
+
+const day = 86_400_000;
+const seriesFixture = (n = 30) => {
+  const base = Date.parse("2026-08-23T03:00:00Z");
+  return Array.from({ length: n }, (_, i) => ({
+    collectedAt: new Date(base - (n - 1 - i) * day).toISOString(),
+    metrics: {
+      records_total: { value: 100_000 + i * 400, label: "Records", kind: "count" },
+      storage_used: { value: 8e9 + i * 1e7, label: "Storage used", kind: "bytes" },
+    },
+  }));
+};
+
+test("a metric chart ships its points so the browser can zoom without asking the server", () => {
+  // There is no fetch to make under default-src 'none', so the data has to
+  // arrive with the page or pan/zoom cannot work at all.
+  const points = [[1, 10], [2, 20], [3, 15]];
+  const html = timeChart(points, { kind: "count", label: "Records" });
+  assert.match(html, /<figure class="chart" data-points=/);
+  assert.match(html, /data-kind="count"/);
+  assert.match(html, /<polyline class="line" points="/);
+  assert.match(html, /class="reset" hidden/);
+  // Points are numbers by construction, so the data attribute carries no
+  // quotes to break out of. The label does come from the application, and it
+  // goes through the same escaping as every other untrusted string.
+  assert.deepEqual(JSON.parse(html.match(/data-points="([^"]+)"/)[1]), points);
+  const hostile = timeChart(points, { kind: "count", label: '"><script>alert(1)</script>' });
+  assert.doesNotMatch(hostile, /<script>/);
+  assert.match(hostile, /&lt;script&gt;/);
+});
+
+test("a chart with too little data says so instead of drawing a lie", () => {
+  assert.match(timeChart([], { kind: "count" }), /no samples yet/);
+  assert.match(timeChart([[1, 5]], { kind: "count" }), /one sample so far/);
+});
+
+test("the metrics page shows values, read-time deltas, and history", () => {
+  const html = metricsPage({
+    session: uiSession,
+    apps: [{ name: "demo", label: "Demo application" }],
+    app: { name: "demo", label: "Demo application" },
+    snapshots: seriesFixture(),
+    windowId: "90d",
+    state: { lastResult: "ok", lastDetail: "2 metrics" },
+  });
+  assert.match(html, /Demo application/);
+  assert.match(html, /Records/);
+  assert.match(html, /111,600/); // exact value, grouped
+  assert.match(html, /GiB/); // bytes formatted by kind
+  assert.match(html, /since the previous sample/);
+  assert.match(html, /vs a week earlier/);
+  assert.match(html, /window=1y/);
+  assert.equal((html.match(/<figure class="chart"/g) ?? []).length, 2);
+});
+
+test("a metric an app stopped publishing keeps its history and says it is gone", () => {
+  const snapshots = seriesFixture(3);
+  snapshots[0].metrics.retired_metric = { value: 1, label: "Retired", kind: "count" };
+  const html = metricsPage({
+    session: uiSession,
+    apps: [{ name: "demo" }],
+    app: { name: "demo" },
+    snapshots,
+    windowId: "90d",
+    state: {},
+  });
+  assert.match(html, /No longer published, history kept/);
+  assert.match(html, /retired_metric/);
+});
+
+test("a label from the application cannot inject markup into the dashboard", () => {
+  // The label is written by a separate application; it is untrusted input.
+  const snapshots = [
+    {
+      collectedAt: new Date().toISOString(),
+      metrics: { evil: { value: 1, label: '<img src=x onerror="alert(1)">', kind: "count" } },
+    },
+  ];
+  const html = metricsPage({
+    session: uiSession,
+    apps: [{ name: "demo" }],
+    app: { name: "demo" },
+    snapshots,
+    windowId: "90d",
+    state: {},
+  });
+  assert.doesNotMatch(html, /<img src=x/);
+  assert.match(html, /&lt;img src=x/);
+});
+
+test("with nothing configured the metrics page points at the setting", () => {
+  const html = metricsPage({ session: uiSession, apps: [], app: null, snapshots: [], windowId: "90d" });
+  assert.match(html, /No application metrics are configured/);
+  assert.match(html, /appMetrics/);
+});
+
+test("the metrics route renders and refuses an unknown application", async () => {
+  const url = createLoginToken({ config, store, email: "op@example.com" });
+  const res = await get(`/auth?token=${new URL(url).searchParams.get("token")}`);
+  const cookie = res.headers.get("set-cookie").split(";")[0];
+
+  const page = await get("/metrics", { cookie });
+  assert.equal(page.status, 200);
+  assert.match(await page.text(), /Demo application/);
+
+  const named = await get("/metrics/demo-metrics?window=1y", { cookie });
+  assert.equal(named.status, 200);
+
+  assert.equal((await get("/metrics/not-a-thing", { cookie })).status, 404);
+
+  // And the machine-readable snapshot carries collector state.
+  const api = await (await get("/api/status", { cookie })).json();
+  assert.ok("appMetrics" in api);
+});
+
+/* -------------------------------------------------------------------------
+ * The browser half of the chart.
+ *
+ * It is duplicated on purpose - under default-src 'none' the page has no
+ * request to make - so what matters is that it parses and that it agrees with
+ * the server. Without these, the entire client half is unexercised: it lives
+ * in a template literal, so a stray backtick corrupts it silently.
+ * ---------------------------------------------------------------------- */
+
+test("the script that ships to every operator parses", () => {
+  const { BROWSER_SCRIPT } = uiModule;
+  assert.doesNotThrow(() => new Function(BROWSER_SCRIPT));
+  // A second script element would be blocked by the CSP, which allows exactly
+  // one hash.
+  assert.doesNotMatch(BROWSER_SCRIPT, /<script/i);
+});
+
+test("the axis formatters agree between the server and the browser", () => {
+  // They cannot call each other, so the only thing keeping them honest is
+  // this table. Negative bytes and durations are the case that diverged.
+  const { compact, stamp } = browserHelpers();
+  const values = [0, 1, -1, 999, 1024, -2048, 12345, -12345, 1.5e6, 2.3e9, 0.25, -0.25, 8.42e9, 90_000, 1e12];
+  for (const kind of ["count", "bytes", "number", "percent", "duration"]) {
+    for (const v of values) {
+      assert.equal(compact(v, kind), compactValue(v, kind), `compact(${v}, ${kind})`);
+    }
+  }
+  const t = Date.parse("2026-08-22T03:04:00Z");
+  for (const span of [3600e3, 2 * 86400e3, 30 * 86400e3, 400 * 86400e3, 800 * 86400e3]) {
+    assert.equal(stamp(t, span), compactTime(t, span), `stamp(span=${span})`);
+  }
+});
+
+test("the server and the browser draw the same chart", () => {
+  // The server draws the full range and the browser redraws it. If the
+  // geometry disagrees the chart jumps the moment anyone touches it.
+  const cases = {
+    ramp: Array.from({ length: 40 }, (_, i) => [1_700_000_000_000 + i * 86_400_000, i * 3]),
+    flat: Array.from({ length: 10 }, (_, i) => [1_700_000_000_000 + i * 86_400_000, 5]),
+    zeroes: Array.from({ length: 10 }, (_, i) => [1_700_000_000_000 + i * 86_400_000, 0]),
+    negative: Array.from({ length: 10 }, (_, i) => [1_700_000_000_000 + i * 86_400_000, -1024 * (i + 1)]),
+    huge: Array.from({ length: 10 }, (_, i) => [1_700_000_000_000 + i * 86_400_000, 1e18 + i]),
+  };
+  for (const [name, points] of Object.entries(cases)) {
+    for (const kind of ["count", "bytes", "duration"]) {
+      const server = timeChart(points, { kind }).match(/<svg[^>]*>([\s\S]*)<\/svg>/)[1];
+      const client = browserDraw(points, kind);
+      assert.equal(client, server, `${name} / ${kind}`);
+    }
+  }
+});
+
+test("a wheel gesture without a modifier is left to the page", () => {
+  // The page is a tall stack of cards and a chart covers most of each one, so
+  // swallowing plain wheel events would turn scrolling into zoom.
+  const { BROWSER_SCRIPT } = uiModule;
+  assert.match(BROWSER_SCRIPT, /if \(!e\.ctrlKey && !e\.metaKey\) return;/);
+  const wheelBlock = BROWSER_SCRIPT.slice(BROWSER_SCRIPT.indexOf('addEventListener("wheel"'));
+  assert.ok(
+    wheelBlock.indexOf("ctrlKey") < wheelBlock.indexOf("preventDefault"),
+    "the modifier is checked before the page's scroll is cancelled",
+  );
+});
+
+test("pinch to zoom is not disabled over a chart", async () => {
+  // touch-action: pan-y on its own removes pinch-zoom, and the chart renders
+  // small enough on a phone that pinching is how the labels get read.
+  const source = await fs.promises.readFile(new URL("../src/web/ui.js", import.meta.url), "utf8");
+  assert.match(source, /touch-action: pan-y pinch-zoom;/);
+  assert.match(source, /@media \(max-width: 700px\)/);
+});
+
+test("a non-finite value draws nothing rather than a confident flat line", () => {
+  // JSON turns Infinity into null and isFinite(null) is true, so the browser
+  // would otherwise plot it at mid-scale.
+  const points = [[1, 10], [2, Number.POSITIVE_INFINITY], [3, 20], [4, 30]];
+  const html = timeChart(points, { kind: "count" });
+  assert.doesNotMatch(html, /NaN/);
+  const shipped = JSON.parse(html.match(/data-points="([^"]+)"/)[1]);
+  assert.deepEqual(shipped, [[1, 10], [3, 20], [4, 30]]);
+});
+
+test("an application with no collection yet is not shown as healthy", () => {
+  const html = metricsPage({
+    session: uiSession,
+    apps: [{ name: "demo" }],
+    app: { name: "demo" },
+    snapshots: [],
+    windowId: "90d",
+    state: {},
+  });
+  assert.match(html, /never collected/);
+  assert.doesNotMatch(html, /status ok/);
+});
+
+test("charts shrink as the metric count grows, so page cost stays bounded", () => {
+  // The metric count is set by the application, not the operator.
+  const many = Array.from({ length: 120 }, (_, k) => `metric_${k}`);
+  const snapshots = Array.from({ length: 900 }, (_, i) => ({
+    collectedAt: new Date(1_700_000_000_000 + i * 3_600_000).toISOString(),
+    metrics: Object.fromEntries(many.map((key) => [key, { value: i, kind: "count" }])),
+  }));
+  const html = metricsPage({
+    session: uiSession,
+    apps: [{ name: "demo" }],
+    app: { name: "demo" },
+    snapshots,
+    windowId: "all",
+    state: { lastResult: "ok" },
+  });
+  const sizes = [...html.matchAll(/data-points="([^"]+)"/g)].map((m) => JSON.parse(m[1]).length);
+  assert.equal(sizes.length, 120);
+  // 18000/120 = 150, well under the 300 a single chart would get. Asserting
+  // against 300 would pass with the adaptive budget removed entirely.
+  assert.ok(Math.max(...sizes) <= 150, `largest chart shipped ${Math.max(...sizes)} points`);
+  assert.ok(html.length < 1_500_000, `page was ${html.length} bytes`);
+});
+
+test("an empty publish does not take the whole page down", () => {
+  // The keys come from the newest snapshot that published something; reading
+  // the metric from the newest snapshot instead throws, and the route turns
+  // that into a 500 for every window, for as long as the app keeps sending {}.
+  const snapshots = [
+    { collectedAt: "2026-08-01T00:00:00Z", metrics: { rows: { value: 5, kind: "count" } } },
+    { collectedAt: "2026-08-02T00:00:00Z", metrics: { rows: { value: 9, kind: "count" } } },
+    { collectedAt: "2026-08-03T00:00:00Z", metrics: {} },
+  ];
+  const html = metricsPage({
+    session: uiSession,
+    apps: [{ name: "demo" }],
+    app: { name: "demo" },
+    snapshots,
+    windowId: "90d",
+    state: { lastResult: "ok" },
+  });
+  assert.match(html, /Rows|rows/);
+  assert.doesNotMatch(html, /No longer published/);
+});
+
+test("a breakdown's delta is a number, not a breakdown", () => {
+  const snapshots = [
+    { collectedAt: "2026-08-01T00:00:00Z", metrics: { tiers: { value: { a: 2, b: 3 }, kind: "breakdown" } } },
+    { collectedAt: "2026-08-02T00:00:00Z", metrics: { tiers: { value: { a: 4, b: 6 }, kind: "breakdown" } } },
+  ];
+  const html = metricsPage({
+    session: uiSession,
+    apps: [{ name: "demo" }],
+    app: { name: "demo" },
+    snapshots,
+    windowId: "90d",
+    state: {},
+  });
+  assert.match(html, /\+5/, "the change in the total");
+  assert.doesNotMatch(html, /\+-|--<\/span>/);
+});
+
+test("the truncation notice appears only when the read was truncated", () => {
+  const page = (count) =>
+    metricsPage({
+      session: uiSession,
+      apps: [{ name: "demo" }],
+      app: { name: "demo" },
+      snapshots: Array.from({ length: count }, (_, i) => ({
+        collectedAt: new Date(1_700_000_000_000 + i * 3_600_000).toISOString(),
+        metrics: { a: { value: i, kind: "count" } },
+      })),
+      windowId: "all",
+      state: {},
+    });
+  assert.doesNotMatch(page(50), /most recent/);
+  assert.match(page(uiModule.PAGE_SNAPSHOTS), /most recent/);
+});
+
+test("the browser drops a non-finite point rather than plotting it", () => {
+  // JSON writes Infinity as null and isFinite(null) is true, so without the
+  // guard the browser draws a confident flat line at mid-scale.
+  const { draw } = browserHelpers();
+  let markup = "";
+  const svg = { set innerHTML(v) { markup = v; }, get innerHTML() { return markup; }, setAttribute() {} };
+  draw({ el: { querySelector: () => svg }, pts: [[1, 10], [2, null], [3, 20]], lo: 1, hi: 3, kind: "count" });
+  const points = markup.match(/<polyline class="line" points="([^"]+)"/)[1].split(" ");
+  assert.equal(points.length, 2, "the null point is not plotted");
+});
+
+test("the readout follows the plot area, not the whole svg box", () => {
+  // The time axis spans PL..W-PR, so using the box width slides the grabbed
+  // sample out from under the pointer on a long drag.
+  const { BROWSER_SCRIPT } = uiModule;
+  assert.match(BROWSER_SCRIPT, /function plotFraction\(el, clientX\)/);
+  assert.match(BROWSER_SCRIPT, /\(px - PL\) \/ \(W - PL - PR\)/);
+  // Both the drag and the wheel go through it rather than doing their own maths.
+  assert.equal((BROWSER_SCRIPT.match(/plotFraction\(/g) ?? []).length >= 4, true);
+});
+
+test("zooming is reachable without a wheel or a modifier key", () => {
+  // A phone has neither, and the browser owns the pinch.
+  const html = timeChart([[1, 10], [2, 20], [3, 15]], { kind: "count" });
+  assert.match(html, /class="zoom-in"/);
+  assert.match(html, /class="zoom-out"/);
+  assert.match(html, /aria-label="Zoom in"/);
+  assert.match(uiModule.BROWSER_SCRIPT, /function zoomBy\(fig, factor\)/);
+});
+
+test("zooming stops a few samples short of empty, not at a fraction of the range", () => {
+  // Tying the floor to the range means the last several notches land on a
+  // blank chart for any long series.
+  const { clamp } = browserHelpers();
+  const hour = 3_600_000;
+  const pts = Array.from({ length: 500 }, (_, i) => [1_700_000_000_000 + i * hour, i]);
+  const fig = {
+    el: { querySelector: () => null },
+    pts,
+    gap: hour,
+    lo: pts[10][0],
+    hi: pts[10][0] + 1000, // absurdly deep zoom
+  };
+  clamp(fig);
+  assert.ok(fig.hi - fig.lo >= hour * 3, `floor was ${(fig.hi - fig.lo) / hour} hours`);
+});
+
+test("the readout does not describe the viewport before last", () => {
+  const { draw, readout } = browserHelpers();
+  let markup = "";
+  let text = "";
+  const svg = {
+    set innerHTML(v) { markup = v; },
+    get innerHTML() { return markup; },
+    setAttribute() {},
+    getBoundingClientRect: () => ({ left: 0, width: 720 }),
+  };
+  const out = { set textContent(v) { text = v; }, get textContent() { return text; } };
+  const el = { querySelector: (sel) => (sel === ".readout" ? out : svg) };
+  const pts = [[1_700_000_000_000, 50], [1_700_003_600_000, 60]];
+
+  // One figure, panned: the stale state only exists because the same object
+  // is redrawn, so a fresh one would never reach the bug.
+  const fig = { el, pts, lo: pts[0][0], hi: pts[1][0], kind: "count" };
+  draw(fig);
+  readout(fig, 700);
+  assert.match(text, /50|60/);
+
+  text = "";
+  fig.lo = pts[1][0] + 10_000_000;
+  fig.hi = pts[1][0] + 20_000_000;
+  draw(fig);
+  assert.match(markup, /no samples in this range/);
+  readout(fig, 700);
+  assert.equal(text, "", "the previous viewport's reading must not persist");
+});
+
+test("the file reader measures what arrived, not what stat claimed", async () => {
+  // Some regular files report size 0 and still have content. Trusting the
+  // stat would read them as empty, and it is also the size a file can change
+  // between the check and the read.
+  const { fetchDocument } = await import("../src/appmetrics/collect.js");
+  assert.equal(fs.statSync("/proc/self/status").size, 0);
+  const text = await fetchDocument({ name: "a", source: { file: "/proc/self/status" } });
+  assert.ok(text.length > 0, "content was read despite a zero stat size");
+  assert.match(text, /^Name:/);
+});
+
+test("the zoom buttons zoom the right way and stop at the floor", () => {
+  // Asserting the markup contains a button says nothing about what it does.
+  const { zoomBy } = browserHelpers();
+  const hour = 3_600_000;
+  const pts = Array.from({ length: 400 }, (_, i) => [1_700_000_000_000 + i * hour, i]);
+  const fig = { el: { querySelector: () => null }, pts, gap: hour, lo: pts[0][0], hi: pts[pts.length - 1][0] };
+  const full = fig.hi - fig.lo;
+
+  // The shipped zoomBy, not a copy of it: a copy proves nothing about which
+  // way the buttons are wired.
+  zoomBy(fig, 0.5);
+  assert.ok(fig.hi - fig.lo < full, "zoom in narrows the window");
+  const narrowed = fig.hi - fig.lo;
+  zoomBy(fig, 2);
+  assert.ok(fig.hi - fig.lo > narrowed, "zoom out widens it again");
+
+  for (let i = 0; i < 40; i++) zoomBy(fig, 0.5);
+  assert.ok(fig.hi - fig.lo >= hour * 3, "zooming in stops short of an empty chart");
+  for (let i = 0; i < 40; i++) zoomBy(fig, 2);
+  assert.equal(fig.hi - fig.lo, full, "zooming out cannot escape the data");
+});
+
+test("a press on a chart control does not start a pan", () => {
+  // Capturing the pointer on the figure retargets the click away from the
+  // button, so the control can pan the chart and never fire at all.
+  const { BROWSER_SCRIPT } = uiModule;
+  assert.match(BROWSER_SCRIPT, /if \(e\.target\.closest\("button"\)\) return;/);
+  assert.doesNotMatch(BROWSER_SCRIPT, /closest\("\.reset"\)/);
+});
+
+test("frozen numbers under a fresh timestamp are called out, not shown as healthy", () => {
+  // An endpoint that keeps answering 200 with an empty metrics object would
+  // otherwise leave the last real values on the page forever, in green, under
+  // a collection time from a minute ago.
+  const day = 86_400_000;
+  const snapshots = [
+    { collectedAt: new Date(Date.now() - 9 * day).toISOString(), metrics: { rows: { value: 500, label: "Rows", kind: "count" } } },
+    { collectedAt: new Date(Date.now() - 60_000).toISOString(), metrics: {} },
+  ];
+  const html = metricsPage({
+    session: uiSession,
+    apps: [{ name: "demo" }],
+    app: { name: "demo" },
+    snapshots,
+    windowId: "90d",
+    state: { lastResult: "ok" },
+  });
+  assert.match(html, /last publish was empty/);
+  assert.match(html, /values are from 9d ago/);
+  assert.match(html, /status warn/);
+  assert.doesNotMatch(html, /status ok/);
+});
+
+/**
+ * Run the shipped chart script against a stub DOM and hand back the figure's
+ * live state plus a way to click its controls. This is the only way to test
+ * the wiring rather than the helpers: which handler is attached to which
+ * button is exactly where a chart silently does the wrong thing.
+ */
+function mountChart(points, kind = "count") {
+  const listeners = new Map();
+  const buttons = {};
+  const svg = {
+    innerHTML: "",
+    setAttribute() {},
+    getBoundingClientRect: () => ({ left: 0, width: 720 }),
+  };
+  const makeButton = (name) => {
+    const el = {
+      hidden: false,
+      disabled: false,
+      addEventListener(type, fn) {
+        if (type === "click") this._click = fn;
+      },
+      click() {
+        this._click?.({ target: this });
+      },
+      closest: () => el,
+    };
+    buttons[name] = el;
+    return el;
+  };
+  const figure = {
+    getAttribute: (name) =>
+      name === "data-points" ? JSON.stringify(points) : name === "data-kind" ? kind : null,
+    addEventListener(type, fn) {
+      listeners.set(type, fn);
+    },
+    querySelector(sel) {
+      if (sel === "svg") return svg;
+      if (sel === ".zoom-in") return buttons["zoom-in"] ?? makeButton("zoom-in");
+      if (sel === ".zoom-out") return buttons["zoom-out"] ?? makeButton("zoom-out");
+      if (sel === ".reset") return buttons.reset ?? makeButton("reset");
+      if (sel === ".readout") return { textContent: "" };
+      return null;
+    },
+    setPointerCapture() {},
+    releasePointerCapture() {},
+    hasPointerCapture: () => false,
+  };
+  const document = { addEventListener() {}, querySelectorAll: () => [figure] };
+  new Function("document", uiModule.BROWSER_SCRIPT)(document);
+  // The window the chart currently shows, read back off the rendered axis.
+  const span = () => {
+    const labels = [...svg.innerHTML.matchAll(/class="xlab"[^>]*>([^<]+)</g)].map((m) => m[1]);
+    return labels.length;
+  };
+  return { buttons, listeners, svg, span };
+}
+
+test("the zoom buttons are wired the right way round", () => {
+  const hour = 3_600_000;
+  const points = Array.from({ length: 400 }, (_, i) => [1_700_000_000_000 + i * hour, i]);
+  const chart = mountChart(points);
+  const plotted = () => (chart.svg.innerHTML.match(/<polyline class="line" points="([^"]+)"/)?.[1] ?? "").split(" ").length;
+
+  const whole = plotted();
+  chart.buttons["zoom-in"].click();
+  const narrowed = plotted();
+  assert.ok(narrowed < whole, `zoom in should show fewer samples (${narrowed} vs ${whole})`);
+
+  chart.buttons["zoom-out"].click();
+  assert.ok(plotted() > narrowed, "zoom out should show more again");
+
+  chart.buttons["zoom-in"].click();
+  chart.buttons.reset.click();
+  assert.equal(plotted(), whole, "reset returns the whole range");
+});
+
+test("a press on a control does not pan the chart", () => {
+  const hour = 3_600_000;
+  const points = Array.from({ length: 100 }, (_, i) => [1_700_000_000_000 + i * hour, i]);
+  const chart = mountChart(points);
+  chart.buttons["zoom-in"].click();
+  const afterZoom = chart.svg.innerHTML;
+
+  // pointerdown on a button, then a move: with the guard missing this drags.
+  chart.listeners.get("pointerdown")({ target: chart.buttons["zoom-in"], clientX: 100, pointerId: 1 });
+  chart.listeners.get("pointermove")({ clientX: 400, pointerId: 1 });
+  assert.equal(chart.svg.innerHTML, afterZoom, "the chart did not move");
 });
