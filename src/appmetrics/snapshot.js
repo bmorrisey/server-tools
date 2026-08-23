@@ -113,7 +113,9 @@ function parseMetric(key, raw) {
 export function parseSnapshot(raw, { collectedAt = new Date() } = {}) {
   let doc = raw;
   if (typeof doc === "string") {
-    if (doc.length > LIMITS.bytes) throw new Error(`document is larger than ${LIMITS.bytes} bytes`);
+    // Bytes, not characters: a document of multi-byte text is larger than its
+    // length suggests, and the cap is about memory.
+    if (Buffer.byteLength(doc) > LIMITS.bytes) throw new Error(`document is larger than ${LIMITS.bytes} bytes`);
     try {
       doc = JSON.parse(doc);
     } catch (e) {

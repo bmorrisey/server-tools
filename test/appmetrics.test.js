@@ -374,3 +374,60 @@ test("collection failures alert once and recover once", () => {
   assert.equal(state.evaluate("app", true, 2), "recover");
   assert.equal(state.evaluate("app", true, 2), null);
 });
+
+test("an unbounded chunked response is cut off, not buffered whole", async () => {
+  // A chunked reply declares no length, so measuring after reading is not a
+  // cap at all: the agent would hold the whole thing first.
+  const http = await import("node:http");
+  let sent = 0;
+  let cancelled = false;
+  const server = http.createServer((req, res) => {
+    res.writeHead(200, { "content-type": "application/json" }); // chunked, no length
+    const chunk = "x".repeat(64 * 1024);
+    const pump = () => {
+      if (res.writableEnded || cancelled) return;
+      sent += chunk.length;
+      if (sent > 20 * 1024 * 1024) return res.end(); // do not run away in a test
+      if (res.write(chunk)) setImmediate(pump);
+      else res.once("drain", pump);
+    };
+    res.on("close", () => (cancelled = true));
+    pump();
+  });
+  await new Promise((r) => server.listen(0, r));
+  try {
+    const target = { name: "app", source: { url: `http://127.0.0.1:${server.address().port}/m` } };
+    await assert.rejects(() => fetchDocument(target), /larger than/);
+    // It stopped early rather than reading everything the server would send.
+    assert.ok(sent < 5 * 1024 * 1024, `read ${sent} bytes before giving up`);
+  } finally {
+    server.close();
+  }
+});
+
+test("a source that is not a regular file is refused rather than blocking", async () => {
+  const { execFileSync } = await import("node:child_process");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "st-fifo-"));
+  try {
+    const fifo = path.join(dir, "pipe");
+    execFileSync("mkfifo", [fifo]);
+    // A FIFO reports size 0 and then blocks forever on read.
+    await assert.rejects(
+      () => Promise.race([
+        fetchDocument({ name: "app", source: { file: fifo } }),
+        new Promise((_, reject) => setTimeout(() => reject(new Error("blocked forever")), 3000)),
+      ]),
+      /not a regular file/,
+    );
+    await assert.rejects(() => fetchDocument({ name: "app", source: { file: dir } }), /not a regular file/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("the byte cap counts bytes, not characters", () => {
+  // A multi-byte document is bigger than its length suggests.
+  const multibyte = "é".repeat(LIMITS.bytes - 10); // 2 bytes each
+  assert.ok(multibyte.length < LIMITS.bytes);
+  assert.throws(() => parseSnapshot(multibyte), /larger than/);
+});

@@ -44,6 +44,9 @@ export async function fetchDocument(target, { timeoutMs = 10_000, fetchImpl = fe
   const source = target.source ?? {};
   if (source.file) {
     const stat = await fsp.stat(source.file).catch(() => null);
+    // A FIFO reports size 0 and then blocks forever, and a directory or a
+    // device is not a document. Only a regular file is a source.
+    if (stat && !stat.isFile()) throw new Error(`${source.file} is not a regular file`);
     if (stat && stat.size > LIMITS.bytes) {
       throw new Error(`${source.file} is ${stat.size} bytes; the limit is ${LIMITS.bytes}`);
     }
@@ -67,9 +70,39 @@ export async function fetchDocument(target, { timeoutMs = 10_000, fetchImpl = fe
   if (Number.isFinite(declared) && declared > LIMITS.bytes) {
     throw new Error(`response declares ${declared} bytes; the limit is ${LIMITS.bytes}`);
   }
-  const text = await res.text();
-  if (text.length > LIMITS.bytes) throw new Error(`response is larger than ${LIMITS.bytes} bytes`);
-  return text;
+  return readCapped(res);
+}
+
+/**
+ * Read a response body, giving up once it passes the cap.
+ *
+ * Reading it whole and measuring afterwards is not a cap: a chunked reply
+ * declares no length, so a broken or hostile application could hand the agent
+ * an unbounded body and have it buffered in full before anyone objected. This
+ * counts bytes as they arrive and cancels the stream, and bytes rather than
+ * characters because a multi-byte document is bigger than its length suggests.
+ */
+async function readCapped(res) {
+  const reader = res.body?.getReader?.();
+  if (!reader) {
+    // A stub or a runtime without a stream body: fall back to measuring after.
+    const text = await res.text();
+    if (Buffer.byteLength(text) > LIMITS.bytes) throw new Error(`response is larger than ${LIMITS.bytes} bytes`);
+    return text;
+  }
+  const chunks = [];
+  let received = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    received += value.byteLength;
+    if (received > LIMITS.bytes) {
+      await reader.cancel().catch(() => {});
+      throw new Error(`response is larger than ${LIMITS.bytes} bytes`);
+    }
+    chunks.push(Buffer.from(value));
+  }
+  return Buffer.concat(chunks).toString("utf8");
 }
 
 /**
