@@ -18,6 +18,10 @@ Compatibility is two halves, each useful without the other:
 Everything here is generic: the toolkit knows nothing about any particular
 product. The per-tool sections below are setup recipes, not integrations.
 
+This page is the reference. For a narrative pass - one example box wired to
+Grafana, Superset, and Redash end to end, including what the failure modes
+look like - read [WALKTHROUGH.md](WALKTHROUGH.md) first.
+
 ## Linking out: registering a dashboard
 
 ```jsonc

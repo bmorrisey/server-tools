@@ -131,6 +131,8 @@ statuses - never application content.
 
 - [docs/DASHBOARDS.md](docs/DASHBOARDS.md) - linking external dashboards, and
   feeding Grafana, Superset, or Redash from the data connectors
+- [docs/WALKTHROUGH.md](docs/WALKTHROUGH.md) - a worked example: one box and
+  three charting tools wired up end to end, told as a day of use
 - [docs/METRICS.md](docs/METRICS.md) - the application metrics contract: what
   your app publishes, the versioning rule, and the limits
 - [docs/DEPLOY.md](docs/DEPLOY.md) - step-by-step VPS deployment, reverse
