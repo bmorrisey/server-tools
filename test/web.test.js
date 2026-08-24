@@ -995,3 +995,41 @@ test("a press on a control does not pan the chart", () => {
   chart.listeners.get("pointermove")({ clientX: 400, pointerId: 1 });
   assert.equal(chart.svg.innerHTML, afterZoom, "the chart did not move");
 });
+
+test("external dashboard tiles link out with status from the named check", () => {
+  const page = (dashboards, checks = {}) =>
+    uiModule.overviewPage({
+      session: uiSession,
+      host: { cpuPct: 10, mem: { usedPct: 40, usedBytes: 1, totalBytes: 2 }, load: { m1: 0.5, cores: 4 }, disks: [], uptimeSeconds: 100 },
+      checks,
+      backups: {},
+      deploys: {},
+      events: [],
+      sparks: { cpu: [], mem: [], load: [] },
+      dashboards,
+    });
+
+  const html = page(
+    [
+      { name: "charts", label: "Team charts", url: "https://charts.example.com/d/abc", kind: "grafana", check: "charts-http" },
+      { name: "reports", url: "https://reports.example.com" },
+    ],
+    { "charts-http": { status: "fail", detail: "HTTP 502", type: "http", at: new Date().toISOString() } },
+  );
+  assert.match(html, /External dashboards/);
+  assert.match(html, /<a class="card" href="https:\/\/charts.example.com\/d\/abc"/);
+  // The named check's state is the pill, so the tile and the alerts agree.
+  assert.match(html, /✕ fail/);
+  assert.match(html, /HTTP 502/);
+  // An entry without a check gets a neutral link pill, not a green one.
+  assert.match(html, /status external">link/);
+  assert.match(html, /charts.example.com\/d\/abc - grafana/);
+
+  // Operator config still renders as text, never as markup.
+  const hostile = page([{ name: "x", label: "<script>alert(1)</script>", url: "https://x.example.com", kind: "grafana" }]);
+  assert.doesNotMatch(hostile, /<script>alert/);
+  assert.match(hostile, /&lt;script&gt;alert/);
+
+  // No dashboards, no section.
+  assert.doesNotMatch(page([]), /External dashboards/);
+});

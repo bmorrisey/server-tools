@@ -28,6 +28,8 @@ feature will report clearly rather than half-work with.
 | `backups` | `[]` | Backup targets (below). |
 | `deploys` | `[]` | Deployable applications (below). |
 | `appMetrics` | `[]` | Application metric sources (below). |
+| `dashboards` | `[]` | External dashboards to link from the Overview (below). |
+| `connect` | `{}` | Bearer tokens for the read-only data endpoints (below). |
 | `housekeeping` | `{}` | Cleanup settings (below). |
 | `alerts` | `{}` | Alert channels (below). |
 | `web` | enabled | Dashboard settings (below). |
@@ -414,6 +416,38 @@ directory is the point: that pruner deletes by date regardless of topic, and 90
 days is right for check samples and wrong for a record meant to last years. See
 [docs/METRICS.md](METRICS.md) for why this is a separate directory rather than
 a retention override.
+
+## External dashboards
+
+Tiles on the Overview linking out to dashboards you run elsewhere, with
+status from a check you already have. Full recipes per tool in
+[docs/DASHBOARDS.md](DASHBOARDS.md).
+
+```json
+{ "name": "charts", "label": "Team charts", "url": "https://charts.example.com",
+  "kind": "grafana", "check": "charts-http" }
+```
+
+`kind` is a badge, not behaviour. `check` must name a configured check; its
+state supplies the tile's pill, so the tile, the Checks page and your alerts
+all agree. Dashboards are linked, never embedded: this page's CSP allows one
+script by hash and no external assets, and that is worth keeping.
+
+## Connect (data endpoints)
+
+Named bearer tokens for the read-only `/connect/` endpoints that external
+tools chart from. One token per consumer, each from the environment:
+
+```json
+{ "tokens": [ { "name": "charting", "token": "${CONNECT_TOKEN_CHARTING}" } ] }
+```
+
+Tokens must be at least 16 characters, so a `${VAR}` that resolved to an
+empty string fails validation instead of standing guard as an empty token.
+With no tokens configured the endpoints refuse everything except a signed-in
+dashboard session. Tokens are accepted in the `Authorization: Bearer` header
+only - never in a URL - and the only part of a token that ever appears in a
+log is its name.
 
 ## Housekeeping
 

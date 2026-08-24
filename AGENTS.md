@@ -3,7 +3,8 @@
 ## What this is
 
 An operations toolkit (health checks, alerts, encrypted backups, safe
-deploys, housekeeping, admin dashboard) for a single-box Docker VPS. One
+deploys, housekeeping, application metrics, admin dashboard, read-only data
+connectors for external charting tools) for a single-box Docker VPS. One
 Node.js process (`src/agent.js`) schedules everything and serves the
 dashboard; `src/cli.js` runs any operation by hand.
 
@@ -55,7 +56,7 @@ dashboard; `src/cli.js` runs any operation by hand.
 | `src/housekeep.js` | history pruning, temp expiry, configured dir cleanup |
 | `src/storage.js` | disk usage analysis + conservative, previewed reclamation |
 | `src/remediate.js` | plain-language incident diagnosis + validated one-click actions |
-| `src/web/` | dashboard: http server, magic-link auth, server-rendered UI, action routes |
+| `src/web/` | dashboard: http server, magic-link auth, server-rendered UI, action routes, read-only data connectors |
 | `deploy/` | Dockerfile, docker-compose.yml, config + env examples |
 | `test/` | node:test unit tests, no framework |
 
@@ -78,6 +79,16 @@ node --check src/<file>.js        # syntax check a module
   behaviour goes in the single hashed `SCRIPT` block in `src/web/ui.js`;
   inline `on*=` attributes are blocked by the CSP and fail silently, so a
   confirmation written that way never prompts at all.
+- The `/connect/` namespace (`src/web/connect.js`) is read-only and
+  GET-only, authenticated by named bearer tokens (Authorization header only,
+  never URLs) or a signed-in session, and refuses everything when no tokens
+  are configured. Keep all of that. The Prometheus exposition deliberately
+  emits no sample timestamps; freshness ships as `*_age_seconds` gauges
+  instead (see `docs/DASHBOARDS.md`).
 - Config changes need: validation in `src/config.js`, documentation in
   `docs/CONFIG.md`, and the example in `deploy/config.example.json` updated
-  together.
+  together. A config field that references a new `${VAR}` additionally needs
+  a passthrough line in the `environment` block of
+  `deploy/docker-compose.yml` and an entry in `deploy/.env.example`: compose
+  only forwards variables named in the compose file, so a missing line
+  reaches the agent as an empty string and fails validation at startup.

@@ -304,6 +304,61 @@ export function validateConfig(cfg) {
     }
   }
 
+  for (const [i, d] of (cfg.dashboards ?? []).entries()) {
+    const where = `dashboards[${i}]`;
+    need(
+      typeof d.name === "string" && /^[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(d.name),
+      `${where}.name is required (letters, digits, "_", "." or "-", starting alphanumeric)`,
+    );
+    if (d.label !== undefined) need(typeof d.label === "string" && d.label, `${where}.label must be a non-empty string`);
+    need(
+      typeof d.url === "string" && /^https?:\/\//.test(d.url),
+      `${where}.url must be an http(s) URL (where the external dashboard lives)`,
+    );
+    // The kind is a badge and a docs pointer, nothing more: this toolkit has
+    // no vocabulary for any particular product, dashboards included.
+    if (d.kind !== undefined)
+      need(
+        typeof d.kind === "string" && /^[a-z0-9][a-z0-9-]*$/.test(d.kind),
+        `${where}.kind must be a short lowercase slug`,
+      );
+    if (d.check !== undefined) {
+      // Status comes from an existing check rather than a second prober, so
+      // the reference has to point at one.
+      need(
+        (cfg.checks ?? []).some((c) => c.name === d.check),
+        `${where}.check "${d.check}" is not a configured check; add an http check for the dashboard and name it here`,
+      );
+    }
+  }
+  {
+    const names = (cfg.dashboards ?? []).map((d) => d.name);
+    const duplicate = names.find((n, i) => names.indexOf(n) !== i);
+    need(!duplicate, `dashboards has more than one entry named "${duplicate}"`);
+  }
+
+  const connectCfg = cfg.connect ?? {};
+  if (connectCfg.tokens !== undefined) {
+    need(Array.isArray(connectCfg.tokens), "connect.tokens must be an array");
+    for (const [i, t] of (Array.isArray(connectCfg.tokens) ? connectCfg.tokens : []).entries()) {
+      const where = `connect.tokens[${i}]`;
+      need(
+        typeof t?.name === "string" && /^[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(t.name),
+        `${where}.name is required (it identifies the consumer; it is the only part of a token ever logged)`,
+      );
+      // Interpolation resolves a missing env var to "": a token that resolved
+      // empty must fail validation, not silently authorize nothing or - far
+      // worse - be matchable by an empty Bearer value.
+      need(
+        typeof t?.token === "string" && t.token.length >= 16,
+        `${where}.token must be at least 16 characters; set it from the environment with "\${VAR}" (is the variable exported?)`,
+      );
+    }
+    const names = (Array.isArray(connectCfg.tokens) ? connectCfg.tokens : []).map((t) => t?.name);
+    const duplicate = names.find((n, i) => n && names.indexOf(n) !== i);
+    need(!duplicate, `connect.tokens has more than one token named "${duplicate}"`);
+  }
+
   const hk = cfg.housekeeping ?? {};
   if (hk.schedule !== undefined)
     need(parseSchedule(hk.schedule) !== null, `housekeeping.schedule "${hk.schedule}" is not a valid schedule`);
@@ -418,6 +473,8 @@ export function withDefaults(cfg) {
     backups: [],
     deploys: [],
     appMetrics: [],
+    dashboards: [],
+    connect: {},
     housekeeping: {},
     alerts: {},
     web: { enabled: true, port: 9090, bind: "127.0.0.1", sessionDays: 30 },

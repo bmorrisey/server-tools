@@ -684,7 +684,7 @@ export function statCard({ label, value, detail = "", extra = "", href = "" }) {
     : `<div class="card">${inner}</div>`;
 }
 
-export function overviewPage({ session, host, checks, backups, backupTargets = [], deploys, events, sparks, incidents = [], notes = [], flash, csrf }) {
+export function overviewPage({ session, host, checks, backups, backupTargets = [], deploys, events, sparks, incidents = [], notes = [], dashboards = [], flash, csrf }) {
   const counts = { ok: 0, warn: 0, fail: 0 };
   for (const c of Object.values(checks)) counts[c.status] = (counts[c.status] ?? 0) + 1;
   const headline =
@@ -785,6 +785,7 @@ ${attention}
 <h2>Host</h2>
 <div class="grid">${hostCards}</div>
 
+${externalDashboards(dashboards, checks)}
 <h2 style="margin-top:24px">Backups</h2>
 ${coverageBanners(notes)}
 <div class="grid wide">${backupCards || '<p class="sub">No backup targets configured.</p>'}</div>
@@ -798,6 +799,47 @@ ${coverageBanners(notes)}
 <h2 style="margin-top:24px">Recent events</h2>
 <ul class="events">${eventItems || '<li class="sub">Nothing yet.</li>'}</ul>`;
   return layout({ title: "Overview", page: "/", session, body, flash });
+}
+
+/**
+ * Tiles linking out to external dashboards the operator registered.
+ *
+ * Linked, never embedded: this page ships no external assets and allows one
+ * script by hash, and every charting stack sets its own frame protections
+ * anyway. Status comes from the check the entry names - the machinery that
+ * already knows how to poll, alert and recover - not from a second prober.
+ */
+function externalDashboards(dashboards, checks) {
+  if (!dashboards.length) return "";
+  const cards = dashboards
+    .map((d) => {
+      const state = d.check ? checks[d.check] : null;
+      const pill = state
+        ? statusPill(state.status)
+        : '<span class="status external">link</span>';
+      // statCard escapes the label itself; detail is raw HTML, so everything
+      // interpolated into it is escaped here.
+      const kind = d.kind ? ` - ${esc(d.kind)}` : "";
+      return statCard({
+        label: d.label ?? d.name,
+        value: pill,
+        detail: `${esc(shortUrl(d.url))}${kind}${state ? `<br>${esc(state.detail ?? "")}` : ""}`,
+        href: d.url,
+      });
+    })
+    .join("\n");
+  return `<h2 style="margin-top:24px">External dashboards</h2>
+<div class="grid">${cards}</div>`;
+}
+
+/** The part of a URL worth showing on a tile. */
+function shortUrl(url) {
+  try {
+    const u = new URL(url);
+    return u.host + (u.pathname !== "/" ? u.pathname : "");
+  } catch {
+    return url;
+  }
 }
 
 export function checksPage({ session, checks, historyByName, flash }) {

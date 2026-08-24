@@ -57,3 +57,29 @@ test("pruneHistory removes only old day files", () => {
     cleanup();
   }
 });
+
+test("recent returns the same newest records however many day-files exist", () => {
+  // The connectors let a caller widen the window to years; the limit has to
+  // bound the read, and bounding it must not change what comes back.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "st-recent-"));
+  try {
+    const store = new Store(dir);
+    store.ensureDirs();
+    // Three day-files written directly, so their dates are fixed.
+    const day = (d, values) =>
+      fs.writeFileSync(
+        path.join(dir, "history", `demo-${d}.jsonl`),
+        values.map((v) => `${JSON.stringify({ ts: `${d}T00:00:0${v}Z`, v })}\n`).join(""),
+      );
+    day("2026-08-01", [1, 2]);
+    day("2026-08-02", [3, 4]);
+    day("2026-08-03", [5, 6]);
+
+    assert.deepEqual(store.recent("demo", { limit: 3, maxDays: 7 }).map((r) => r.v), [4, 5, 6]);
+    assert.deepEqual(store.recent("demo", { limit: 100, maxDays: 7 }).map((r) => r.v), [1, 2, 3, 4, 5, 6]);
+    assert.deepEqual(store.recent("demo", { limit: 100, maxDays: 2 }).map((r) => r.v), [3, 4, 5, 6]);
+    assert.deepEqual(store.recent("demo", { limit: 1, maxDays: 7 }).map((r) => r.v), [6]);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

@@ -19,6 +19,8 @@
  *   POST /action           run one validated remediation (CSRF protected)
  *   GET  /api/status       machine-readable snapshot (session required)
  *   GET  /api/storage      machine-readable storage report (session required)
+ *   GET  /connect[/...]    read-only data for external dashboards
+ *                          (bearer token from connect.tokens, or a session)
  */
 import http from "node:http";
 import { URL } from "node:url";
@@ -29,6 +31,7 @@ import * as storage from "../storage.js";
 import { sendMail } from "../smtp.js";
 import { coverageNotes } from "../config.js";
 import { WINDOWS, windowById } from "../appmetrics/series.js";
+import * as connect from "./connect.js";
 import { diagnose, gatherContext, runAction, ACTION_IDS } from "../remediate.js";
 import { logger } from "../log.js";
 
@@ -217,6 +220,26 @@ export function startWebServer({ config, store, docker, alerter }) {
       return redirect(res, "/", { "set-cookie": auth.sessionCookie(config, sessionId) });
     }
 
+    // Data connectors: bearer-token consumers (external charting stacks)
+    // cannot do magic-link cookies, so this namespace authenticates
+    // itself. A signed-in browser also works, so an operator can eyeball an
+    // endpoint. Placed before the session gate on purpose; everything in it is
+    // read-only and GET-only.
+    if (path === "/connect" || path.startsWith("/connect/")) {
+      const tokenName = connect.authorize(config.connect?.tokens, req.headers.authorization);
+      const connectSession = tokenName ? null : auth.sessionFromCookie({ store, cookieHeader: req.headers.cookie });
+      if (!tokenName && !connectSession) {
+        // Fail closed: with no tokens configured there is nothing a consumer
+        // could present, and an endpoint that is open because nobody finished
+        // configuring it is the wrong default for production data.
+        return send(res, 401, { error: "unauthorized", hint: "send 'Authorization: Bearer <token>' from connect.tokens" }, {
+          "www-authenticate": "Bearer",
+        });
+      }
+      if (req.method !== "GET") return send(res, 405, { error: "connect endpoints are read-only" });
+      return serveConnect(path, url, res);
+    }
+
     // Everything else requires a session.
     const session = auth.sessionFromCookie({ store, cookieHeader: req.headers.cookie });
     if (!session) {
@@ -269,6 +292,7 @@ export function startWebServer({ config, store, docker, alerter }) {
           sparks,
           incidents,
           notes: coverageNotes(config),
+          dashboards: config.dashboards ?? [],
           flash,
           csrf: session.csrf,
         }),
@@ -367,6 +391,71 @@ export function startWebServer({ config, store, docker, alerter }) {
     }
 
     return send(res, 404, "<h1>Not found</h1>");
+  }
+
+  /** One /connect route. Auth has already happened. */
+  async function serveConnect(path, url, res) {
+    const appNames = (config.appMetrics ?? []).map((a) => a.name);
+    const sendRows = (rows, format, columns) => {
+      if (format === "csv") {
+        return send(res, 200, connect.toCsv(rows, columns), { "content-type": "text/csv; charset=utf-8" });
+      }
+      return send(res, 200, rows);
+    };
+    const days = (fallback) => {
+      const parsed = connect.parseDays(url.searchParams.get("days"), fallback);
+      if (parsed === null) send(res, 400, { error: `days must be an integer from 1 to ${connect.MAX_DAYS}` });
+      return parsed;
+    };
+
+    if (path === "/connect") return send(res, 200, connect.endpointIndex({ apps: appNames }));
+
+    if (path === "/connect/prometheus") {
+      const apps = appNames.map((app) => ({ app, snapshot: store.readSnapshots(app, { limit: 1 })[0] ?? null }));
+      const body = connect.prometheusText({
+        checks: store.readState("checks", {}),
+        backups: store.readState("backups", {}),
+        host: await collectHost(config),
+        apps,
+      });
+      return send(res, 200, body, { "content-type": "text/plain; version=0.0.4; charset=utf-8" });
+    }
+
+    const match = path.match(/^\/connect\/(checks|check-history|host|events|backups|metrics\/[^/]+)\.(json|csv)$/);
+    if (!match) return send(res, 404, { error: "unknown connect endpoint; GET /connect lists them" });
+    const [, series, format] = match;
+
+    if (series === "checks") return sendRows(connect.checkRows(store.readState("checks", {})), format, connect.COLUMNS.checks);
+    if (series === "backups")
+      return sendRows(connect.backupRows(store.readState("backups", {})), format, connect.COLUMNS.backups);
+    if (series === "check-history") {
+      const maxDays = days(7);
+      if (maxDays === null) return;
+      let samples = store.recent("checks", { limit: connect.MAX_ROWS, maxDays });
+      const only = url.searchParams.get("check");
+      if (only) samples = samples.filter((s) => s.name === only);
+      return sendRows(connect.historyRows(samples), format, connect.COLUMNS["check-history"]);
+    }
+    if (series === "host") {
+      const maxDays = days(7);
+      if (maxDays === null) return;
+      return sendRows(connect.hostRows(store.recent("host", { limit: connect.MAX_ROWS, maxDays })), format, connect.COLUMNS.host);
+    }
+    if (series === "events") {
+      const maxDays = days(7);
+      if (maxDays === null) return;
+      return sendRows(connect.eventRows(store.recent("events", { limit: connect.MAX_ROWS, maxDays })), format, connect.COLUMNS.events);
+    }
+    // metrics/<app>
+    const app = decodeURIComponent(series.slice("metrics/".length));
+    if (!appNames.includes(app)) return send(res, 404, { error: "no such application; GET /connect lists them" });
+    const maxDays = days(90);
+    if (maxDays === null) return;
+    const snapshots = store.readSnapshots(app, {
+      sinceMs: Date.now() - maxDays * 86_400_000,
+      limit: ui.PAGE_SNAPSHOTS,
+    });
+    return sendRows(connect.metricRows(snapshots), format, connect.COLUMNS.metrics);
   }
 
   const { port, bind } = config.web;

@@ -74,17 +74,24 @@ export class Store {
     } catch {
       return [];
     }
-    const out = [];
-    for (const f of files) {
-      const lines = fs.readFileSync(path.join(dir, f), "utf8").split("\n");
-      for (const line of lines) {
+    // Newest file first, stopping once `limit` records are in hand. The
+    // output is identical to reading everything and slicing, but the work is
+    // not: the connectors let a caller widen the window to years, and the
+    // limit has to bound what one request makes this process read, not just
+    // what it returns.
+    let out = [];
+    for (let i = files.length - 1; i >= 0; i--) {
+      const batch = [];
+      for (const line of fs.readFileSync(path.join(dir, files[i]), "utf8").split("\n")) {
         if (!line.trim()) continue;
         try {
-          out.push(JSON.parse(line));
+          batch.push(JSON.parse(line));
         } catch {
           // Skip torn writes rather than failing the whole read.
         }
       }
+      out = batch.concat(out);
+      if (out.length >= limit) break;
     }
     return out.slice(-limit);
   }
