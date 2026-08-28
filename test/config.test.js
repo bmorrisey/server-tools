@@ -121,6 +121,78 @@ test("a registry image carries no tag; the tag is the deploy argument", () => {
   assert.deepEqual(validateConfig(withDefaults({ ...minimal, deploys: [{ ...base, image: "ghcr.io/o/app" }] })), []);
 });
 
+test("a registry deploy can move several images on one tag", () => {
+  const base = { name: "app", dir: "/apps/app", healthUrl: "https://a/health", source: "registry", project: "app" };
+  assert.deepEqual(
+    validateConfig(
+      withDefaults({
+        ...minimal,
+        deploys: [
+          {
+            ...base,
+            images: [
+              { image: "ghcr.io/o/api", envVar: "API_IMAGE", services: ["api"] },
+              { image: "ghcr.io/o/web", envVar: "WEB_IMAGE", services: ["web"] },
+            ],
+          },
+        ],
+      }),
+    ),
+    [],
+  );
+});
+
+test("the two ways of naming a registry image are not mixed", () => {
+  const problems = validateConfig(
+    withDefaults({
+      ...minimal,
+      deploys: [
+        {
+          name: "app",
+          dir: "/apps/app",
+          healthUrl: "https://a/health",
+          source: "registry",
+          project: "app",
+          image: "ghcr.io/o/app",
+          services: ["app"],
+          images: [{ image: "ghcr.io/o/api", services: ["api"] }],
+        },
+      ],
+    }),
+  );
+  assert.ok(problems.some((p) => p.includes("belong inside each entry")));
+});
+
+test("each image in a multi-image deploy needs its own variable and services", () => {
+  const base = { name: "app", dir: "/apps/app", healthUrl: "https://a/health", source: "registry", project: "app" };
+  const problems = validateConfig(
+    withDefaults({
+      ...minimal,
+      deploys: [
+        // Two images behind one variable is the second overwriting the first.
+        { ...base, images: [{ image: "ghcr.io/o/api", services: ["api"] }, { image: "ghcr.io/o/web", services: ["web"] }] },
+        // A service cannot run two image IDs at once, so every deploy of this
+        // target would fail verification and roll back.
+        {
+          ...base,
+          images: [
+            { image: "ghcr.io/o/api", envVar: "API_IMAGE", services: ["app"] },
+            { image: "ghcr.io/o/web", envVar: "WEB_IMAGE", services: ["app"] },
+          ],
+        },
+        { ...base, images: [{ image: "ghcr.io/o/api:v1", envVar: "API_IMAGE", services: ["api"] }] },
+        { ...base, images: [{ image: "ghcr.io/o/api", envVar: "API_IMAGE" }] },
+        { ...base, images: [] },
+      ],
+    }),
+  );
+  assert.ok(problems.some((p) => p.includes('deploys[0].images[1].envVar "APP_IMAGE" is already used')));
+  assert.ok(problems.some((p) => p.includes('deploys[1].images[1].services lists "app"')));
+  assert.ok(problems.some((p) => p.includes("deploys[2].images[0].image must not include a tag")));
+  assert.ok(problems.some((p) => p.includes("deploys[3].images[0].services is required")));
+  assert.ok(problems.some((p) => p.includes("deploys[4].images must be a non-empty array")));
+});
+
 test("git deploys stay valid without the registry fields and reject them when set", () => {
   assert.deepEqual(
     validateConfig(withDefaults({ ...minimal, deploys: [{ name: "app", dir: "/apps/app", healthUrl: "https://a/health" }] })),

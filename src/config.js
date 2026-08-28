@@ -272,35 +272,85 @@ export function validateConfig(cfg) {
       need(Number.isInteger(d.healthAttempts) && d.healthAttempts > 0, `${where}.healthAttempts must be a positive integer`);
     if (d.healthDelay !== undefined)
       need(parseDuration(d.healthDelay) !== null, `${where}.healthDelay "${d.healthDelay}" is not a duration`);
+    // An image repository, with no tag or digest: the tag is the deploy
+    // argument, so one baked into the config would silently outrank it.
+    const needImageName = (value, at, required) => {
+      need(typeof value === "string" && value, required);
+      if (typeof value !== "string" || !value) return;
+      // A private registry carries a port ("registry.example.com:5000/o/app"),
+      // so a colon is legal here; the second check is what rejects a tag.
+      need(/^[A-Za-z0-9][A-Za-z0-9._:/-]*$/.test(value), `${at} is not a valid image repository name`);
+      need(
+        !value.split("/").pop().includes(":") && !value.includes("@"),
+        `${at} must not include a tag or digest; the tag is the deploy argument`,
+      );
+    };
+    const needEnvVarName = (value, at) =>
+      need(
+        typeof value === "string" && /^[A-Za-z_][A-Za-z0-9_]*$/.test(value),
+        `${at} must be a valid environment variable name`,
+      );
     if (source === "registry") {
       // A bare "docker compose" on a box with several stacks acts on a project
       // derived from the directory, so the project name is stated, not guessed.
       need(typeof d.project === "string" && d.project, `${where}.project is required for registry deploys (the "docker compose -p" name)`);
-      need(typeof d.image === "string" && d.image, `${where}.image is required for registry deploys (repository without a tag)`);
-      if (typeof d.image === "string" && d.image)
-        // A private registry carries a port ("registry.example.com:5000/o/app"),
-        // so a colon is legal here; the tag check below is what rejects one.
+      if (d.images !== undefined) {
+        // An application built as a frontend and a backend is several images
+        // on one tag. Mixing the two spellings would leave it ambiguous which
+        // services the single "image" was meant to cover, so it is refused.
         need(
-          /^[A-Za-z0-9][A-Za-z0-9._:/-]*$/.test(d.image),
-          `${where}.image is not a valid image repository name`,
+          d.image === undefined && d.imageEnvVar === undefined && d.services === undefined,
+          `${where} uses "images", so "image", "imageEnvVar" and "services" belong inside each entry, not beside it`,
         );
-      if (typeof d.image === "string" && d.image)
+        need(Array.isArray(d.images) && d.images.length > 0, `${where}.images must be a non-empty array of images to deploy together`);
+        if (Array.isArray(d.images)) {
+          const envVars = new Map();
+          const owners = new Map();
+          for (const [j, e] of d.images.entries()) {
+            const at = `${where}.images[${j}]`;
+            need(e && typeof e === "object" && !Array.isArray(e), `${at} must be an object`);
+            if (!e || typeof e !== "object" || Array.isArray(e)) continue;
+            needImageName(e.image, `${at}.image`, `${at}.image is required (repository without a tag)`);
+            need(
+              Array.isArray(e.services) &&
+                e.services.length > 0 &&
+                e.services.every((s) => typeof s === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(s)),
+              `${at}.services is required: the compose services that must end up running this image`,
+            );
+            const envVar = e.envVar ?? "APP_IMAGE";
+            if (e.envVar !== undefined) needEnvVarName(e.envVar, `${at}.envVar`);
+            // Two images behind one variable is not a deploy of two images; it
+            // is the second one overwriting the first, and only the compose
+            // file would show it.
+            need(
+              !envVars.has(envVar),
+              `${at}.envVar "${envVar}" is already used by ${where}.images[${envVars.get(envVar)}]; each image needs its own variable (the default is "APP_IMAGE")`,
+            );
+            envVars.set(envVar, j);
+            for (const s of Array.isArray(e.services) ? e.services : []) {
+              // A service listed twice would be required to run two different
+              // image IDs at once, so every deploy of this target would fail
+              // verification and roll back.
+              need(
+                !owners.has(s),
+                `${at}.services lists "${s}", which ${where}.images[${owners.get(s)}] also deploys; a service runs one image`,
+              );
+              owners.set(s, j);
+            }
+          }
+        }
+      } else {
+        needImageName(d.image, `${where}.image`, `${where}.image is required for registry deploys (repository without a tag)`);
         need(
-          !d.image.split("/").pop().includes(":") && !d.image.includes("@"),
-          `${where}.image must not include a tag or digest; the tag is the deploy argument`,
+          Array.isArray(d.services) && d.services.length > 0,
+          `${where}.services is required for registry deploys (the services that must end up running the new image)`,
         );
-      need(
-        Array.isArray(d.services) && d.services.length > 0,
-        `${where}.services is required for registry deploys (the services that must end up running the new image)`,
-      );
-      if (d.imageEnvVar !== undefined)
-        need(
-          typeof d.imageEnvVar === "string" && /^[A-Za-z_][A-Za-z0-9_]*$/.test(d.imageEnvVar),
-          `${where}.imageEnvVar must be a valid environment variable name`,
-        );
+        if (d.imageEnvVar !== undefined) needEnvVarName(d.imageEnvVar, `${where}.imageEnvVar`);
+      }
     } else {
       need(d.image === undefined, `${where}.image only applies to registry deploys (set "source": "registry")`);
       need(d.imageEnvVar === undefined, `${where}.imageEnvVar only applies to registry deploys (set "source": "registry")`);
+      need(d.images === undefined, `${where}.images only applies to registry deploys (set "source": "registry")`);
     }
   }
 

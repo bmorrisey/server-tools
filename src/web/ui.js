@@ -1236,7 +1236,10 @@ export function deploysPage({ session, deploys, targets, events, flash }) {
     .map((t) => {
       const d = deploys[t.name];
       const registry = t.source === "registry";
-      const source = registry ? `registry - ${esc(t.image)}` : "git - builds on this box";
+      // A target deploys one image or several; the page names every one, so
+      // "which repositories does this release move" needs no config lookup.
+      const images = (t.images?.length ? t.images.map((i) => i.image) : [t.image]).filter(Boolean);
+      const source = registry ? `registry - ${esc(images.join(", "))}` : "git - builds on this box";
       return `<tr>
 <td>${d ? deployPill(d.kind) : '<span class="detail">no deploys recorded</span>'}</td>
 <td>${esc(t.name)}<br><span class="detail">${esc(t.dir)}${t.project ? ` - project ${esc(t.project)}` : ""}</span></td>

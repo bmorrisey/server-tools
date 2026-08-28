@@ -71,6 +71,19 @@
       "healthDelay": "6s"
     },
     {
+      "name": "portal",
+      "dir": "/apps/portal",
+      "project": "portal",
+      "source": "registry",
+      "images": [
+        { "image": "ghcr.io/owner/portal-api", "envVar": "API_IMAGE", "services": ["api"] },
+        { "image": "ghcr.io/owner/portal-web", "envVar": "WEB_IMAGE", "services": ["web"] }
+      ],
+      "healthUrl": "https://portal.example.com/api/health",
+      "healthAttempts": 20,
+      "healthDelay": "6s"
+    },
+    {
       "name": "marketing",
       "dir": "/apps/marketing",
       "project": "marketing",

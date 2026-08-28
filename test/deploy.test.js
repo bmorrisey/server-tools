@@ -7,6 +7,7 @@ import {
   composeArgs,
   deploy,
   imageRef,
+  imageSlots,
   parseInspectLines,
   readEnvVar,
   upsertEnvVar,
@@ -789,6 +790,196 @@ test("an annotated .env line still yields a usable rollback target", async () =>
     assert.equal(result.rolledBack, true);
     assert.doesNotMatch(result.detail, /unsafe docker reference/);
     assert.ok(docker.calls.some((c) => c === "docker pull ghcr.io/o/app:v1"));
+    assert.equal(fs.readFileSync(path.join(dir, ".env"), "utf8"), before);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+/* -------------------------------------------------------------------------
+ * Several images on one tag
+ *
+ * An application built as a frontend and a backend is two repositories that
+ * move together. What matters is that they move together: the failure worth
+ * testing hardest is the half-deployed stack, where health passes against the
+ * part that did not change.
+ * ---------------------------------------------------------------------- */
+
+test("imageSlots reads one image and many the same way", () => {
+  assert.deepEqual(imageSlots({ image: "ghcr.io/o/app", services: ["web"] }), [
+    { image: "ghcr.io/o/app", envVar: "APP_IMAGE", services: ["web"] },
+  ]);
+  assert.deepEqual(
+    imageSlots({
+      images: [
+        { image: "ghcr.io/o/api", envVar: "API_IMAGE", services: ["api"] },
+        { image: "ghcr.io/o/web", services: ["web"] },
+      ],
+    }),
+    [
+      { image: "ghcr.io/o/api", envVar: "API_IMAGE", services: ["api"] },
+      { image: "ghcr.io/o/web", envVar: "APP_IMAGE", services: ["web"] },
+    ],
+  );
+});
+
+const MULTI_ENV = "DB_PASSWORD=hunter2\nAPI_IMAGE=ghcr.io/o/api:v1\nWEB_IMAGE=ghcr.io/o/web:v1\n";
+
+const IMAGE_IDS = {
+  "ghcr.io/o/api:v1": "sha256:api1",
+  "ghcr.io/o/api:v2": "sha256:api2",
+  "ghcr.io/o/web:v1": "sha256:web1",
+  "ghcr.io/o/web:v2": "sha256:web2",
+};
+
+const multiTarget = (dir, extra = {}) => ({
+  name: "app",
+  dir,
+  project: "app",
+  source: "registry",
+  images: [
+    { image: "ghcr.io/o/api", envVar: "API_IMAGE", services: ["api"] },
+    { image: "ghcr.io/o/web", envVar: "WEB_IMAGE", services: ["web"] },
+  ],
+  healthUrl: "http://127.0.0.1:1/health",
+  ...extra,
+});
+
+/**
+ * A scripted docker for a multi-image target. It works out what each service
+ * is running from the .env compose would have read, so a rollback moves the
+ * fake back the same way it moves the real stack back. A service named in
+ * `stuck` never moves, which is what a half-deployed stack looks like.
+ */
+function fakeMultiDocker({ dir, initial = {}, stuck = [], failPull = null } = {}) {
+  const calls = [];
+  const state = { ...initial };
+  const serviceVar = { api: "API_IMAGE", web: "WEB_IMAGE" };
+  const exec = async (cmd, args) => {
+    calls.push([cmd, ...args].join(" "));
+    if (args[0] === "pull") {
+      if (failPull && args[1].includes(failPull)) return { code: 1, stdout: "", stderr: "simulated pull failure" };
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    if (args[0] === "image" && args[1] === "inspect") {
+      const id = IMAGE_IDS[args[4]];
+      return id ? { code: 0, stdout: id, stderr: "" } : { code: 1, stdout: "", stderr: "no such image" };
+    }
+    if (args.includes("up")) {
+      const env = fs.readFileSync(path.join(dir, ".env"), "utf8");
+      for (const [service, envVar] of Object.entries(serviceVar)) {
+        if (stuck.includes(service)) continue;
+        state[service] = IMAGE_IDS[readEnvVar(env, envVar)] ?? "sha256:none";
+      }
+      return { code: 0, stdout: "", stderr: "" };
+    }
+    if (args.includes("ps")) return { code: 0, stdout: `cid-${args[args.length - 1]}`, stderr: "" };
+    if (args[0] === "inspect") {
+      const lines = args
+        .slice(3)
+        .map((id) => `${id}\t${state[id.replace(/^cid-/, "")] ?? "sha256:none"}\trunning\t/app-${id.replace(/^cid-/, "")}-1`);
+      return { code: 0, stdout: lines.join("\n"), stderr: "" };
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  return { exec, calls, state };
+}
+
+const multiRunning = { api: "sha256:api1", web: "sha256:web1" };
+
+test("a multi-image deploy moves every reference on one tag, in one recreate", async () => {
+  const dir = scratch(MULTI_ENV);
+  try {
+    const docker = fakeMultiDocker({ dir, initial: multiRunning });
+    const result = await deploy(multiTarget(dir), "v2", { store: null, exec: docker.exec, health: healthy });
+    assert.equal(result.ok, true);
+    assert.equal(result.rolledBack, false);
+    const env = fs.readFileSync(path.join(dir, ".env"), "utf8");
+    assert.equal(readEnvVar(env, "API_IMAGE"), "ghcr.io/o/api:v2");
+    assert.equal(readEnvVar(env, "WEB_IMAGE"), "ghcr.io/o/web:v2");
+    assert.match(env, /DB_PASSWORD=hunter2/, "the app's own secrets are untouched");
+
+    // One recreate for the whole project: a second would tear the stack down
+    // and back up again for no reason.
+    assert.equal(docker.calls.filter((c) => c.includes("up -d --no-build")).length, 1);
+    const upAt = docker.calls.findIndex((c) => c.includes("up -d --no-build"));
+    const pulls = docker.calls.map((c, i) => (c.startsWith("docker pull") ? i : -1)).filter((i) => i >= 0);
+    assert.equal(pulls.length, 2, "both images are pulled");
+    assert.ok(Math.max(...pulls) < upAt, "every pull happens before anything is recreated");
+    assert.match(result.detail, /API_IMAGE=api2/);
+    assert.match(result.detail, /WEB_IMAGE=web2/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("one service left on the old image rolls the whole release back", async () => {
+  const dir = scratch(MULTI_ENV);
+  const before = fs.readFileSync(path.join(dir, ".env"), "utf8");
+  try {
+    // The half-deployed stack: the api moved, the web service did not. Health
+    // is deliberately passing, because the api answering it is exactly why
+    // this cannot be left to the health gate.
+    const docker = fakeMultiDocker({ dir, initial: multiRunning, stuck: ["web"] });
+    const result = await deploy(multiTarget(dir), "v2", { store: null, exec: docker.exec, health: healthy });
+    assert.equal(result.ok, false);
+    assert.equal(result.rolledBack, true);
+    assert.match(result.detail, /web\/app-web-1 runs image web1/);
+    assert.equal(fs.readFileSync(path.join(dir, ".env"), "utf8"), before, "both references go back, byte for byte");
+    assert.ok(docker.calls.some((c) => c === "docker pull ghcr.io/o/api:v1"), "the api rolls back too");
+    assert.ok(docker.calls.some((c) => c === "docker pull ghcr.io/o/web:v1"));
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a second image that cannot be pulled leaves the first one undeployed", async () => {
+  const dir = scratch(MULTI_ENV);
+  const before = fs.readFileSync(path.join(dir, ".env"), "utf8");
+  try {
+    // The whole point of pulling everything before writing anything: a
+    // missing second image must not strand the stack half on the new tag.
+    const docker = fakeMultiDocker({ dir, initial: multiRunning, failPull: "ghcr.io/o/web" });
+    const result = await deploy(multiTarget(dir), "v2", { store: null, exec: docker.exec, health: healthy });
+    assert.equal(result.ok, false);
+    assert.equal(result.rolledBack, false);
+    assert.match(result.detail, /nothing on this box was changed/);
+    assert.equal(fs.readFileSync(path.join(dir, ".env"), "utf8"), before);
+    assert.equal(docker.calls.some((c) => c.includes("up -d")), false);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a rollback that is missing one previous reference names which one", async () => {
+  const dir = scratch("DB_PASSWORD=hunter2\nAPI_IMAGE=ghcr.io/o/api:v1\n");
+  try {
+    // Restoring .env leaves WEB_IMAGE unset, so the stack cannot come up on
+    // it. Guessing a tag for it would be worse than saying so.
+    const docker = fakeMultiDocker({ dir, initial: multiRunning });
+    const result = await deploy(multiTarget(dir), "v2", { store: null, exec: docker.exec, health: unhealthy });
+    assert.equal(result.ok, false);
+    assert.equal(result.rolledBack, false);
+    assert.match(result.detail, /WEB_IMAGE named no image before this deploy/);
+    assert.doesNotMatch(result.detail, /API_IMAGE named no image/);
+    const env = fs.readFileSync(path.join(dir, ".env"), "utf8");
+    assert.equal(readEnvVar(env, "WEB_IMAGE"), null, "the broken tag is not left behind");
+    assert.equal(readEnvVar(env, "API_IMAGE"), "ghcr.io/o/api:v1");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a multi-image dry run names every image and touches nothing", async () => {
+  const dir = scratch(MULTI_ENV);
+  const before = fs.readFileSync(path.join(dir, ".env"), "utf8");
+  try {
+    const docker = fakeMultiDocker({ dir, initial: multiRunning });
+    const result = await deploy(multiTarget(dir), "v2", { store: null, dryRun: true, exec: docker.exec, health: healthy });
+    assert.equal(result.ok, true);
+    assert.match(result.detail, /ghcr\.io\/o\/api:v2, ghcr\.io\/o\/web:v2/);
+    assert.match(result.detail, /recreate api, web/);
+    assert.equal(docker.calls.length, 0);
     assert.equal(fs.readFileSync(path.join(dir, ".env"), "utf8"), before);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
