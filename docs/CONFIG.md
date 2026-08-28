@@ -288,8 +288,9 @@ Common fields: `name`, `dir` (the compose project directory), `healthUrl`,
 | `source` | `"git"` | `"git"` builds on the box from a checkout; `"registry"` pulls an already-built image by tag. |
 | `project` | derived from `dir` | The `docker compose -p` project name. Required for `registry`; strongly recommended everywhere else (see below). |
 | `services` | none | Compose services that must end up running the new release. Required for `registry`. A one-shot service that exits 0 (a migration job) will fail this check; leave it off the list. |
-| `image` | none | Registry repository, with no tag or digest. Required for `registry`. |
+| `image` | none | Registry repository, with no tag or digest. Required for `registry`, unless `images` is used. |
 | `imageEnvVar` | `"APP_IMAGE"` | The variable written into the target's `.env` and referenced from the compose file. |
+| `images` | none | Several repositories that move together on one tag, instead of `image`/`imageEnvVar`/`services`. Each entry takes `image`, `services`, and its own `envVar`. |
 | `healthAttempts` | `20` | How many times to poll `healthUrl`. |
 | `healthDelay` | `"6s"` | Wait between polls. |
 | `composeEnv` | `[]` | Extra environment variable names to pass through to `docker compose` (see below). |
@@ -340,6 +341,41 @@ then polls `healthUrl`. On any failure after the pull it restores `.env` to the
 exact bytes it had before (comments and quoting included), brings the stack
 back on that image, and reports the rollback. A failure during the pull
 changes nothing at all and says so.
+
+#### Several images on one tag
+
+An application built as a frontend and a backend is two repositories that ship
+as one release. List them under `images` instead of naming a single `image`,
+and each entry gets its own variable and its own services:
+
+```json
+{ "name": "myapp", "dir": "/apps/myapp", "project": "myapp",
+  "source": "registry",
+  "images": [
+    { "image": "ghcr.io/owner/myapp-api", "envVar": "API_IMAGE", "services": ["api"] },
+    { "image": "ghcr.io/owner/myapp-web", "envVar": "WEB_IMAGE", "services": ["web"] }
+  ],
+  "healthUrl": "https://app.example.com/api/health" }
+```
+
+`server-tools deploy myapp v1.2.3` pulls `myapp-api:v1.2.3` **and**
+`myapp-web:v1.2.3`, then writes both references in a single edit of `.env` and
+recreates the project once. The services of each entry are checked against
+that entry's image ID, so a release where only half the images moved is caught
+and rolled back even though the health endpoint answers perfectly - which is
+the failure this shape exists to prevent.
+
+The order is what makes it safe: every image is pulled before anything is
+written, so a tag that was never pushed changes nothing at all. A rollback
+restores the whole file, so either every reference goes back or none does. If
+any of the variables named no image before the deploy, there is nothing to
+come back to and the toolkit says which one rather than guessing a tag.
+
+`images` and `image` are not mixed on one target: with `images`, the
+`image`, `imageEnvVar` and `services` fields live inside each entry. Two
+entries cannot share a variable (the second would overwrite the first) or a
+service (it would have to run two image IDs at once). `envVar` defaults to
+`APP_IMAGE`, so at most one entry can leave it out.
 
 Nothing compiles on the host, so a release cannot starve the other stacks
 sharing the box, and a rollback costs a pull rather than a second build. Four

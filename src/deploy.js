@@ -17,6 +17,13 @@
  *                  other stacks sharing it, and a rollback is a pull rather
  *                  than a second build.
  *
+ * A registry target names one image or several. Several is the ordinary shape
+ * for an application built as a frontend and a backend: two repositories, one
+ * tag, one release. They move together, so the whole set is pulled before
+ * anything is written, and a failure anywhere puts every reference back at
+ * once - a stack left half on the new tag is the outcome worth the most care
+ * here, because health can pass against the half that did not move.
+ *
  * Three details in registry mode that look optional and are not:
  *
  *   1. The image reference is WRITTEN to `.env`, not exported for one
@@ -416,6 +423,37 @@ async function inspectServices(exec, target, services) {
  * Registry mode
  * ---------------------------------------------------------------------- */
 
+/**
+ * The images a registry target deploys, as a list of slots.
+ *
+ * A target states either one image (`image` / `imageEnvVar` / `services`) or
+ * several (`images`, each entry with its own `image`, `envVar` and
+ * `services`). One is the same thing as many with a single entry, so the
+ * deploy sequence below only ever handles a list and there is no second code
+ * path for the multi-image case to drift away from.
+ */
+export function imageSlots(target) {
+  const entries =
+    Array.isArray(target.images) && target.images.length
+      ? target.images
+      : [{ image: target.image, envVar: target.imageEnvVar, services: target.services }];
+  return entries.map((e) => ({
+    image: e.image,
+    envVar: e.envVar ?? DEFAULT_IMAGE_ENV_VAR,
+    services: e.services ?? [],
+  }));
+}
+
+/** Every service a target's images between them must leave running. */
+const slotServices = (slots) => [...new Set(slots.flatMap((s) => s.services))];
+
+/** How the running images read in an event: "image abc123" for the single case. */
+function imagesRunning(slots) {
+  return slots.length === 1
+    ? `image ${short(slots[0].imageId)}`
+    : `images ${slots.map((s) => `${s.envVar}=${short(s.imageId)}`).join(", ")}`;
+}
+
 /** Full image reference for a tag, validated for use as a command argument. */
 export function imageRef(image, tag) {
   const t = String(tag ?? "").trim();
@@ -443,21 +481,44 @@ async function pullImage(exec, ref, { allowLocal = false } = {}) {
 }
 
 /**
+ * Prove each slot's services are running that slot's image.
+ *
+ * Every slot is checked even after one has already failed: at 3am "the
+ * frontend is still on the old tag" and "the frontend is still on the old tag
+ * and the backend is missing" call for different reactions, and the second
+ * one is only visible if the loop does not stop early.
+ */
+async function verifySlots(exec, target, slots) {
+  const problems = [];
+  for (const s of slots) {
+    const verify = verifyContainers(await inspectServices(exec, target, s.services), { imageId: s.imageId });
+    problems.push(...verify.problems);
+  }
+  return { ok: problems.length === 0, problems };
+}
+
+/**
  * Recreate the stack on whatever `.env` currently names, and prove the named
- * services are running the image that was pulled for it. The caller writes
+ * services are running the images that were pulled for it. The caller writes
  * `.env` and pulls first, so reaching this function is the moment the box
  * starts changing.
+ *
+ * One `up` covers every slot: they share a compose project, so recreating it
+ * once per image would tear the stack down and back up several times over.
  */
-async function bringUp(exec, target, ref, imageId) {
+async function bringUp(exec, target, slots) {
   await compose(exec, target, ["up", "-d", "--no-build"], { timeoutMs: 15 * 60_000 });
-  const verify = verifyContainers(await inspectServices(exec, target, target.services), { imageId });
-  if (!verify.ok) throw new Error(`services are not running ${ref}: ${verify.problems.join("; ")}`);
+  const verify = await verifySlots(exec, target, slots);
+  if (!verify.ok) {
+    throw new Error(`services are not running ${slots.map((s) => s.ref).join(", ")}: ${verify.problems.join("; ")}`);
+  }
 }
 
 async function deployRegistry(target, tag, { store, dryRun, exec, health }) {
-  const envVar = target.imageEnvVar ?? DEFAULT_IMAGE_ENV_VAR;
+  const slots = imageSlots(target);
   const envPath = path.join(target.dir, ".env");
-  const to = imageRef(target.image, tag);
+  for (const s of slots) s.ref = imageRef(s.image, tag);
+  const to = slots.map((s) => s.ref).join(", ");
 
   // A directory that is not visible to the agent produces a chain of
   // misleading symptoms later; say so here instead.
@@ -467,8 +528,8 @@ async function deployRegistry(target, tag, { store, dryRun, exec, health }) {
   }
 
   const envText = await readEnvFile(envPath);
-  const previous = readEnvVar(envText, envVar);
-  const from = previous ?? "(unset)";
+  for (const s of slots) s.previous = readEnvVar(envText, s.envVar);
+  const from = slots.map((s) => s.previous ?? "(unset)").join(", ");
 
   log.info(`deploy ${target.name}: ${from} -> ${to}${dryRun ? " (dry run)" : ""}`);
   if (dryRun) {
@@ -477,17 +538,18 @@ async function deployRegistry(target, tag, { store, dryRun, exec, health }) {
       from,
       to,
       rolledBack: false,
-      detail: `dry run - would pull ${to} and recreate ${target.services.join(", ")}`,
+      detail: `dry run - would pull ${to} and recreate ${slotServices(slots).join(", ")}`,
     };
   }
 
   const record = recorder(store, target, from, to, "registry");
 
-  // Stage 1: pull. Nothing on the box has changed yet, so a failure here is
-  // reported as a failure and not as a rollback of a stack we never touched.
-  let imageId;
+  // Stage 1: pull, all of them. Nothing on the box has changed yet, so a
+  // failure here is reported as a failure and not as a rollback of a stack we
+  // never touched - and pulling every image before writing anything is what
+  // keeps a missing second image from stranding the stack half-deployed.
   try {
-    imageId = await pullImage(exec, to);
+    for (const s of slots) s.imageId = await pullImage(exec, s.ref);
   } catch (e) {
     const detail = `${e.message.slice(0, 300)}; nothing on this box was changed`;
     log.error(`deploy ${target.name} failed before any change: ${e.message}`);
@@ -497,13 +559,16 @@ async function deployRegistry(target, tag, { store, dryRun, exec, health }) {
 
   // Stage 2: from here the stack is being changed, so every exit restores it.
   const rollback = (reason, what) =>
-    rollbackRegistry(exec, target, { record, envPath, envVar, envText, previous, from, to, reason, what, health });
+    rollbackRegistry(exec, target, { record, envPath, envText, slots, from, to, reason, what, health });
 
   // Writing .env is the first thing that changes the box, so its own failure
   // belongs with the pull: nothing has happened yet, and recreating a healthy
-  // stack to "roll back" from it would be the only damage done.
+  // stack to "roll back" from it would be the only damage done. Every
+  // reference goes in one write, so the file is never briefly half-updated.
   try {
-    await writeEnvFile(envPath, upsertEnvVar(envText, envVar, to));
+    let text = envText;
+    for (const s of slots) text = upsertEnvVar(text, s.envVar, s.ref);
+    await writeEnvFile(envPath, text);
   } catch (e) {
     const detail = `${e.message.slice(0, 300)}; nothing on this box was changed`;
     log.error(`deploy ${target.name} could not write ${envPath}: ${e.message}`);
@@ -513,7 +578,7 @@ async function deployRegistry(target, tag, { store, dryRun, exec, health }) {
 
   let unproven = null;
   try {
-    await bringUp(exec, target, to, imageId);
+    await bringUp(exec, target, slots);
   } catch (e) {
     if (!e.unverifiable) return rollback(e.message, "rollout");
     // Docker could not answer. The stack may well be fine, so let the health
@@ -529,7 +594,7 @@ async function deployRegistry(target, tag, { store, dryRun, exec, health }) {
   // first check cannot see a container that dies a few seconds in; by now
   // health polling has given it time to fall over.
   try {
-    const settled = verifyContainers(await inspectServices(exec, target, target.services), { imageId });
+    const settled = await verifySlots(exec, target, slots);
     if (!settled.ok) throw new Error(settled.problems.join("; "));
     unproven = null;
   } catch (e) {
@@ -538,14 +603,15 @@ async function deployRegistry(target, tag, { store, dryRun, exec, health }) {
   }
 
   const caveat = unproven ? `, but ${unproven}` : "";
-  record(unproven ? "warn" : "ok", `${from} -> ${to} (image ${short(imageId)}), healthy after ${healthResult.tries} checks${caveat}`);
+  const running = imagesRunning(slots);
+  record(unproven ? "warn" : "ok", `${from} -> ${to} (${running}), healthy after ${healthResult.tries} checks${caveat}`);
   log.info(`deploy ${target.name} ok: ${to} healthy${caveat}`);
   return {
     ok: true,
     from,
     to,
     rolledBack: false,
-    detail: `running ${short(imageId)}, healthy after ${healthResult.tries} checks${caveat}`,
+    detail: `running ${running}, healthy after ${healthResult.tries} checks${caveat}`,
   };
 }
 
@@ -554,44 +620,53 @@ async function deployRegistry(target, tag, { store, dryRun, exec, health }) {
  *
  * `.env` is restored to the exact bytes it had before this deploy, always and
  * first: leaving a failed tag in a file compose re-reads on every later
- * `up -d` is how a rolled-back release deploys itself again a week later. If
- * the file named no image before, there is nothing to roll forward onto and
- * saying so is more useful than guessing at a tag.
+ * `up -d` is how a rolled-back release deploys itself again a week later. One
+ * write restores every reference, which is also why a partial rollback is not
+ * a state this can end in. If any variable named no image before, there is
+ * nothing to roll forward onto and saying so is more useful than guessing at
+ * a tag - the stack cannot come up on a reference that is unset.
  */
-async function rollbackRegistry(exec, target, { record, envPath, envVar, envText, previous, from, to, reason, what, health }) {
+async function rollbackRegistry(exec, target, { record, envPath, envText, slots, from, to, reason, what, health }) {
   const why = `${what} failed on ${to} (${String(reason).slice(0, 200)})`;
   const restoreError = await writeEnvFile(envPath, envText).then(
     () => null,
     (e) => e.message,
   );
-  // If the file could not be put back it still names the failed image, so the
-  // next routine "compose up -d" redeploys it. That has to reach the operator,
-  // not just the log.
+  // If the file could not be put back it still names the failed images, so the
+  // next routine "compose up -d" redeploys them. That has to reach the
+  // operator, not just the log.
+  const names = slots.map((s) => s.envVar).join(", ");
   const stillBroken = restoreError
-    ? ` ${envVar} in ${envPath} could NOT be restored (${restoreError.slice(0, 150)}) and still names ${to} - fix it before any later compose up, or it redeploys - intervene.`
+    ? ` ${names} in ${envPath} could NOT be restored (${restoreError.slice(0, 150)}) and still names ${to} - fix it before any later compose up, or it redeploys - intervene.`
     : "";
   if (restoreError) log.error(`could not restore ${envPath}: ${restoreError}`);
 
-  if (!previous) {
-    const detail = `${why}; ${envVar} named no image before this deploy, so there is nothing to roll back to - intervene.${stillBroken}`;
-    log.error(`${what} failed for ${target.name} and no previous image is recorded; intervene`);
+  const unset = slots.filter((s) => !s.previous);
+  if (unset.length) {
+    const which = unset.map((s) => s.envVar).join(", ");
+    const detail = `${why}; ${which} named no image before this deploy, so there is nothing to roll back to - intervene.${stillBroken}`;
+    log.error(`${what} failed for ${target.name} and no previous image is recorded for ${which}; intervene`);
     record("fail", detail);
     return { ok: false, from, to, rolledBack: false, detail };
   }
 
-  log.error(`${what} failed for ${target.name}; rolling back to ${previous}`);
+  const back = slots.map((s) => s.previous).join(", ");
+  log.error(`${what} failed for ${target.name}; rolling back to ${back}`);
   try {
-    // The previous image may have been pruned since; a local copy is enough.
-    // .env already names it again, byte for byte, so nothing rewrites it here.
-    const imageId = await pullImage(exec, previous, { allowLocal: true });
-    await bringUp(exec, target, previous, imageId);
+    // A previous image may have been pruned since; a local copy is enough.
+    // .env already names them again, byte for byte, so nothing rewrites it
+    // here. The slots are rebuilt around the previous refs so the same
+    // verification runs on the way back as on the way out.
+    const previousSlots = slots.map((s) => ({ ...s, ref: s.previous }));
+    for (const s of previousSlots) s.imageId = await pullImage(exec, s.ref, { allowLocal: true });
+    await bringUp(exec, target, previousSlots);
   } catch (e) {
-    const detail = `${why}; rollback to ${previous} ALSO FAILED (${e.message.slice(0, 200)}) - intervene.${stillBroken}`;
+    const detail = `${why}; rollback to ${back} ALSO FAILED (${e.message.slice(0, 200)}) - intervene.${stillBroken}`;
     record("rollback", detail);
     return { ok: false, from, to, rolledBack: true, detail };
   }
   const healthResult = await health(target.healthUrl, healthWaitFor(target));
-  const detail = `${why}; rolled back to ${previous}, now ${healthResult.healthy ? "healthy" : "STILL UNHEALTHY - intervene"}.${stillBroken}`;
+  const detail = `${why}; rolled back to ${back}, now ${healthResult.healthy ? "healthy" : "STILL UNHEALTHY - intervene"}.${stillBroken}`;
   record(restoreError ? "fail" : "rollback", detail);
   return { ok: false, from, to, rolledBack: true, detail };
 }

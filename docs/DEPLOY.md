@@ -210,6 +210,12 @@ the first registry deploy of an app has nothing to roll back to and says so.
 Set `APP_IMAGE` to the currently deployed tag before the first deploy if you
 want that safety net from the start.
 
+An app whose frontend and backend are built as separate images lists them
+under `images` instead, each with its own variable and services; one tag then
+moves the whole release, and a deploy where only half the images moved is
+rolled back rather than passed by the health check. See
+[CONFIG.md](CONFIG.md#deploys).
+
 ## Updating server-tools itself
 
 ```bash
