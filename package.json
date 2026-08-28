@@ -2,6 +2,7 @@
   "name": "server-tools",
   "version": "0.1.0",
   "description": "Self-contained ops toolkit for a single-box Docker VPS: health checks, alerts, encrypted offsite backups, safe deploys, housekeeping, and an admin dashboard.",
+  "license": "MIT",
   "type": "module",
   "private": true,
   "engines": {
