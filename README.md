@@ -152,3 +152,7 @@ node src/cli.js validate # config sanity
 
 CI runs the test suite on Node 20 and 22 plus a syntax pass over every module
 and a validation of the example config.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
