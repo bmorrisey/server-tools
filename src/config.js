@@ -420,6 +420,11 @@ export function validateConfig(cfg) {
       parseDuration(hk.staleContainerAge) !== null,
       `housekeeping.staleContainerAge "${hk.staleContainerAge}" is not a duration`,
     );
+  if (hk.keepImageVersions !== undefined)
+    need(
+      Number.isInteger(hk.keepImageVersions) && hk.keepImageVersions >= 0,
+      "housekeeping.keepImageVersions must be a non-negative integer (0 turns rollback keeping off)",
+    );
   if (hk.keepImages !== undefined)
     need(
       Array.isArray(hk.keepImages) && hk.keepImages.every((p) => typeof p === "string" && p),

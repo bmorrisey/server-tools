@@ -296,7 +296,7 @@ const CSS = `
   /* Categorical, for the storage breakdown only. Status colors stay reserved
      for status; every segment is labelled in the table beside it. */
   --c-images: #2a78d6; --c-writable: #0f8a8a; --c-volumes: #7a5cd6;
-  --c-cache: #b07a2a; --c-backups: #4d6b8a; --c-toolkit: #a15c94; --c-other: #c9c7bf;
+  --c-cache: #b07a2a; --c-backups: #4d6b8a; --c-toolkit: #a15c94; --c-other: #c9c7bf; --c-reserved: #e4e1d8;
 }
 @media (prefers-color-scheme: dark) {
   :root {
@@ -304,7 +304,7 @@ const CSS = `
     --muted: #898781; --grid: #2c2c2a; --border: rgba(255,255,255,0.10);
     --series: #3987e5; --good: #0ca30c; --warn: #fab219; --crit: #d03b3b;
     --c-images: #3987e5; --c-writable: #22a5a5; --c-volumes: #9a7ff0;
-    --c-cache: #d19a3e; --c-backups: #7f9bb8; --c-toolkit: #c887ba; --c-other: #46453f;
+    --c-cache: #d19a3e; --c-backups: #7f9bb8; --c-toolkit: #c887ba; --c-other: #46453f; --c-reserved: #2e2d29;
   }
 }
 * { box-sizing: border-box; }
@@ -452,6 +452,7 @@ details.logs-wrap summary { cursor: pointer; font-size: 13px; color: var(--ink-2
 .seg-backups { background: var(--c-backups); }
 .seg-toolkit { background: var(--c-toolkit); }
 .seg-other { background: var(--c-other); }
+.seg-reserved { background: var(--c-reserved); }
 .reclaim { display: grid; gap: 14px; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); }
 .reclaim .card { display: flex; flex-direction: column; gap: 8px; }
 .reclaim .amount { font-size: 25px; font-weight: 600; font-variant-numeric: tabular-nums; letter-spacing: -0.01em; }
@@ -570,7 +571,7 @@ export function actionForm({ id, label, kind = "safe", confirm, params = {}, csr
 </form>`;
 }
 
-export function layout({ title, page, session, body, flash }) {
+export function layout({ title, page, session, body, flash, refreshSec = 0 }) {
   const nav = [
     ["/", "Overview"],
     ["/storage", "Storage"],
@@ -591,6 +592,7 @@ export function layout({ title, page, session, body, flash }) {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex, nofollow">
+${refreshSec > 0 ? `<meta http-equiv="refresh" content="${Number(refreshSec)}">` : ""}
 <title>${esc(title)} - server-tools</title>
 <style>${CSS}</style>
 </head>
@@ -995,18 +997,40 @@ function ago(iso) {
  * items it would remove, so the button only ever does what the operator just
  * read. Volumes are listed but never actionable; that is the whole point.
  */
-export function storagePage({ session, report, flash, csrf }) {
+export function storagePage({ session, report, measuredAt = null, ageMs = null, refreshing = false, stale = false, flash, csrf }) {
+  if (!report) {
+    // First measurement since the agent started. /system/df can take over a
+    // minute on a box with many images, so say so and reload on our own
+    // rather than hold the request open until it finishes.
+    const body = `<h1>Storage</h1>
+<p class="sub">Measuring the disk now. On a box with many images this takes a minute or two. This page reloads itself every 15 seconds until the figures are ready.</p>`;
+    return layout({ title: "Storage", page: "/storage", session, body, flash, refreshSec: 15 });
+  }
   const r = report;
   const total = r.disk?.totalBytes ?? r.accountedBytes ?? 0;
   const share = (bytes) => (total > 0 ? (bytes / total) * 100 : 0);
 
-  const headline = r.reclaimableBytes > 0 ? `${formatBytes(r.reclaimableBytes)} can be reclaimed safely` : "Nothing worth reclaiming right now";
+  const safeBytes = r.safeReclaimableBytes ?? r.reclaimableBytes;
+  const reviewBytes = Math.max((r.reclaimableBytes ?? 0) - (safeBytes ?? 0), 0);
+  const headline = safeBytes > 0 ? `Up to ${formatBytes(safeBytes)} can be reclaimed safely` : "Nothing to reclaim safely right now";
+  const headlineMore = reviewBytes > 0 ? `<span class="detail">Up to ${formatBytes(reviewBytes)} more with the options marked review first.</span>` : "";
 
+  const age = ageMs === null ? "" : `Measured ${esc(formatDuration(ageMs))} ago`;
+  const measured = `<p class="sub">${age}${
+    refreshing ? `${age ? ". " : ""}Measuring again now; reload in a minute or two for new figures.` : age ? "." : ""
+  }</p>`;
+  const staleBanner =
+    stale && refreshing
+      ? `<div class="banner warn">&#9888; These figures are from before your last change. A new measurement is running.</div>`
+      : "";
+
+  const reservedNote =
+    r.disk?.reservedBytes > 0 ? `<br><span class="detail">${formatBytes(r.disk.reservedBytes)} more is reserved for root and not counted, the same as df</span>` : "";
   const diskLine = r.disk
     ? `<div class="card" style="margin:0 0 20px">
   <div class="label">Disk ${esc(r.diskPath)}</div>
   <div class="value">${r.disk.usedPct}% used</div>
-  <div class="detail">${formatBytes(r.disk.freeBytes)} free of ${formatBytes(r.disk.totalBytes)}</div>
+  <div class="detail">${formatBytes(r.disk.usedBytes)} used, ${formatBytes(r.disk.freeBytes)} free of ${formatBytes(r.disk.totalBytes)}${reservedNote}</div>
   ${meter(r.disk.usedPct, {})}
 </div>`
     : `<p class="sub">Filesystem usage for ${esc(r.diskPath)} is not visible from here.</p>`;
@@ -1030,13 +1054,19 @@ export function storagePage({ session, report, flash, csrf }) {
     )
     .join("");
 
+  // Image actions free a range: shared layers make the exact figure unknowable
+  // until the images are gone. The button promises the upper end with "up to",
+  // and the card states the floor as well.
+  const ranged = (a) => a.minBytes !== undefined && a.minBytes < a.bytes;
   const reclaimCards = r.plan
     .map((a) => {
       const button = actionForm({
         id: a.id,
-        label: `Free ${formatBytes(a.bytes)}`,
+        label: `Free ${ranged(a) ? "up to " : ""}${formatBytes(a.bytes)}`,
         kind: a.kind,
-        confirm: `${a.label}\n\n${a.what}\n\n${a.risk}\n\nFrees about ${formatBytes(a.bytes)}. Continue?`,
+        confirm: `${a.label}\n\n${a.what}\n\n${a.risk}\n\n${
+          ranged(a) ? `Frees between ${formatBytes(a.minBytes)} and ${formatBytes(a.bytes)}` : `Frees about ${formatBytes(a.bytes)}`
+        }. Continue?`,
         params: { target: a.target },
         csrf,
         returnPath: "/storage",
@@ -1044,7 +1074,8 @@ export function storagePage({ session, report, flash, csrf }) {
       });
       return `<div class="card">
   <div class="label">${esc(a.label)} ${a.kind === "caution" ? '<span class="status warn">&#9888; review first</span>' : '<span class="status ok">&#10003; safe</span>'}</div>
-  <div class="amount">${formatBytes(a.bytes)} <small>${a.count ? `${a.count} item${a.count > 1 ? "s" : ""}` : ""}</small></div>
+  <div class="amount">${ranged(a) ? "up to " : ""}${formatBytes(a.bytes)} <small>${a.count ? `${a.count} item${a.count > 1 ? "s" : ""}` : ""}</small></div>
+  ${ranged(a) ? `<p class="detail">At least ${formatBytes(a.minBytes)}. The rest depends on which shared layers only these images use.</p>` : ""}
   <p class="what">${esc(a.what)}</p>
   <p class="risk">${esc(a.risk)}</p>
   ${button}
@@ -1076,8 +1107,23 @@ export function storagePage({ session, report, flash, csrf }) {
     .join("");
 
   const imagesTable = `<table>
-<thead><tr><th>Image</th><th>Kind</th><th>Built</th><th>Size</th></tr></thead>
+<thead><tr><th>Image</th><th>Kind</th><th>Built</th><th>Size incl. shared layers</th></tr></thead>
 <tbody>${imageRows}</tbody>
+</table>`;
+
+  const kept = r.keptImages ?? [];
+  const keptTable = `<table>
+<thead><tr><th>Image</th><th>Kept as one of the newest of</th><th>Built</th><th>Size incl. shared layers</th></tr></thead>
+<tbody>${kept
+    .map(
+      (i) => `<tr>
+<td>${esc(i.name)}${i.tags.length > 1 ? `<br><span class="tag">also tagged ${esc(i.tags.slice(1).join(", "))}</span>` : ""}</td>
+<td><span class="detail">${esc(i.keptFor)}</span></td>
+<td class="num">${i.createdAt ? esc(ago(i.createdAt)) : "-"}</td>
+<td class="num">${formatBytes(i.sizeBytes)}</td>
+</tr>`,
+    )
+    .join("")}</tbody>
 </table>`;
 
   const containerRows = r.staleContainers
@@ -1161,10 +1207,12 @@ export function storagePage({ session, report, flash, csrf }) {
   const body = `
 <h1>Storage</h1>
 <p class="sub">Where the disk is going on this box, and the ways to get some of it back that will not disturb anything running.</p>
+${measured}
 
+${staleBanner}
 ${dockerWarning}
 
-<div class="headline-row"><span class="big">${esc(headline)}</span></div>
+<div class="headline-row"><span class="big">${esc(headline)}</span>${headlineMore}</div>
 
 ${diskLine}
 
@@ -1174,7 +1222,7 @@ ${diskLine}
 <thead><tr><th>Category</th><th>Size</th><th>Share of disk</th><th>What it is</th></tr></thead>
 <tbody>${breakdownRows}</tbody>
 </table>
-<p class="sub" style="margin-top:8px">Shares are of the filesystem at ${esc(r.diskPath)}, and assume Docker stores its data there, which is the default. Image sizes count shared layers once.</p>
+<p class="sub" style="margin-top:8px">Shares are of the whole filesystem at ${esc(r.diskPath)}, and assume Docker stores its data there, which is the default. The image total counts each shared layer once.</p>
 
 <h2 style="margin-top:24px">Ways to reclaim space</h2>
 <div class="safe-note"><strong>What will never happen here:</strong> no volume is ever deleted, no running container is stopped or removed, and no application data is touched. Every option below lists exactly what it removes before you click.</div>
@@ -1190,6 +1238,7 @@ ${findings ? `<h2 style="margin-top:24px">Worth fixing before it costs you</h2>$
 </table>
 
 <h2 style="margin-top:24px">Images no container is using (${r.unusedImages.length})</h2>
+<p class="sub">No container uses these, running or stopped. Each size includes layers shared with other images, so the sizes add up to more than removing them frees.</p>
 ${
   r.unusedImages.length
     ? r.unusedImages.length > 8
@@ -1198,6 +1247,13 @@ ${
     : '<p class="sub">Every image on the box backs a container. Nothing to remove.</p>'
 }
 ${r.keepImages.length ? `<p class="sub" style="margin-top:8px">Protected by your config and never listed here: ${esc(r.keepImages.join(", "))}</p>` : ""}
+${
+  kept.length
+    ? `<h3 style="margin-top:16px">Kept for rollback (${kept.length})</h3>
+<p class="sub">Not in use, but among the newest ${r.keepImageVersions} versions of their repository, so a rollback can start at once. Set <code>housekeeping.keepImageVersions</code> to change how many are kept.</p>
+${kept.length > 8 ? collapsible(`Show all ${kept.length} kept images`, keptTable) : keptTable}`
+    : ""
+}
 
 <h2 style="margin-top:24px">Stopped containers safe to remove (${r.staleContainers.length})</h2>
 <p class="sub">Containers that exited more than ${esc(formatDuration(r.staleAgeMs))} ago and are not set to restart. Anything meant to be running is left out of this list on purpose, along with its logs.</p>

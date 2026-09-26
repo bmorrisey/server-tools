@@ -489,7 +489,7 @@ log is its name.
 
 ```json
 { "schedule": "04:45", "historyDays": 90, "tmpAge": "2d",
-  "staleContainerAge": "24h", "keepImages": ["myapp:stable"],
+  "staleContainerAge": "24h", "keepImages": ["myapp:stable"], "keepImageVersions": 3,
   "clean": [ { "path": "/apps/myapp/storage/tmp", "maxAge": "7d" } ] }
 ```
 
@@ -500,14 +500,15 @@ log is its name.
 | `tmpAge` | `"2d"` | How long the toolkit's own temp files live. |
 | `staleContainerAge` | `"24h"` | How long a container must have been stopped before the Storage page offers to remove it. |
 | `keepImages` | `[]` | Image tag patterns that are never offered for removal, even when nothing is using them. `*` and `?` wildcards; matched against each tag. Use this to pin a known-good rollback image. |
+| `keepImageVersions` | `3` | The newest image versions kept per repository, so a rollback never has to pull or rebuild first. Counts distinct image IDs (an image with several tags counts once) and includes the version running now. `0` turns it off; `1` is treated as `2`, because keeping only the running version keeps nothing to roll back to. |
 | `clean` | `[]` | Age-based cleanup rules for directories you name. |
 
 `clean` rules delete files older than `maxAge` inside the listed directories
 (recursive, files only, symlinks never followed, then empty dirs). Point
 these at cache/temp directories only.
 
-`staleContainerAge` and `keepImages` only ever make the Storage page more
-conservative. They cannot cause anything to be removed on their own: cleanups
+`staleContainerAge`, `keepImages` and `keepImageVersions` only ever make the
+Storage page more conservative. They cannot cause anything to be removed on their own: cleanups
 still happen only when someone clicks the button or runs
 `server-tools reclaim`.
 

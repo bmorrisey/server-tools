@@ -13,7 +13,7 @@
  *   server-tools deploy <target> <ref> [--dry-run]
  *   server-tools housekeep [--dry-run]
  *   server-tools storage [--json]        what is using the disk, and what is reclaimable
- *   server-tools reclaim <action>        run one storage cleanup (see storage output)
+ *   server-tools reclaim <action> [--dry-run]  run one storage cleanup (--dry-run lists what would go)
  *   server-tools metrics [app]           show the latest application metrics snapshot
  *   server-tools collect [app]           collect application metrics now (all apps if omitted)
  *   server-tools status                  print latest check/backup state
@@ -273,7 +273,8 @@ async function main() {
       }
       if (report.disk) {
         process.stdout.write(
-          `disk ${report.diskPath}: ${report.disk.usedPct}% used, ${formatBytes(report.disk.freeBytes)} free of ${formatBytes(report.disk.totalBytes)}\n\n`,
+          `disk ${report.diskPath}: ${report.disk.usedPct}% used, ${formatBytes(report.disk.freeBytes)} free of ${formatBytes(report.disk.totalBytes)}` +
+            `${report.disk.reservedBytes > 0 ? ` (${formatBytes(report.disk.reservedBytes)} reserved for root, not counted as used)` : ""}\n\n`,
         );
       }
       process.stdout.write("where the space is going:\n");
@@ -290,10 +291,18 @@ async function main() {
         }
       }
       if (report.plan.length) {
-        process.stdout.write(`\nreclaimable (${formatBytes(report.reclaimableBytes)} total), run: server-tools reclaim <action>\n`);
+        process.stdout.write(
+          `\nreclaimable (up to ${formatBytes(report.reclaimableBytes)} total), run: server-tools reclaim <action> [--dry-run]\n`,
+        );
         for (const a of report.plan) {
           const id = a.target ? `${a.id} ${a.target}` : a.id;
-          process.stdout.write(`  ${id.padEnd(34)} ${formatBytes(a.bytes).padStart(10)}  [${a.kind}] ${a.label}\n`);
+          const upTo = a.minBytes !== undefined && a.minBytes < a.bytes ? "up to " : "";
+          process.stdout.write(`  ${id.padEnd(34)} ${`${upTo}${formatBytes(a.bytes)}`.padStart(16)}  [${a.kind}] ${a.label}\n`);
+        }
+        if (report.keptImages?.length) {
+          process.stdout.write(
+            `\n${report.keptImages.length} unused image(s) kept for rollback (newest ${report.keepImageVersions} per repository)\n`,
+          );
         }
       } else {
         process.stdout.write("\nnothing to reclaim\n");
@@ -328,6 +337,19 @@ async function main() {
         );
       }
       process.stdout.write(`${chosen.label}: ${chosen.what}\n${chosen.risk}\n\n`);
+      if (flags.has("--dry-run")) {
+        // The list is the one the action recomputes and removes, so this is
+        // exactly what would go if the same command ran without the flag now.
+        const range = chosen.minBytes !== undefined && chosen.minBytes < chosen.bytes;
+        process.stdout.write(
+          `(dry run) would free ${range ? `between ${formatBytes(chosen.minBytes)} and ` : "about "}${formatBytes(chosen.bytes)}\n`,
+        );
+        for (const item of chosen.items ?? []) process.stdout.write(`  would remove ${item}\n`);
+        if (chosen.id === "remove-unused-images") {
+          for (const i of report.keptImages ?? []) process.stdout.write(`  keeps ${i.name} (newest of ${i.keptFor})\n`);
+        }
+        break;
+      }
       const result = await runAction(chosen.id, { target: chosen.target }, { docker, store, config });
       process.stdout.write(`${result.ok ? "OK" : "FAILED"}: ${result.message}\n`);
       process.exit(result.ok ? 0 : 1);
@@ -420,6 +442,12 @@ async function main() {
       if (!incident) {
         process.stdout.write(`${name} is healthy: ${state.detail ?? "ok"}\n`);
         break;
+      }
+      // The dashboard reads a background measurement; a one-shot CLI process
+      // has none, so a disk diagnosis measures first. Waiting is fine here.
+      if (check.type === "disk") {
+        const storage = await import("./storage.js");
+        await storage.report({ docker, store, config }).catch(() => null);
       }
       const ctx = await gatherContext(check, { docker });
       process.stdout.write(`${incident.severity.toUpperCase()}: ${incident.title}\n\n${incident.meaning}\n`);

@@ -166,6 +166,18 @@ export async function startAgent({ configPath, withWeb = true } = {}) {
     }
   }
 
+  // Storage measurement for the dashboard. /system/df walks every image layer
+  // and can take well over a minute, so the Storage page reads a cached
+  // report; this keeps it warm. The first run waits a little so it does not
+  // compete with the checks that start at boot.
+  if (web) {
+    const storage = await import("./storage.js");
+    const measure = () =>
+      storage.refresh({ docker, store, config }).catch((e) => log.warn(`storage measurement failed: ${e.message}`));
+    setTimeout(measure, 30_000).unref();
+    setInterval(measure, storage.BACKGROUND_REFRESH_MS).unref();
+  }
+
   log.info("agent started");
   return { config, store, docker, engine, alerter, web };
 }

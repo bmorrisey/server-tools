@@ -129,6 +129,7 @@
     "tmpAge": "2d",
     "staleContainerAge": "24h",
     "keepImages": ["myapp:stable"],
+    "keepImageVersions": 3,
     "clean": []
   },
 

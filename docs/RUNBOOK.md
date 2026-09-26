@@ -151,6 +151,13 @@ Open **Storage** in the dashboard (or run `server-tools storage`). It answers
 the three questions in order: where the space went, which compose project is
 holding it, and what can be removed right now.
 
+The dashboard page shows the last measurement and its age. Docker's disk
+usage call can take over a minute on a box with hundreds of images, so the
+agent measures in the background every 30 minutes, and a page view older than
+5 minutes starts a new measurement without waiting for it. The CLI always
+measures fresh. Used space is on the same basis as `df`: blocks the
+filesystem reserves for root get their own line instead of counting as used.
+
 1. **Read the breakdown.** Images, container writable layers, volumes, build
    cache, backups, and everything else, as sizes and as a share of the disk.
    On a box that builds its own images, old images and build cache are very
@@ -163,13 +170,18 @@ holding it, and what can be removed right now.
    | Action | Frees | What it costs you |
    | --- | --- | --- |
    | `reclaim-build-cache` | Unused build layers | Nothing. The next image build starts cold. |
-   | `reclaim-dangling-images` | Untagged leftover images | Nothing. |
-   | `remove-unused-images` | Every image no container uses | Rolling back to one of those versions means rebuilding or pulling it again. |
+   | `reclaim-dangling-images` | Untagged leftover images (an image pulled by digest is not one) | Nothing. |
+   | `remove-unused-images` | Images no container uses, running or stopped, except the newest `keepImageVersions` of each repository (3 by default) | Rolling back further than the kept versions means rebuilding or pulling first. |
    | `remove-stopped-containers` | Old one-off containers | Their logs go with them. |
    | `prune-backups` | Backup artifacts already past retention | Nothing the schedule was not going to delete anyway. |
    | `trim-history` | The toolkit's own old history and temp files | Nothing. |
 
-   From a terminal: `server-tools reclaim <action> [target]`.
+   Image actions show "up to" an amount: images share layers, so what
+   removing a set frees is only known exactly afterwards. The card also shows
+   the floor.
+
+   From a terminal: `server-tools reclaim <action> [target]`. Add
+   `--dry-run` to list exactly what would go without removing anything.
 4. **Volumes are never removed for you.** The page lists them, flags the ones
    nothing references, and stops there. An unreferenced volume is very often
    the database of a project that is simply down right now. Confirm what it
@@ -199,7 +211,7 @@ The actions are deliberately conservative - none delete application data:
 | Action | What it does | Where it is offered |
 | --- | --- | --- |
 | `restart-container` | Restarts the named container (brief downtime) | container / postgres / http incidents |
-| `reclaim-docker-space` | Removes unused Docker images + build cache | disk incidents |
+| `reclaim-docker-space` | Removes untagged leftover images + unused build cache | disk incidents |
 | `reclaim-build-cache`, `reclaim-dangling-images`, `remove-unused-images`, `remove-stopped-containers`, `trim-history` | Targeted disk reclamation, each previewed before it runs | the Storage page (see "Disk is filling up") |
 | `run-backup` | Runs a configured backup target now | backup-freshness incidents, and the Backups page |
 | `run-drill` | Proves a backup: a database target is restored into a temporary database and dropped again; a files target has its archive read back and checked against the manifest | the Backups page |

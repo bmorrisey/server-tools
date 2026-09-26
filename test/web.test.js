@@ -84,9 +84,15 @@ store.append("events", { topic: "backup", kind: "ok", name: "demo-db", detail: "
 let restarted = null;
 const removedContainers = [];
 const diskUsage = {
-  LayersSize: 3_000_000,
+  // v1 and v0 share a 2.5 MB base layer. v1 backs a stopped container, v0 is
+  // the previous release, and the untagged image is build debris.
+  LayersSize: 3_600_000,
   BuilderSize: 1_000_000,
-  Images: [{ Id: "sha256:old", RepoTags: ["demo/app:v1"], Size: 3_000_000, Containers: 0, Created: 1_700_000_000 }],
+  Images: [
+    { Id: "sha256:old", RepoTags: ["demo/app:v1"], Size: 3_000_000, SharedSize: 2_500_000, Containers: 1, Created: 1_700_000_000 },
+    { Id: "sha256:older", RepoTags: ["demo/app:v0"], Size: 2_900_000, SharedSize: 2_500_000, Containers: 0, Created: 1_690_000_000 },
+    { Id: "sha256:debris", RepoTags: ["<none>:<none>"], Size: 200_000, SharedSize: 0, Containers: 0, Created: 1_695_000_000 },
+  ],
   Containers: [
     {
       Id: "leftover",
@@ -291,7 +297,24 @@ test("storage page explains usage, offers cleanups, and refuses to delete volume
   const res = await get(`/auth?token=${new URL(url).searchParams.get("token")}`);
   const cookie = res.headers.get("set-cookie").split(";")[0];
 
+  // The first view does not wait for the measurement: it says it is
+  // measuring and reloads itself, and the API answers 202 until it is done.
+  const first = await (await get("/storage", { cookie })).text();
+  assert.match(first, /Measuring the disk now/);
+  assert.match(first, /<meta http-equiv="refresh" content="15">/);
+  let api = null;
+  for (let i = 0; i < 50 && !api; i++) {
+    const r = await get("/api/storage", { cookie });
+    if (r.status === 200) api = await r.json();
+    else {
+      assert.equal(r.status, 202);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+  }
+  assert.ok(api, "the background measurement completes");
+
   const html = await (await get("/storage", { cookie })).text();
+  assert.match(html, /Measured .* ago/);
   assert.match(html, /Where the space is going/);
   assert.match(html, /Container images/);
   assert.match(html, /Volumes \(your data\)/);
@@ -299,16 +322,22 @@ test("storage page explains usage, offers cleanups, and refuses to delete volume
   assert.match(html, /docker volume rm/); // ... but only as a manual instruction
   assert.match(html, /no volume is ever deleted/i);
   assert.match(html, /demo-migrate-run-1/); // the stale container is previewed
-  assert.match(html, /demo\/app:v1/); // the unused image is previewed
+  assert.match(html, /debris|\(untagged\)/); // the leftover image is previewed
+  // v1 backs a stopped container, so it is never offered; v0 is the previous
+  // release and is held back for rollback, and the page says so.
+  assert.match(html, /Kept for rollback \(1\)/);
+  assert.match(html, /demo\/app:v0/);
   assert.match(html, /Clear unused build cache/);
   assert.ok(!/actionId="[^"]*volume/i.test(html), "no volume action is ever offered");
 
   // The disk tile on the overview links here.
   assert.match(await (await get("/", { cookie })).text(), /href="\/storage"/);
 
-  // The machine-readable form carries the same numbers.
-  const api = await (await get("/api/storage", { cookie })).json();
+  // The machine-readable form carries the same numbers, and their age.
   assert.equal(api.dockerAvailable, true);
+  assert.ok(api.measuredAt && typeof api.ageMs === "number");
+  assert.deepEqual(api.unusedImages.map((i) => i.id), ["sha256:debris"]);
+  assert.deepEqual(api.keptImages.map((i) => i.id), ["sha256:older"]);
   assert.equal(api.summary.volumes.totalBytes, 9_000_000);
   assert.equal(api.staleContainers.length, 1);
   assert.ok(api.plan.every((a) => !/volume/i.test(a.id)));
