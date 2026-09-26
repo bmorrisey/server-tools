@@ -7,6 +7,7 @@
  */
 import crypto from "node:crypto";
 import { escapeHtml as esc, formatBytes, formatDuration } from "../util.js";
+import { icon, markSvg } from "./icons.js";
 import { compactTime, compactValue, formatDelta, formatValue, numericValue } from "../appmetrics/snapshot.js";
 import { WINDOWS, buildAllSeries, computeDeltas, downsample, seriesKeys } from "../appmetrics/series.js";
 
@@ -317,7 +318,11 @@ header {
   display: flex; align-items: center; gap: 20px; flex-wrap: wrap;
   padding: 14px 24px; border-bottom: 1px solid var(--border); background: var(--surface);
 }
-header .brand { font-weight: 700; letter-spacing: -0.01em; }
+header .brand { display: inline-flex; align-items: center; gap: 8px; font-weight: 700; letter-spacing: -0.01em; }
+/* Status icons sit on the text baseline like the glyphs they replaced. */
+.i { width: 1em; height: 1em; flex: none; vertical-align: -0.125em; }
+.mark { flex: none; }
+.login h1 { display: flex; align-items: center; gap: 10px; }
 header nav { display: flex; gap: 4px; flex-wrap: wrap; }
 header nav a {
   text-decoration: none; color: var(--ink-2); padding: 5px 11px; border-radius: 8px; font-size: 14px;
@@ -483,17 +488,16 @@ header button { padding: 5px 11px; color: var(--ink-2); }
 footer { text-align: center; color: var(--muted); font-size: 12.5px; padding: 20px; }
 `;
 
-const STATUS_GLYPH = { ok: "✓", warn: "⚠", fail: "✕" };
 const STATUS_TEXT = { ok: "ok", warn: "warn", fail: "fail" };
 
 export function statusPill(status) {
   const s = STATUS_TEXT[status] ? status : "fail";
-  return `<span class="status ${s}">${STATUS_GLYPH[s]} ${STATUS_TEXT[s]}</span>`;
+  return `<span class="status ${s}">${icon(s)}${STATUS_TEXT[s]}</span>`;
 }
 
 export function flashBanner(flash) {
   if (!flash || !flash.message) return "";
-  return `<div class="banner ${flash.ok ? "ok" : "err"}">${flash.ok ? "✓" : "✕"} ${esc(flash.message)}</div>`;
+  return `<div class="banner ${flash.ok ? "ok" : "err"}">${icon(flash.ok ? "ok" : "fail")} ${esc(flash.message)}</div>`;
 }
 
 /**
@@ -592,13 +596,14 @@ export function layout({ title, page, session, body, flash, refreshSec = 0 }) {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex, nofollow">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
 ${refreshSec > 0 ? `<meta http-equiv="refresh" content="${Number(refreshSec)}">` : ""}
 <title>${esc(title)} - server-tools</title>
 <style>${CSS}</style>
 </head>
 <body>
 <header>
-  <span class="brand">server-tools</span>
+  <span class="brand">${markSvg({ size: 20 })}server-tools</span>
   <nav>${nav}</nav>
   <form method="post" action="/logout"><input type="hidden" name="csrf" value="${esc(session.csrf ?? "")}"><button type="submit" title="Signed in as ${esc(session.email)}">Sign out</button></form>
 </header>
@@ -620,12 +625,13 @@ export function loginPage({ message = "", sent = false } = {}) {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex, nofollow">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <title>Sign in - server-tools</title>
 <style>${CSS}</style>
 </head>
 <body>
 <main class="login">
-  <h1>server-tools</h1>
+  <h1>${markSvg({ size: 28 })}server-tools</h1>
   <p class="sub">Admin dashboard. Enter your email to receive a sign-in link.</p>
   <form method="post" action="/login">
     <input type="email" name="email" placeholder="you@example.com" required autofocus autocomplete="email">
@@ -976,7 +982,7 @@ function describeTarget(t) {
  */
 export function coverageBanners(notes = []) {
   return notes
-    .map((n) => `<div class="banner warn">&#9888; <strong>${esc(n.title)}</strong><br>${esc(n.detail)}</div>`)
+    .map((n) => `<div class="banner warn">${icon("warn")} <strong>${esc(n.title)}</strong><br>${esc(n.detail)}</div>`)
     .join("");
 }
 
@@ -1021,7 +1027,7 @@ export function storagePage({ session, report, measuredAt = null, ageMs = null, 
   }</p>`;
   const staleBanner =
     stale && refreshing
-      ? `<div class="banner warn">&#9888; These figures are from before your last change. A new measurement is running.</div>`
+      ? `<div class="banner warn">${icon("warn")} These figures are from before your last change. A new measurement is running.</div>`
       : "";
 
   const reservedNote =
@@ -1073,7 +1079,7 @@ export function storagePage({ session, report, measuredAt = null, ageMs = null, 
         working: `Running: ${a.label}. Clearing this much can take several minutes. You can leave this page; the result is recorded under Events.`,
       });
       return `<div class="card">
-  <div class="label">${esc(a.label)} ${a.kind === "caution" ? '<span class="status warn">&#9888; review first</span>' : '<span class="status ok">&#10003; safe</span>'}</div>
+  <div class="label">${esc(a.label)} ${a.kind === "caution" ? `<span class="status warn">${icon("warn")}review first</span>` : `<span class="status ok">${icon("ok")}safe</span>`}</div>
   <div class="amount">${ranged(a) ? "up to " : ""}${formatBytes(a.bytes)} <small>${a.count ? `${a.count} item${a.count > 1 ? "s" : ""}` : ""}</small></div>
   ${ranged(a) ? `<p class="detail">At least ${formatBytes(a.minBytes)}. The rest depends on which shared layers only these images use.</p>` : ""}
   <p class="what">${esc(a.what)}</p>
@@ -1151,7 +1157,7 @@ export function storagePage({ session, report, measuredAt = null, ageMs = null, 
       .map(
         (v) => `<tr>
 <td>${esc(v.name)}${v.project ? `<br><span class="detail">${esc(v.project)}</span>` : ""}</td>
-<td>${v.inUse ? `${statusPill("ok")} in use` : '<span class="status warn">&#9888; not referenced</span>'}</td>
+<td>${v.inUse ? `${statusPill("ok")} in use` : `<span class="status warn">${icon("warn")}not referenced</span>`}</td>
 <td class="num">${formatBytes(v.sizeBytes)}</td>
 </tr>`,
       )
@@ -1187,7 +1193,7 @@ export function storagePage({ session, report, measuredAt = null, ageMs = null, 
   const findings = r.findings
     .map(
       (f) => `<div class="incident warn">
-  <h3><span class="status warn">&#9888; heads up</span> ${esc(f.title)}</h3>
+  <h3><span class="status warn">${icon("warn")}heads up</span> ${esc(f.title)}</h3>
   <p class="meaning">${esc(f.detail)}</p>
   ${f.names?.length ? `<div class="context">${esc(f.names.join(", "))}</div>` : ""}
 </div>`,
@@ -1202,7 +1208,7 @@ export function storagePage({ session, report, measuredAt = null, ageMs = null, 
 
   const dockerWarning = r.dockerAvailable
     ? ""
-    : `<div class="banner err">&#10007; Docker is not reachable from here, so only backup and history usage is shown.</div>`;
+    : `<div class="banner err">${icon("fail")} Docker is not reachable from here, so only backup and history usage is shown.</div>`;
 
   const body = `
 <h1>Storage</h1>

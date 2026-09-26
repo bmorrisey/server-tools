@@ -1,3 +1,5 @@
+<img src="docs/icon.svg" width="56" height="56" alt="server-tools">
+
 # server-tools
 
 A self-contained operations toolkit for a single-box Docker VPS. One small
