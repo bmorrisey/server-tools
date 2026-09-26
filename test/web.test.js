@@ -7,6 +7,7 @@ import { createHash } from "node:crypto";
 import { Store } from "../src/store.js";
 import { startWebServer } from "../src/web/server.js";
 import { createLoginToken } from "../src/web/auth.js";
+import { MARK_SVG } from "../src/web/icons.js";
 import * as uiModule from "../src/web/ui.js";
 import { backupsPage, coverageBanners, deploysPage, metricsPage, sparkline, meter, statusPill, timeChart } from "../src/web/ui.js";
 import { compactTime, compactValue } from "../src/appmetrics/snapshot.js";
@@ -382,6 +383,27 @@ test("confirmations survive the CSP: hashed script, no inline handlers", async (
   assert.match(html, /data-working="[^"]*can take several minutes[^"]*recorded under Events/);
 });
 
+test("the favicon is public, is the project mark, and every page links it", async () => {
+  // No cookie: the sign-in page needs its tab icon before anyone signs in.
+  for (const p of ["/favicon.svg", "/favicon.ico"]) {
+    const res = await get(p);
+    assert.equal(res.status, 200, p);
+    assert.equal(res.headers.get("content-type"), "image/svg+xml");
+    assert.match(res.headers.get("cache-control"), /max-age=86400/);
+    assert.equal(await res.text(), MARK_SVG);
+  }
+  const login = await (await get("/login")).text();
+  assert.match(login, /<link rel="icon" href="\/favicon.svg" type="image\/svg\+xml">/);
+  assert.match(login, /<h1><svg class="mark"/);
+
+  const url = createLoginToken({ config, store, email: "op@example.com" });
+  const res = await get(`/auth?token=${new URL(url).searchParams.get("token")}`);
+  const cookie = res.headers.get("set-cookie").split(";")[0];
+  const home = await (await get("/", { cookie })).text();
+  assert.match(home, /<link rel="icon" href="\/favicon.svg"/);
+  assert.match(home, /<span class="brand"><svg class="mark"/);
+});
+
 test("logout requires a valid CSRF token", async () => {
   const url = createLoginToken({ config, store, email: "op@example.com" });
   const res = await get(`/auth?token=${new URL(url).searchParams.get("token")}`);
@@ -423,8 +445,10 @@ test("login POST is uniform for allowed and unknown emails", async () => {
 });
 
 test("ui fragments render sanely", () => {
-  assert.match(statusPill("ok"), /✓ ok/);
-  assert.match(statusPill("fail"), /✕ fail/);
+  // An icon from the one set, then the word: status never rides on the icon
+  // or the color alone.
+  assert.match(statusPill("ok"), /<svg class="i"[^>]*aria-hidden="true"[\s\S]*<\/svg>ok<\/span>/);
+  assert.match(statusPill("fail"), /<\/svg>fail<\/span>/);
   assert.equal(sparkline([1]), ""); // too few points
   assert.match(sparkline([1, 5, 3, 8]), /<svg/);
   assert.match(sparkline([1, 5, 3, 8]), /<title>latest 8/);
@@ -1048,7 +1072,7 @@ test("external dashboard tiles link out with status from the named check", () =>
   assert.match(html, /External dashboards/);
   assert.match(html, /<a class="card" href="https:\/\/charts.example.com\/d\/abc"/);
   // The named check's state is the pill, so the tile and the alerts agree.
-  assert.match(html, /✕ fail/);
+  assert.match(html, /<span class="status fail"><svg class="i"[^>]*>[\s\S]*?<\/svg>fail<\/span>/);
   assert.match(html, /HTTP 502/);
   // An entry without a check gets a neutral link pill, not a green one.
   assert.match(html, /status external">link/);

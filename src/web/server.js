@@ -28,6 +28,7 @@ import * as ui from "./ui.js";
 import * as auth from "./auth.js";
 import * as metrics from "../metrics.js";
 import * as storage from "../storage.js";
+import { MARK_SVG } from "./icons.js";
 import { sendMail } from "../smtp.js";
 import { coverageNotes } from "../config.js";
 import { WINDOWS, windowById } from "../appmetrics/series.js";
@@ -184,6 +185,12 @@ export function startWebServer({ config, store, docker, alerter }) {
     const path = url.pathname.replace(/\/+$/, "") || "/";
 
     // Public endpoints.
+    if (req.method === "GET" && (path === "/favicon.svg" || path === "/favicon.ico")) {
+      // Public so the sign-in page gets its tab icon too. Every page links
+      // /favicon.svg; /favicon.ico is the path a browser tries on its own when
+      // it ignores the link, and it gets the same file rather than a 404.
+      return send(res, 200, MARK_SVG, { "content-type": "image/svg+xml", "cache-control": "public, max-age=86400" });
+    }
     if (req.method === "GET" && path === "/healthz") {
       return send(res, 200, { status: "ok", uptime: Math.floor(process.uptime()) });
     }
