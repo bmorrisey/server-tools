@@ -56,19 +56,35 @@ export function cpu() {
   return { pct: Math.round((1 - dIdle / dTotal) * 1000) / 10 };
 }
 
-/** Disk usage for a path via statfs. */
-export async function disk(pathname) {
-  const s = await fsp.statfs(pathname);
+/**
+ * Disk usage from a statfs result, on the same basis as `df`.
+ *
+ * Filesystems such as ext4 keep a share of blocks (5% by default) back for
+ * root. Those blocks are neither used by data nor available to ordinary
+ * processes. Counting them as used - total minus available - overstated usage
+ * by the whole reservation, so used is total minus free, and the percentage
+ * is used over what ordinary processes can ever fill (used plus available),
+ * which is what df prints. The reservation is reported on its own.
+ */
+export function diskFromStatfs(s, pathname) {
   const total = s.blocks * s.bsize;
-  const free = s.bavail * s.bsize;
-  const used = total - free;
+  const available = s.bavail * s.bsize;
+  const used = (s.blocks - s.bfree) * s.bsize;
+  const reserved = Math.max((s.bfree - s.bavail) * s.bsize, 0);
+  const usable = used + available;
   return {
     path: pathname,
     totalBytes: total,
-    freeBytes: free,
+    freeBytes: available,
     usedBytes: used,
-    usedPct: total ? Math.round((used / total) * 1000) / 10 : 0,
+    reservedBytes: reserved,
+    usedPct: usable ? Math.round((used / usable) * 1000) / 10 : 0,
   };
+}
+
+/** Disk usage for a path via statfs. */
+export async function disk(pathname) {
+  return diskFromStatfs(await fsp.statfs(pathname), pathname);
 }
 
 /** Seconds the host has been up (host /proc/uptime is not namespaced). */

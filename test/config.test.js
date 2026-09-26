@@ -193,6 +193,15 @@ test("each image in a multi-image deploy needs its own variable and services", (
   assert.ok(problems.some((p) => p.includes("deploys[4].images must be a non-empty array")));
 });
 
+test("housekeeping.keepImageVersions is a non-negative integer", () => {
+  const cfg = (v) => withDefaults({ ...minimal, housekeeping: { keepImageVersions: v } });
+  assert.deepEqual(validateConfig(cfg(0)), [], "0 turns rollback keeping off");
+  assert.deepEqual(validateConfig(cfg(5)), []);
+  for (const bad of [-1, 2.5, "3"]) {
+    assert.ok(validateConfig(cfg(bad)).some((p) => p.includes("keepImageVersions")), `${JSON.stringify(bad)} is refused`);
+  }
+});
+
 test("git deploys stay valid without the registry fields and reject them when set", () => {
   assert.deepEqual(
     validateConfig(withDefaults({ ...minimal, deploys: [{ name: "app", dir: "/apps/app", healthUrl: "https://a/health" }] })),

@@ -89,11 +89,31 @@ test("runAction validates targets against config", async () => {
     r = await runAction("run-backup", { target: "nope" }, { docker: null, store, config });
     assert.equal(r.ok, false);
 
-    // Reclaim aggregates reclaimed bytes from both prunes.
-    const docker2 = { pruneImages: async () => 1_000_000, pruneBuildCache: async () => 500_000 };
+    // Reclaim removes untagged leftovers by explicit id plus build cache, and
+    // never uses the Engine's image prune: prune calls a digest-pinned release
+    // "dangling" because it has no tag.
+    let layers = 3_000_000;
+    const removed = [];
+    const docker2 = {
+      systemDf: async () => ({
+        LayersSize: layers,
+        Images: [
+          { Id: "sha256:debris", RepoTags: ["<none>:<none>"], RepoDigests: [], Size: 1_000_000, SharedSize: 0, Containers: 0 },
+          { Id: "sha256:pinned", RepoTags: [], RepoDigests: ["o/app@sha256:1234"], Size: 2_000_000, SharedSize: 0, Containers: 0 },
+        ],
+        Containers: [],
+      }),
+      removeImage: async (ref) => {
+        removed.push(ref);
+        layers -= 1_000_000;
+      },
+      pruneImages: async () => assert.fail("the Engine's image prune must not be used"),
+      pruneBuildCache: async () => 500_000,
+    };
     r = await runAction("reclaim-docker-space", {}, { docker: docker2, store, config });
     assert.equal(r.ok, true);
-    assert.match(r.message, /Reclaimed/);
+    assert.deepEqual(removed, ["sha256:debris"]);
+    assert.match(r.message, /Reclaimed 1\.4 MiB/);
 
     // run-drill validates target existence and type before touching docker.
     r = await runAction("run-drill", { target: "nope" }, { docker: null, store, config });

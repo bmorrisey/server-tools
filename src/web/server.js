@@ -321,8 +321,10 @@ export function startWebServer({ config, store, docker, alerter }) {
       );
     }
     if (path === "/storage") {
-      const report = await storage.report({ docker, store, config });
-      return send(res, 200, ui.storagePage({ session, report, flash, csrf: session.csrf }));
+      // Never waits on /system/df: the page renders from the last measurement
+      // and a new one runs in the background when that is out of date.
+      const view = storage.peek({ docker, store, config });
+      return send(res, 200, ui.storagePage({ session, ...view, flash, csrf: session.csrf }));
     }
     if (path === "/backups") {
       return send(
@@ -387,7 +389,10 @@ export function startWebServer({ config, store, docker, alerter }) {
       });
     }
     if (path === "/api/storage") {
-      return send(res, 200, await storage.report({ docker, store, config }));
+      const view = storage.peek({ docker, store, config });
+      if (!view.report) return send(res, 202, { measuring: true, refreshing: view.refreshing });
+      const { report, ...meta } = view;
+      return send(res, 200, { ...report, ...meta });
     }
 
     return send(res, 404, "<h1>Not found</h1>");

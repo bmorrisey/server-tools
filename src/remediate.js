@@ -22,7 +22,7 @@ import { runBackup, prune as pruneBackups } from "./backup/backup.js";
 import { drill, drillFiles } from "./backup/restore.js";
 import { housekeep } from "./housekeep.js";
 import * as storage from "./storage.js";
-import { formatBytes, parseDuration } from "./util.js";
+import { formatBytes, formatDuration, parseDuration } from "./util.js";
 
 /**
  * Build the incident for a check + its latest state. Pure function (no I/O) so
@@ -95,7 +95,7 @@ export function diagnose(check, state) {
           "Old backup artifacts kept longer than needed",
         ],
         actions: [
-          { id: "reclaim-docker-space", label: "Reclaim unused Docker space", kind: "safe", confirm: "Remove unused Docker images and build cache? This never touches running containers or their data." },
+          { id: "reclaim-docker-space", label: "Reclaim unused Docker space", kind: "safe", confirm: "Remove untagged leftover images and unused build cache? Named images, containers and their data are never touched." },
         ],
         link: { href: "/storage", label: "See what is using the disk" },
       };
@@ -202,15 +202,18 @@ export async function gatherContext(check, { docker }) {
   }
 
   if (check.type === "disk") {
-    try {
-      const df = await docker.systemDf();
-      const reclaimable =
-        (df.Images ?? []).reduce((s, im) => s + (im.Containers === 0 ? im.Size : 0), 0) +
-        (df.BuildCache ?? []).reduce((s, c) => s + (c.InUse ? 0 : (c.Size ?? 0)), 0);
+    // From the Storage page's last measurement, not a fresh /system/df: that
+    // call can take over a minute on a box with many images, and this runs
+    // while an operator waits for an incident page. It covers exactly what
+    // the reclaim-docker-space button removes, estimated without counting
+    // shared image layers once per image.
+    const last = storage.latest();
+    if (last?.plan) {
+      const reclaimable = last.plan
+        .filter((a) => a.id === "reclaim-build-cache" || a.id === "reclaim-dangling-images")
+        .reduce((s, a) => s + a.bytes, 0);
       ctx.reclaimable = reclaimable;
-      ctx.reclaimableText = `about ${formatBytes(reclaimable)} of unused Docker images and build cache can be cleared safely`;
-    } catch {
-      // df unavailable
+      ctx.reclaimableText = `up to ${formatBytes(reclaimable)} of untagged leftover images and build cache can be cleared safely (measured ${formatDuration(Date.now() - Date.parse(last.generatedAt))} ago)`;
     }
   }
 
@@ -273,11 +276,9 @@ export async function runAction(actionId, params, { docker, store, config }) {
       }
 
       case "reclaim-docker-space": {
-        const images = await docker.pruneImages();
-        const cache = await docker.pruneBuildCache();
-        const total = (images ?? 0) + (cache ?? 0);
-        storage.invalidate();
-        return record(true, `Reclaimed ${formatBytes(total)} of disk (unused images + build cache).`);
+        const images = await storage.reclaimDanglingImages(docker, imageKeepRules(config));
+        const cache = await storage.reclaimBuildCache(docker);
+        return record(true, `Reclaimed ${formatBytes(images.bytes + cache.bytes)} of disk (untagged leftover images + build cache).`);
       }
 
       case "reclaim-build-cache": {
@@ -286,14 +287,13 @@ export async function runAction(actionId, params, { docker, store, config }) {
       }
 
       case "reclaim-dangling-images": {
-        const { bytes } = await storage.reclaimDanglingImages(docker);
-        return record(true, `Removed untagged leftover images, freeing ${formatBytes(bytes)}.`);
+        const result = await storage.reclaimDanglingImages(docker, imageKeepRules(config));
+        return record(true, `Removed ${result.removed} untagged leftover image${result.removed === 1 ? "" : "s"}, freeing ${formatBytes(result.bytes)}.${skippedNote(result)}`);
       }
 
       case "remove-unused-images": {
-        const result = await storage.removeUnusedImages(docker, { keep: config.housekeeping?.keepImages ?? [] });
-        const note = result.skipped.length ? ` ${result.skipped.length} turned out to be in use and were left alone.` : "";
-        return record(true, `Removed ${result.removed} image${result.removed === 1 ? "" : "s"} with no container, freeing ${formatBytes(result.bytes)}.${note}`);
+        const result = await storage.removeUnusedImages(docker, imageKeepRules(config));
+        return record(true, `Removed ${result.removed} image${result.removed === 1 ? "" : "s"} with no container, freeing ${formatBytes(result.bytes)}.${skippedNote(result)}`);
       }
 
       case "remove-stopped-containers": {
@@ -348,6 +348,15 @@ export async function runAction(actionId, params, { docker, store, config }) {
 }
 
 /** Is this a container referenced by any configured check or backup? */
+/** The image keep rules from config, in the shape the storage removals take. */
+function imageKeepRules(config) {
+  return { keep: config.housekeeping?.keepImages ?? [], keepVersions: config.housekeeping?.keepImageVersions };
+}
+
+function skippedNote(result) {
+  return result.skipped.length ? ` ${result.skipped.length} could not be removed and ${result.skipped.length === 1 ? "was" : "were"} left alone.` : "";
+}
+
 function knownContainer(config, name) {
   if (!name) return false;
   const fromChecks = (config.checks ?? []).some((c) => c.container === name);

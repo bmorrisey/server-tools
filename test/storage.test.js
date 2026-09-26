@@ -17,7 +17,19 @@ import {
   removeStaleContainers,
   report,
   invalidate,
+  peek,
+  refresh,
+  latest,
+  planTotals,
+  repositoryOf,
+  rollbackKeepers,
+  effectiveKeepVersions,
+  classifyUnusedImages,
+  imageReclaimEstimate,
+  referencedImageIds,
+  reclaimDanglingImages,
 } from "../src/storage.js";
+import { diskFromStatfs } from "../src/metrics.js";
 import { ACTION_IDS } from "../src/remediate.js";
 import { Docker, safeRef } from "../src/docker.js";
 import { Store } from "../src/store.js";
@@ -34,7 +46,7 @@ function df() {
     LayersSize: 10_000,
     BuilderSize: 1000,
     Images: [
-      { Id: "sha256:aaa", RepoTags: ["app:v2"], Size: 4000, VirtualSize: 4000, SharedSize: 1000, Containers: 1, Created: 1_700_000_000 },
+      { Id: "sha256:aaa", RepoTags: ["app:v2"], Size: 4000, VirtualSize: 4000, SharedSize: 1000, Containers: 3, Created: 1_700_000_000 },
       { Id: "sha256:bbb", RepoTags: ["app:v1"], Size: 3500, VirtualSize: 3500, SharedSize: 1000, Containers: 0, Created: 1_600_000_000 },
       { Id: "sha256:ccc", RepoTags: ["<none>:<none>"], Size: 1500, VirtualSize: 1500, SharedSize: 0, Containers: 0, Created: 1_650_000_000 },
       { Id: "sha256:ddd", RepoTags: ["keepme:stable"], Size: 1000, VirtualSize: 1000, SharedSize: 0, Containers: 0, Created: 1_690_000_000 },
@@ -54,15 +66,15 @@ function df() {
       {
         Id: "c2",
         Names: ["/web-migrate-run-abc"],
-        Image: "app:v1",
-        ImageID: "sha256:bbb",
+        Image: "app:v2",
+        ImageID: "sha256:aaa",
         State: "exited",
         Status: "Exited (0) 5 days ago",
         SizeRw: 200,
         Created: 1_600_000_000,
         Labels: { "com.docker.compose.project": "web", "com.docker.compose.service": "migrate" },
       },
-      { Id: "c3", Names: ["/scratch"], Image: "app:v1", ImageID: "sha256:bbb", State: "exited", Status: "Exited (1) 2 days ago", SizeRw: 50, Created: 1_600_000_000, Labels: {} },
+      { Id: "c3", Names: ["/scratch"], Image: "app:v2", ImageID: "sha256:aaa", State: "exited", Status: "Exited (1) 2 days ago", SizeRw: 50, Created: 1_600_000_000, Labels: {} },
     ],
     Volumes: [
       { Name: "web_db", UsageData: { Size: 5000, RefCount: 1 }, Labels: { "com.docker.compose.project": "web" } },
@@ -82,8 +94,10 @@ test("summarizeDf follows Docker's accounting and never counts volumes as reclai
   assert.equal(s.images.totalBytes, 10_000);
   assert.equal(s.images.count, 4);
   assert.equal(s.images.unusedCount, 3);
-  // Only "app:v2" backs a container: 4000 total minus 1000 shared stays put.
-  assert.equal(s.images.reclaimableBytes, 7000);
+  // The bytes only unused images hold: 2500 + 1500 + 1000. Docker 29 reports
+  // the same figure, and the older formula (7000 here) counted the layers
+  // "app:v2" shares with them as reclaimable although it still needs them.
+  assert.equal(s.images.reclaimableBytes, 5000);
   assert.equal(s.images.danglingBytes, 1500);
 
   assert.equal(s.containers.totalBytes, 350);
@@ -101,7 +115,7 @@ test("summarizeDf follows Docker's accounting and never counts volumes as reclai
   assert.equal(summarizeDf({ BuildCache: [{ Size: 500, InUse: false, Shared: true }] }).buildCache.reclaimableBytes, 500);
 
   // Images + stopped writable layers + build cache. Volume bytes excluded.
-  assert.equal(s.reclaimableBytes, 8050);
+  assert.equal(s.reclaimableBytes, 6050);
   assert.ok(!("reclaimableBytes" in s.volumes), "volumes must not advertise reclaimable bytes");
 });
 
@@ -121,12 +135,12 @@ test("globMatch handles literal, wildcard, and anchored patterns", () => {
 });
 
 test("unusedImages lists only images with no container, honouring the keep list", () => {
-  const all = unusedImages(df());
+  const all = unusedImages(df(), { keepVersions: 0 });
   assert.deepEqual(all.map((i) => i.name), ["app:v1", "ccc (untagged)", "keepme:stable"]);
   assert.equal(all[0].sizeBytes, 3500, "sorted biggest first");
   assert.equal(all[1].dangling, true);
 
-  const kept = unusedImages(df(), { keep: ["keepme:*"] });
+  const kept = unusedImages(df(), { keep: ["keepme:*"], keepVersions: 0 });
   assert.deepEqual(kept.map((i) => i.name), ["app:v1", "ccc (untagged)"]);
   assert.ok(!kept.some((i) => i.tags.includes("app:v2")), "an image backing a container is never a candidate");
 });
@@ -200,7 +214,7 @@ test("logRotationFindings warns only about running containers with unbounded jso
 test("buildPlan offers only real savings, sorted, and never touches volumes", () => {
   const base = {
     summary: summarizeDf(df()),
-    unusedImages: unusedImages(df()),
+    unusedImages: unusedImages(df(), { keepVersions: 0 }),
     staleContainers: [{ name: "old", sizeBytes: 250 }],
     backups: [
       { name: "app-db", prunableCount: 2, prunableBytes: 4000, retention: { daily: 7, weekly: 4, monthly: 6 } },
@@ -289,7 +303,7 @@ test("removeUnusedImages removes exactly what was listed and reports real bytes 
   doc.Images[1].RepoTags = ["app:v1", "app:previous"]; // multi-tagged: remove per tag
   const docker = fakeDocker({ document: doc });
 
-  const result = await removeUnusedImages(docker, { keep: ["keepme:*"] });
+  const result = await removeUnusedImages(docker, { keep: ["keepme:*"], keepVersions: 0 });
   assert.deepEqual(docker.removed.images, ["app:v1", "app:previous", "sha256:ccc"]);
   assert.ok(!docker.removed.images.some((r) => r.startsWith("keepme")), "the keep list is honoured");
   assert.ok(!docker.removed.images.includes("app:v2"), "an image with a container is never removed");
@@ -299,7 +313,7 @@ test("removeUnusedImages removes exactly what was listed and reports real bytes 
 
 test("removeUnusedImages skips images the engine refuses and keeps going", async () => {
   const docker = fakeDocker({ failOn: ["app:v1"] });
-  const result = await removeUnusedImages(docker);
+  const result = await removeUnusedImages(docker, { keepVersions: 0 });
   assert.equal(result.removed, 2);
   assert.equal(result.skipped.length, 1);
   assert.equal(result.skipped[0].name, "app:v1");
@@ -393,4 +407,326 @@ test("an external target gets no storage row and no directory", async () => {
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
+});
+
+/* -------------------------------------------------------------------------
+ * Issue: reclaimable space summed from full image sizes
+ *
+ * Versions of one application share their base layers. Each image's Size
+ * includes that base, so adding sizes counts it once per version. On a box
+ * with hundreds of versions the old figure claimed several times the disk.
+ * ---------------------------------------------------------------------- */
+
+/** Ten versions of one app on a shared 900-byte base, newest running. */
+function manyVersions() {
+  const images = [];
+  for (let v = 1; v <= 10; v++) {
+    images.push({
+      Id: `sha256:v${v}`,
+      RepoTags: [`app:v${v}`],
+      Size: 1000,
+      SharedSize: 900,
+      Containers: v === 10 ? 1 : 0,
+      Created: 1_700_000_000 + v,
+    });
+  }
+  return { LayersSize: 900 + 10 * 100, Images: images, Containers: [], Volumes: [], BuildCache: [] };
+}
+
+test("removing old versions frees their own layers, not the base the running one still needs", () => {
+  const doc = manyVersions();
+  const unused = unusedImages(doc, { keepVersions: 0 });
+  assert.equal(unused.length, 9);
+  const summed = unused.reduce((sum, i) => sum + i.sizeBytes, 0);
+  assert.equal(summed, 9000, "the old way: more than every layer on the box");
+
+  const e = imageReclaimEstimate(doc, unused.map((i) => i.id));
+  // Each old version owns 100 bytes; the shared base stays for v10.
+  assert.deepEqual(e, { minBytes: 900, maxBytes: 900 });
+  assert.ok(e.maxBytes <= doc.LayersSize);
+
+  // The summary agrees with what Docker 29 computes for the same document.
+  assert.equal(summarizeDf(doc).images.reclaimableBytes, 900);
+});
+
+test("the Engine's own reclaimable figure is used when it sends one", () => {
+  // Docker 29 (API 1.52+) adds ImageUsage.Reclaimable; `docker system df`
+  // prints it, so the report prints the same number.
+  const doc = { ...manyVersions(), ImageUsage: { Reclaimable: 850, TotalSize: 1900 } };
+  assert.equal(summarizeDf(doc).images.reclaimableBytes, 850);
+  // A figure larger than every layer on the box is clamped, whoever sent it.
+  assert.equal(summarizeDf({ ...doc, ImageUsage: { Reclaimable: 1e12 } }).images.reclaimableBytes, 1900);
+});
+
+test("a base shared only by removed images counts towards the upper figure", () => {
+  const doc = {
+    LayersSize: 1700,
+    Images: [
+      { Id: "sha256:run", RepoTags: ["new:v1"], Size: 500, SharedSize: 0, Containers: 1, Created: 3 },
+      { Id: "sha256:a", RepoTags: ["old:a"], Size: 1000, SharedSize: 800, Containers: 0, Created: 1 },
+      { Id: "sha256:b", RepoTags: ["old:b"], Size: 1000, SharedSize: 800, Containers: 0, Created: 2 },
+    ],
+  };
+  // The 800-byte base belongs to a and b alone, so removing both frees it.
+  assert.deepEqual(imageReclaimEstimate(doc, ["sha256:a", "sha256:b"]), { minBytes: 400, maxBytes: 1200 });
+  // Removing only one cannot free it: b still needs the whole base.
+  assert.deepEqual(imageReclaimEstimate(doc, ["sha256:a"]), { minBytes: 200, maxBytes: 200 });
+});
+
+test("an unknown SharedSize is treated as all shared, so the floor never overstates", () => {
+  const doc = {
+    LayersSize: 1500,
+    Images: [
+      { Id: "sha256:x", RepoTags: ["x:1"], Size: 1000, SharedSize: -1, Containers: 0 },
+      { Id: "sha256:y", RepoTags: ["y:1"], Size: 500, SharedSize: -1, Containers: 1 },
+    ],
+  };
+  const e = imageReclaimEstimate(doc, ["sha256:x"]);
+  assert.equal(e.minBytes, 0);
+  assert.ok(e.maxBytes <= 1000);
+});
+
+test("the plan reports an image range and the total counts nothing twice", () => {
+  const doc = manyVersions();
+  doc.Images.push({ Id: "sha256:junk", RepoTags: ["<none>:<none>"], Size: 50, SharedSize: 0, Containers: 0, Created: 1 });
+  doc.LayersSize += 50;
+  const unused = unusedImages(doc, { keepVersions: 0 });
+  const r = {
+    summary: summarizeDf(doc),
+    unusedImages: unused,
+    keptImages: [],
+    keepImageVersions: 0,
+    imageEstimates: {
+      dangling: imageReclaimEstimate(doc, unused.filter((i) => i.dangling).map((i) => i.id)),
+      unused: imageReclaimEstimate(doc, unused.map((i) => i.id)),
+    },
+    staleContainers: [],
+    backups: [],
+    toolkit: { historyBytes: 0, tmpBytes: 0, historyFiles: 0, tmpFiles: 0 },
+  };
+  const plan = buildPlan(r);
+  const all = plan.find((a) => a.id === "remove-unused-images");
+  const junk = plan.find((a) => a.id === "reclaim-dangling-images");
+  assert.equal(all.bytes, 950);
+  assert.equal(all.minBytes, 950);
+  assert.equal(junk.bytes, 50);
+  assert.equal(junk.subsetOf, "remove-unused-images");
+  assert.deepEqual(junk.items, ["junk (untagged)"]);
+  // 950 once, not 950 + 50: the untagged image is inside the larger action.
+  assert.deepEqual(planTotals(plan), { all: 950, safe: 50 });
+});
+
+/* -------------------------------------------------------------------------
+ * Issue: "used" included blocks the filesystem reserves for root
+ * ---------------------------------------------------------------------- */
+
+test("disk usage is on the same basis as df, with reserved blocks reported apart", () => {
+  // 473 GB disk in 4 KiB blocks, 81 GB used, 5% reserved.
+  const bsize = 4096;
+  const blocks = Math.round(473e9 / bsize);
+  const usedBlocks = Math.round(81e9 / bsize);
+  const reservedBlocks = Math.round(blocks * 0.05);
+  const bfree = blocks - usedBlocks;
+  const d = diskFromStatfs({ bsize, blocks, bfree, bavail: bfree - reservedBlocks }, "/");
+  assert.equal(d.usedBytes, usedBlocks * bsize);
+  assert.equal(d.reservedBytes, reservedBlocks * bsize);
+  assert.equal(d.freeBytes, (bfree - reservedBlocks) * bsize);
+  // df: used / (used + available) = 81 / (81 + 368.35) = 18.0%. The old
+  // formula, (total - available) / total, said 22.1%.
+  assert.equal(d.usedPct, 18);
+  assert.equal(diskFromStatfs({ bsize: 1, blocks: 0, bfree: 0, bavail: 0 }, "/").usedPct, 0);
+});
+
+test("the report gives reserved space its own line instead of padding Everything else", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "st-reserved-"));
+  try {
+    const store = new Store(dir);
+    store.ensureDirs();
+    const config = { checks: [{ name: "disk", type: "disk", path: dir }], backups: [] };
+    invalidate();
+    const r = await report({ docker: fakeDocker(), store, config });
+    const reserved = r.breakdown.find((b) => b.key === "reserved");
+    if (r.disk.reservedBytes > 0) assert.equal(reserved.bytes, r.disk.reservedBytes);
+    else assert.equal(reserved, undefined, "no line when nothing is reserved (tmpfs, most containers)");
+    const other = r.breakdown.find((b) => b.key === "other");
+    assert.equal(other.bytes, Math.max(r.disk.usedBytes - r.accountedBytes, 0), "used excludes the reservation");
+  } finally {
+    invalidate();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+/* -------------------------------------------------------------------------
+ * Issue: the page blocked on /system/df for 90+ seconds
+ * ---------------------------------------------------------------------- */
+
+test("a page read never waits for the measurement, and shows its age once it has one", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "st-peek-"));
+  try {
+    const store = new Store(dir);
+    store.ensureDirs();
+    const config = { checks: [], backups: [] };
+    let calls = 0;
+    let release;
+    const gate = new Promise((resolve) => (release = resolve));
+    const slow = { ...fakeDocker(), systemDf: async () => { calls += 1; await gate; return df(); } };
+    const ctx = { docker: slow, store, config };
+
+    invalidate();
+    // Clear any report left by an earlier test so this starts from boot.
+    await refresh({ docker: { systemDf: async () => { throw new Error("x"); } }, store, config });
+    const first = peek(ctx, { staleAfterMs: 0 });
+    assert.equal(first.refreshing, true, "a measurement starts in the background");
+    assert.equal(first.report?.dockerAvailable, false, "and the page gets the last report meanwhile");
+
+    // A second view and the scheduled refresh join the same measurement.
+    peek(ctx, { staleAfterMs: 0 });
+    const joined = refresh(ctx);
+    release();
+    const r = await joined;
+    assert.equal(calls, 1, "/system/df ran once, not once per caller");
+    assert.equal(r.dockerAvailable, true);
+
+    const now = Date.parse(r.generatedAt) + 4 * 60_000;
+    const view = peek(ctx, { now });
+    assert.equal(view.report, r);
+    assert.equal(view.ageMs, 4 * 60_000);
+    assert.equal(view.refreshing, false, "4 minutes old is fresh enough, nothing new starts");
+    assert.equal(latest(), r);
+  } finally {
+    invalidate();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("after a change the old figures stay readable, marked stale, and a new measurement starts", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "st-stale-"));
+  try {
+    const store = new Store(dir);
+    store.ensureDirs();
+    const ctx = { docker: fakeDocker(), store, config: { checks: [], backups: [] } };
+    invalidate();
+    const before = await report(ctx);
+    invalidate();
+    const view = peek(ctx);
+    assert.equal(view.report, before, "the page does not go blank after an action");
+    assert.equal(view.stale, true);
+    assert.equal(view.refreshing, true);
+    const after = await refresh(ctx);
+    assert.notEqual(after, before);
+    assert.equal(peek(ctx).stale, false);
+  } finally {
+    invalidate();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+/* -------------------------------------------------------------------------
+ * Issue: remove-unused-images deleted rollback images
+ * ---------------------------------------------------------------------- */
+
+test("repositoryOf strips the tag or digest and leaves a registry port alone", () => {
+  assert.equal(repositoryOf("app:v1"), "app");
+  assert.equal(repositoryOf("ghcr.io/o/app:v1"), "ghcr.io/o/app");
+  assert.equal(repositoryOf("registry.example.com:5000/o/app:v1"), "registry.example.com:5000/o/app");
+  assert.equal(repositoryOf("registry.example.com:5000/o/app"), "registry.example.com:5000/o/app");
+  assert.equal(repositoryOf("o/app@sha256:abc"), "o/app");
+});
+
+test("the keep count: default 3, 0 turns it off, 1 is raised to 2", () => {
+  assert.equal(effectiveKeepVersions(undefined), 3);
+  assert.equal(effectiveKeepVersions(0), 0);
+  assert.equal(effectiveKeepVersions(1), 2);
+  assert.equal(effectiveKeepVersions(5), 5);
+});
+
+test("the newest versions per repository are kept, counting the running one and each image once", () => {
+  const doc = manyVersions();
+  // v9 also carries a second tag; it must count once, not twice.
+  doc.Images[8].RepoTags.push("app:previous");
+  const kept = rollbackKeepers(doc, 3);
+  assert.deepEqual([...kept.keys()].sort(), ["sha256:v10", "sha256:v8", "sha256:v9"]);
+
+  const { candidates, kept: held } = classifyUnusedImages(doc, { keepVersions: 3 });
+  // v10 is running, so of the kept three only v9 and v8 appear as held back.
+  assert.deepEqual(held.map((i) => i.id).sort(), ["sha256:v8", "sha256:v9"]);
+  assert.equal(held[0].keptFor, "app");
+  assert.equal(candidates.length, 7);
+  assert.ok(!candidates.some((i) => i.id === "sha256:v10"));
+
+  // Asking for 1 keeps 2, so the previous release always survives.
+  assert.deepEqual([...rollbackKeepers(doc, 1).keys()].sort(), ["sha256:v10", "sha256:v9"]);
+  assert.equal(rollbackKeepers(doc, 0).size, 0);
+});
+
+test("an image a stopped container uses is never a candidate, whatever the image count says", () => {
+  const doc = manyVersions();
+  // The Engine's per-image count says nobody uses v2, but a stopped container
+  // does. Docker would untag it if it had a second tag, so this is the guard.
+  doc.Images[1].RepoTags.push("app:second-tag");
+  doc.Containers = [{ Id: "old", ImageID: "sha256:v2", State: "exited" }];
+  assert.ok(referencedImageIds(doc).has("sha256:v2"));
+  const ids = unusedImages(doc, { keepVersions: 0 }).map((i) => i.id);
+  assert.ok(!ids.includes("sha256:v2"));
+  assert.equal(summarizeDf(doc).images.unusedCount, 8);
+});
+
+test("an image pulled by digest is a release, not build debris", () => {
+  const doc = {
+    LayersSize: 3000,
+    Images: [
+      { Id: "sha256:cur", RepoTags: [], RepoDigests: ["ghcr.io/o/app@sha256:c"], Size: 1000, SharedSize: 0, Containers: 1, Created: 3 },
+      { Id: "sha256:prev", RepoTags: [], RepoDigests: ["ghcr.io/o/app@sha256:p"], Size: 1000, SharedSize: 0, Containers: 0, Created: 2 },
+      { Id: "sha256:junk", RepoTags: ["<none>:<none>"], RepoDigests: [], Size: 1000, SharedSize: 0, Containers: 0, Created: 1 },
+    ],
+    Containers: [],
+  };
+  const { candidates, kept } = classifyUnusedImages(doc, { keepVersions: 3 });
+  assert.deepEqual(candidates.map((i) => i.id), ["sha256:junk"]);
+  assert.deepEqual(kept.map((i) => i.id), ["sha256:prev"]);
+  assert.equal(kept[0].dangling, false);
+  assert.match(kept[0].name, /^ghcr\.io\/o\/app@/);
+  // With keeping off it is still named, not lumped in with the debris.
+  const off = classifyUnusedImages(doc, { keepVersions: 0 }).candidates;
+  assert.equal(off.find((i) => i.id === "sha256:prev").dangling, false);
+});
+
+test("reclaimDanglingImages removes the listed debris by id and leaves digest-pinned images", async () => {
+  let layers = 3000;
+  const removed = [];
+  const docker = {
+    systemDf: async () => ({
+      LayersSize: layers,
+      Images: [
+        { Id: "sha256:prev", RepoTags: [], RepoDigests: ["o/app@sha256:p"], Size: 1000, SharedSize: 0, Containers: 0, Created: 2 },
+        { Id: "sha256:junk", RepoTags: ["<none>:<none>"], Size: 1000, SharedSize: 0, Containers: 0, Created: 1 },
+      ],
+      Containers: [],
+    }),
+    removeImage: async (ref) => {
+      removed.push(ref);
+      layers -= 1000;
+    },
+    pruneImages: async () => assert.fail("the Engine's prune would take the digest-pinned image too"),
+  };
+  const result = await reclaimDanglingImages(docker, { keepVersions: 0 });
+  assert.deepEqual(removed, ["sha256:junk"]);
+  assert.equal(result.removed, 1);
+  assert.equal(result.bytes, 1000);
+});
+
+test("removeUnusedImages keeps the newest versions by default", async () => {
+  let layers = 1900;
+  const removed = [];
+  const docker = {
+    systemDf: async () => ({ ...manyVersions(), LayersSize: layers }),
+    removeImage: async (ref) => {
+      removed.push(ref);
+      layers -= 100;
+    },
+  };
+  const result = await removeUnusedImages(docker);
+  assert.equal(result.removed, 7);
+  for (const keep of ["app:v10", "app:v9", "app:v8"]) assert.ok(!removed.includes(keep), `${keep} survives`);
+  assert.equal(result.bytes, 700);
 });
